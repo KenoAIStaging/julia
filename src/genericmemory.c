@@ -237,7 +237,11 @@ JL_DLLEXPORT void jl_genericmemory_copyto(jl_genericmemory_t *dest, char* destda
         if (__unlikely(jl_astaggedvalue(owner)->bits.gc == GC_OLD_MARKED)) {
             jl_value_t *src_owner = jl_genericmemory_owner(src);
             ssize_t done = 0;
-            if (jl_astaggedvalue(src_owner)->bits.gc != GC_OLD_MARKED) {
+            if (__unlikely(jl_astaggedvalue(owner)->bits.in_image == 1 /* GC_IN_IMAGE_NOT_REMSET */)) {
+                // GC_MARKED optimizations are invalid for generations >= 2
+                jl_gc_queue_root(owner);
+            }
+            else if (jl_astaggedvalue(src_owner)->bits.gc != GC_OLD_MARKED) {
                 if (dest_p < src_p || dest_p > src_p + n) {
                     for (; done < n; done++) { // copy forwards
                         void *val = jl_atomic_load_relaxed(src_p + done);
@@ -281,7 +285,11 @@ JL_DLLEXPORT void jl_genericmemory_copyto(jl_genericmemory_t *dest, char* destda
         jl_value_t *owner = jl_genericmemory_owner(dest);
         if (__unlikely(jl_astaggedvalue(owner)->bits.gc == GC_OLD_MARKED)) {
             jl_value_t *src_owner = jl_genericmemory_owner(src);
-            if (jl_astaggedvalue(src_owner)->bits.gc != GC_OLD_MARKED) {
+            if (__unlikely(jl_astaggedvalue(owner)->bits.in_image == 1 /* GC_IN_IMAGE_NOT_REMSET */)) {
+                // GC_MARKED optimizations are invalid for generations >= 2
+                jl_gc_queue_root(owner);
+            }
+            else if (jl_astaggedvalue(src_owner)->bits.gc != GC_OLD_MARKED) {
                 dt = (jl_datatype_t*)jl_tparam1(dt);
                 for (size_t done = 0; done < n; done++) { // copy forwards
                     char* s = (char*)src_p+done*elsz;
