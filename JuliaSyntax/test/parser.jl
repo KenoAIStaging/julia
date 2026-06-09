@@ -69,6 +69,12 @@ tests = [
         "a .~ b"      =>  "(dotcall-i a ~ b)"
         "[a ~ b c]"   =>  "(hcat (call-i a ~ b) c)"
         "[a~b]"       =>  "(vect (call-i a ~ b))"
+        # Dotted forms of the non-syntactic assignment operators
+        "a .≔ b"      =>  "(.≔ a b)"
+        "a .⩴ b"      =>  "(.⩴ a b)"
+        "a .≕ b"      =>  "(.≕ a b)"
+        # ... but `:=` may not be dotted
+        "a .:= b"     =>  "(:= a (error-t) b)"
         "f(x) .= 1"   =>  "(.= (call f x) 1)"
         "::g() = 1"   =>  "(= (::-pre (call g)) 1)"
         "f(x) = 1"    =>  "(function-= (call f x) 1)"

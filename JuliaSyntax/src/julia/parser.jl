@@ -623,7 +623,15 @@ function parse_assignment_with_initial_ex(ps::ParseState, mark, down::T) where {
             bump(ps, TRIVIA_FLAG) # bump the =
             k = K"op=" # Set k for the emit below
         else
+            op_mark = position(ps)
             bump_dotted(ps, isdot, t, TRIVIA_FLAG)
+            if isdot && k == K":="
+                # `:=` has no dotted form (matching the reference parser)
+                # a .:= b  ==>  (:= a (error-t) b)
+                emit(ps, op_mark, K"error", TRIVIA_FLAG,
+                     error="`:=` may not be dotted")
+                isdot = false
+            end
         end
         bump_trivia(ps)
         # Syntax Edition TODO: We'd like to call `down` here when
@@ -765,6 +773,12 @@ function dotted(k)
         return K".="
     elseif k == K"op="
         return K".op="
+    elseif k == K"≔"
+        return K".≔"
+    elseif k == K"⩴"
+        return K".⩴"
+    elseif k == K"≕"
+        return K".≕"
     else
         error("Unexpected dotted operator: $k")
     end

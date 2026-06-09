@@ -425,7 +425,11 @@ function est_to_dst(st::SyntaxTree)
         [K"Value"] -> st.value === nothing ? newleaf(g, st, K"nothing") : st
         (_, when=is_leaf(st)) -> st
         ([K"unknown_head" l r],
-         when=(s=st.name_val; Base.isoperator(s))) -> let
+         when=(s=st.name_val; Base.isoperator(s) && endswith(s, '='))) -> let
+             # A compound assignment `Expr` head such as `+=` or `.+=`; strip
+             # the trailing `=` to get the operator name. Operator-named heads
+             # not ending in `=` (eg a hand-written `Expr(:⊕, a, b)`) are not
+             # compound assignments and fall through to the generic case.
              (op_s, out_k) = s[1] === '.' ?
                  (s[nextind(s,1):prevind(s,end)], K".op=") :
                  (s[1:prevind(s,end)], K"op=")

@@ -301,6 +301,11 @@ register_kinds!(JuliaSyntax, 0, [
         "≔"
         "⩴"
         "≕"
+        # Dotted forms of the above (not emitted by the lexer; dotted `~`
+        # parses as K"dotcall" and dotted `:=` is an error)
+        ".≔"
+        ".⩴"
+        ".≕"
         # Compound assignments
         "op="
         ".op="
@@ -520,7 +525,7 @@ const generic_operators_by_level = Dict{PrecedenceLevel, Vector{Char}}(
          '⩛', '⩝', '⩡', '⩢', '⩣', '¦'],
     PREC_TIMES =>
         [ #= * ⋆ & =#
-         '/', '÷', '%', '⋅', '·', '·', '∘', '×', '\\', '∩', '∧', '⊗',
+         '/', '÷', '%', '⋅', '∘', '×', '\\', '∩', '∧', '⊗',
          '⊘', '⊙', '⊚', '⊛', '⊠', '⊡', '⊓', '∗', '∙', '∤', '⅋', '≀', '⊼', '⋄', '⋆',
          '⋇', '⋉', '⋊', '⋋', '⋌', '⋏', '⋒', '⟑', '⦸', '⦼', '⦾', '⦿', '⧶', '⧷',
          '⨇', '⨰', '⨱', '⨲', '⨳', '⨴', '⨵', '⨶', '⨷', '⨸', '⨻', '⨼', '⨽', '⩀',
@@ -542,6 +547,7 @@ const _nonunique_kind_names = Set([
     K"Whitespace"
     K"NewlineWs"
     K"Identifier"
+    K"Operator"
     K"Placeholder"
 
     K"ErrorEofMultiComment"

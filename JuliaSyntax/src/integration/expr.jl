@@ -365,7 +365,7 @@ end
             headstr = '.' * string(args[2], '=')
             retexpr.head = Symbol(headstr)
             retexpr.args = Any[lhs, rhs]
-        else
+        elseif length(args) == 1
             return Symbol(string('.', args[1], '='))
         end
     elseif k == K"macrocall"

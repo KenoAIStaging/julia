@@ -536,3 +536,22 @@ end
     out = JL.core_lowering_hook(lambda, test_mod)
     @test out isa Core.SimpleVector && out[1] isa Core.CodeInfo
 end
+
+@testset "operator-headed Expr conversion" begin
+    # Compound assignment heads convert via K"op="/K".op=" and lower
+    @test JL.est_to_expr(JuliaLowering.expr_to_est(Expr(:+=, :x, 1))) ==
+        Expr(:+=, :x, 1)
+    @test JuliaLowering.lower(test_mod,
+        JuliaLowering.expr_to_est(Expr(:+=, :x, 1))) !== nothing
+
+    # The dotted non-syntactic assignment operators have their own kinds
+    st = JuliaLowering.expr_to_est(Expr(:.≔, :a, :b))
+    @test kind(st) === K".≔"
+    @test JL.est_to_expr(st) == Expr(:.≔, :a, :b)
+
+    # Operator-named heads without a trailing `=` (eg a hand-written
+    # `Expr(:⊕, a, b)`) are not compound assignments; they fail lowering
+    # rather than being mangled by the `op=` conversion
+    @test_throws JuliaLowering.LoweringError JuliaLowering.lower(
+        test_mod, JuliaLowering.expr_to_est(Expr(:⊕, :a, :b)))
+end

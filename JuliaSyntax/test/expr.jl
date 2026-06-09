@@ -523,6 +523,15 @@
         @test parsestmt("x \u2212= y") == Expr(:(-=), :x, :y)
     end
 
+    @testset "dotted non-syntactic assignment operators" begin
+        @test parsestmt("a .≔ b") == Expr(:.≔, :a, :b)
+        @test parsestmt("a .⩴ b") == Expr(:.⩴, :a, :b)
+        @test parsestmt("a .≕ b") == Expr(:.≕, :a, :b)
+        # `:=` has no dotted form
+        @test parsestmt("a .:= b", ignore_errors=true) ==
+            Expr(:(:=), :a, Expr(:error), :b)
+    end
+
     @testset "let" begin
         @test parsestmt("let x=1\n end") ==
             Expr(:let, Expr(:(=), :x, 1),  Expr(:block, LineNumberNode(2)))
