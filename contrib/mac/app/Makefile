@@ -33,19 +33,20 @@ dmg/Applications:
 	-mkdir -p dmg
 	ln -fs /Applications $@
 
-dmg/$(APP_NAME): startup.applescript julia.icns
-	-mkdir -p dmg
-	osacompile -o $@ startup.applescript
-	rm $@/Contents/Resources/applet.icns
+dmg/$(APP_NAME): launcher.c Info.plist julia.icns
+	-mkdir -p $@/Contents/MacOS $@/Contents/Resources
+	# Compiled launcher: opens a Terminal running the bundled julia. Replaces
+	# the old AppleScript applet so the .app needs no osacompile (no Mac-only
+	# step), which lets the binary packaging run off-Mac.
+	$(CC) $(CFLAGS) -o $@/Contents/MacOS/Julia launcher.c
+	printf 'APPL????' > $@/Contents/PkgInfo
+	# Bundle metadata: copy the template, stamp the per-build fields.
+	cp Info.plist $@/Contents/Info.plist
+	plutil -replace CFBundleIdentifier         -string "$(APP_ID)" $@/Contents/Info.plist
+	plutil -replace CFBundleShortVersionString -string "$(JULIA_VERSION_MAJOR_MINOR_PATCH)" $@/Contents/Info.plist
+	plutil -replace CFBundleVersion            -string "$(JULIA_VERSION_OPT_COMMIT)" $@/Contents/Info.plist
+	plutil -replace NSHumanReadableCopyright   -string "$(APP_COPYRIGHT)" $@/Contents/Info.plist
 	cp julia.icns $@/Contents/Resources/
-	plutil -replace CFBundleDevelopmentRegion  -string "en" $@/Contents/Info.plist
-	plutil -insert  CFBundleDisplayName        -string "Julia" $@/Contents/Info.plist
-	plutil -replace CFBundleIconFile           -string "julia.icns" $@/Contents/Info.plist
-	plutil -insert  CFBundleIdentifier         -string "$(APP_ID)" $@/Contents/Info.plist
-	plutil -replace CFBundleName               -string "Julia" $@/Contents/Info.plist
-	plutil -insert  CFBundleShortVersionString -string "$(JULIA_VERSION_MAJOR_MINOR_PATCH)" $@/Contents/Info.plist
-	plutil -insert  CFBundleVersion            -string "$(JULIA_VERSION_OPT_COMMIT)" $@/Contents/Info.plist
-	plutil -insert  NSHumanReadableCopyright   -string "$(APP_COPYRIGHT)" $@/Contents/Info.plist
 	-mkdir -p $@/Contents/Resources/julia
 	$(MAKE) -C $(JULIAHOME) binary-dist
 	$(TAR) -xzf $(JULIAHOME)/$(JULIA_BINARYDIST_FILENAME).tar.gz -C $@/Contents/Resources/julia --strip-components 1
