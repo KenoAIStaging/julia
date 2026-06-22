@@ -9,12 +9,14 @@ const Bottom = Union{}
 # For curmod_*
 include("testenv.jl")
 
+include("tempdepot.jl")
+
 ## tests that `const` field declarations
 
 # sanity tests that our built-in types are marked correctly for const fields
 for (T, c) in (
         (Core.CodeInfo, []),
-        (Core.CodeInstance, [:def, :owner, :rettype, :exctype, :rettype_const, :analysis_results, :time_infer_total, :time_infer_cache_saved, :time_infer_self]),
+        (Core.CodeInstance, [:def, :owner, :rettype, :exctype, :rettype_const, :time_infer_total, :time_infer_cache_saved, :time_infer_self]),
         (Core.Method, [#=:name, :module, :file, :line, :primary_world, :sig, :slot_syms, :external_mt, :nargs, :called, :nospecialize, :nkw, :isva, :is_for_opaque_closure, :constprop=#]),
         (Core.MethodInstance, [#=:def, :specTypes, :sparam_vals=#]),
         (Core.MethodTable, [:cache, :module, :name]),
@@ -35,9 +37,9 @@ end
 # sanity tests that our built-in types are marked correctly for atomic fields
 for (T, c) in (
         (Core.CodeInfo, []),
-        (Core.CodeInstance, [:next, :min_world, :max_world, :inferred, :edges, :debuginfo, :ipo_purity_bits, :invoke, :specptr, :specsigflags, :precompile, :time_compile]),
+        (Core.CodeInstance, [:next, :min_world, :max_world, :inferred, :edges, :debuginfo, :ipo_purity_bits, :invoke, :specptr, :flags, :time_compile]),
         (Core.Method, [:primary_world, :did_scan_source, :dispatch_status, :interferences]),
-        (Core.MethodInstance, [:cache, :flags, :dispatch_status]),
+        (Core.MethodInstance, [:cache, :flags, :dispatch_status, :precompile]),
         (Core.MethodTable, [:defs]),
         (Core.MethodCache, [:leafcache, :cache, :var""]),
         (Core.TypeMapEntry, [:next, :min_world, :max_world]),
@@ -193,7 +195,7 @@ f11840(::DataType) = "DataType"
 f11840(::UnionAll) = "UnionAll"
 f11840(::Type{T}) where {T<:Tuple} = "Tuple"
 @test f11840(Type) == "UnionAll"
-@test f11840(Type.body) == "DataType"
+@test f11840(Type.body) == "Type"
 @test f11840(Union{Int,Int8}) == "Type"
 @test f11840(Tuple) == "Tuple"
 @test f11840(TT11840) == "Tuple"
@@ -229,6 +231,17 @@ h11840(::Type{T}) where {T<:Tuple} = '4'
 @test h11840(Union{Vector.body, Matrix.body}) == '2'
 @test h11840(Tuple) == '4'
 @test h11840(TT11840) == '4'
+
+# issue #61242: free-TypeVar bodies and their enclosing UnionAlls bind as
+# distinct type objects.
+let f61242(::Type{T}) where T = T
+    @test f61242(Vector.body) === Vector.body
+    @test f61242(Vector) === Vector
+end
+let g61242(::Type{T}) where T = T
+    @test g61242(Vector) === Vector
+    @test g61242(Vector.body) === Vector.body
+end
 
 # show that we don't make the cache confused by using alternative representations
 # when specificity is reversed
@@ -344,6 +357,15 @@ end
 @test typejoin(Tuple{Tuple{T, T, Any}} where T, Tuple{T, T, Vector{T}} where T) == Tuple{Any,Vararg{Any}}
 @test typejoin(Tuple{T, T, T} where T, Tuple{T, T, Vector{T}} where T) == Tuple{Any,Any,Any}
 
+# issue #61876: a UnionAll operand over a bounded type parameter must still join
+# to the common wrapper rather than collapsing to Any (a free TypeVar parameter
+# no longer subtypes a bounded wrapper var, so typejoin detects shared families
+# by type name).
+abstract type AbstractCfg61876{O<:Integer} end
+struct Cfg61876{O<:Integer, T} <: AbstractCfg61876{O} end
+@test typejoin(Cfg61876{<:Integer, Tuple{Int,Int}}, Cfg61876{Int, Tuple{Int}}) === Cfg61876
+@test typejoin(Cfg61876{<:Integer, Int}, AbstractCfg61876{Int}) === AbstractCfg61876
+
 # issue #26321
 struct T26321{N,S<:NTuple{N}}
     t::S
@@ -369,6 +391,32 @@ end  |> only == Type{typejoin(Int, UInt, Float64)}
 @test typejoin(1, 2, 3) === Any
 @test typejoin(Int, Int, 3) === Any
 
+# issue #61915: typejoin must stay sound when an operand is a `Type{X}` kind. Under the
+# TypeEq refactor `typeof(Type{X})` is no longer a `DataType`; joining a kind with an
+# unrelated non-`Type` operand must give `Any`, not `Type`.
+@test typejoin(Symbol, Type{Int}) === Any
+@test typejoin(Type{Int}, Symbol) === Any
+@test typejoin(Type{Int}, Int) === Any
+@test typejoin(Type{Int}, String) === Any
+@test typejoin(Type{Int}, Type{Float64}) === Type
+@test typejoin(Type{Int}, Type) === Type
+@test_broken typejoin(Type{Int}, DataType) !== DataType
+@test typejoin(Symbol, Type{Int}) === typejoin(Type{Int}, Symbol)
+@test typejoin(DataType, Type{Int}) === typejoin(Type{Int}, DataType)
+
+# issue #61915: a method whose function type is `Type{Foo{...} where ...}` must derive its
+# name as `Foo`, not `:Any` (argument_datatypename has to unwrap the wrapped UnionAll).
+struct UA61915{T,N,A<:AbstractArray{T,N}}
+    a::A
+end
+UA61915{T}(a) where {T} = UA61915{T,ndims(a),typeof(a)}(a)
+@test all(m -> m.name === :UA61915, methods(UA61915))
+@test which(UA61915{Int}, (Vector{Int},)).name === :UA61915
+@test ccall(:jl_argument_datatype, Any, (Any,), Type{Array}) === Base.unwrap_unionall(Array)
+@test ccall(:jl_argument_datatype, Any, (Any,), Union{Tuple{Int},Tuple{Int,Int}}) === nothing
+@test ccall(:jl_argument_datatypename, Any, (Any,), Type{Array}) === Base.unwrap_unionall(Array).name
+@test ccall(:jl_argument_datatypename, Any, (Any,), Union{Tuple{Int},Tuple{Int,Int}}) === Tuple.name
+
 # promote_typejoin returns a Union only with Nothing/Missing combined with concrete types
 for T in (Nothing, Missing)
     @test Base.promote_typejoin(Int, Float64) === Real
@@ -392,6 +440,100 @@ for T in (Nothing, Missing)
     end
     @test Base.promote_typejoin(T, Union{}) === T
     @test Base.promote_typejoin(Union{}, T) === T
+end
+
+# PR #61915: `promote_typejoin_union` must handle `Type{X}` (a `TypeEq` kind), not error
+@test Base.promote_typejoin_union(Type{Int}) === Type{Int}
+@test Base.promote_typejoin_union(Union{Type{Int}, Type{String}}) === Type
+@test fieldtype.(Tuple{Int,Float32,Int}, [1, 2, 3]) == [Int, Float32, Int]
+@test typeof.(Any[Int, "x", 1.0]) == [DataType, String, Float64]
+# PR #61915: dispatching `::Type{Type{T}}` on a `TypeEq`-typed value (e.g. iterating a
+# tuple of `Type{X}` values) must not infer `Union{}` (which crashed via `unreachable`)
+let get_param(::Type{Type{T}}) where {T} = T
+    @test Tuple(get_param(t) for t in (Type{Int}, Type{Float64})) === (Int, Float64)
+end
+
+# PR #61915: dispatch onto an `@nospecialize`d `::Core.AnyType` method with a type-valued
+# argument must hit the method cache (a miss re-runs the full lookup, which allocates).
+# The extra methods keep inference from devirtualizing the call site outright.
+struct AnyTypeCache61915a end
+struct AnyTypeCache61915b end
+anytype_dispatch_61915(::Int8) = 1
+anytype_dispatch_61915(@nospecialize t::Core.AnyType) = 2
+anytype_dispatch_61915(::TypeVar) = 3
+anytype_dispatch_61915(::AnyTypeCache61915a) = 4
+anytype_dispatch_61915(::AnyTypeCache61915b) = 5
+let r = Ref{Any}(Int)
+    @noinline callit() = anytype_dispatch_61915(r[])
+    @test callit() == 2          # dispatches to the `::Core.AnyType` method
+    callit()                     # warmup: populate the method cache
+    @test @allocated(callit()) == 0
+end
+
+# kind-typed (e.g. `::DataType`) and `::Core.AnyType` cache entries must stay reachable
+# (allocation-free dispatch) after the typemap node holding them splits into a level
+anytype_levelsplit_61915(@nospecialize x::Integer) = 1
+anytype_levelsplit_61915(@nospecialize x::AbstractString) = 2
+anytype_levelsplit_61915(@nospecialize x::AbstractFloat) = 3
+anytype_levelsplit_61915(@nospecialize x::AbstractVector) = 4
+anytype_levelsplit_61915(@nospecialize x::Exception) = 5
+anytype_levelsplit_61915(@nospecialize x::IO) = 6
+anytype_levelsplit_61915(@nospecialize x::Function) = 7
+anytype_levelsplit_61915(@nospecialize x::DataType) = 8
+anytype_levelsplit_61915(@nospecialize x::Core.AnyType) = 9
+let f = Ref{Any}(anytype_levelsplit_61915), r = Ref{Any}(Int)
+    @noinline callit() = f[](r[])
+    # populate one widened cache entry per method so the typemap node splits into a level
+    for a in Any[1, "", 1.0, [1], ErrorException(""), IOBuffer(), sin, Int, Union{Int,Char}]
+        r[] = a
+        callit(); callit()
+    end
+    r[] = Int                      # typeof(Int) === DataType: the `::DataType` method
+    @test callit() == 8
+    callit()
+    @test @allocated(callit()) == 0
+    r[] = Union{Int,Char}          # typeof is the `Union` kind: the `::AnyType` method
+    @test callit() == 9
+    callit()
+    @test @allocated(callit()) == 0
+end
+# union-mixed queries take the full-scan intersection path over the method definitions,
+# which must also reach the kind-keyed bucket
+@test any(m -> m.sig == Tuple{typeof(anytype_levelsplit_61915), DataType},
+          methods(anytype_levelsplit_61915, (Union{Type{Int}, Int},)))
+
+# `Core.TypeofBottom` methods filed with the kinds: method matching and dispatch with
+# `Type{...}`-represented queries (e.g. for the value `Union{}`) must reach them after
+# a level split instead of using a less specific `::Type` method
+anytype_bottom_61915(::Core.TypeofBottom) = 0
+anytype_bottom_61915(@nospecialize ::Type) = 1
+anytype_bottom_61915(::Integer) = 2
+anytype_bottom_61915(::AbstractString) = 3
+anytype_bottom_61915(::AbstractFloat) = 4
+anytype_bottom_61915(::AbstractVector) = 5
+anytype_bottom_61915(::Exception) = 6
+anytype_bottom_61915(::IO) = 7
+anytype_bottom_61915(::Function) = 8
+let f = Ref{Any}(anytype_bottom_61915), r = Ref{Any}(Union{})
+    @noinline callit() = f[](r[])
+    @test callit() == 0
+    @test length(methods(anytype_bottom_61915, (Type,))) == 2
+end
+
+# specializations are deduplicated by type equality (`Type == Core.AnyType`), so
+# `specTypes` carries whichever representation was interned first and
+# `jl_isa_compileable_sig` must accept both
+anytype_compilesig_61915(io::IO, T::Type) = 1
+let m = only(methods(anytype_compilesig_61915))
+    miA = ccall(:jl_specializations_get_linfo, Ref{Core.MethodInstance}, (Any, Any, Any),
+                m, Tuple{typeof(anytype_compilesig_61915), IOBuffer, Core.AnyType}, Core.svec())
+    miB = ccall(:jl_specializations_get_linfo, Ref{Core.MethodInstance}, (Any, Any, Any),
+                m, Tuple{typeof(anytype_compilesig_61915), IOBuffer, Type}, Core.svec())
+    @test miA === miB
+    for S in (Type, Core.AnyType)
+        sig = Tuple{typeof(anytype_compilesig_61915), IOBuffer, S}
+        @test ccall(:jl_isa_compileable_sig, Cint, (Any, Any, Any), sig, Core.svec(), m) == 1
+    end
 end
 
 @test promote_type(Bool,Bottom) === Bool
@@ -460,12 +602,12 @@ end
 mutable struct A3890{T1}
     x::Matrix{Complex{T1}}
 end
-@test A3890{Float64}.types[1] === Array{ComplexF64,2}
+@test A3890{Float64}.types[1] === Matrix{ComplexF64}
 # make sure the field type Matrix{Complex{T1}} isn't cached
 mutable struct B3890{T2}
     x::Matrix{Complex{T2}}
 end
-@test B3890{Float64}.types[1] === Array{ComplexF64,2}
+@test B3890{Float64}.types[1] === Matrix{ComplexF64}
 
 # issue #786
 mutable struct Node{T}
@@ -575,6 +717,18 @@ sptest4(x::T, y::T) where {T} = 42
 sptest4(x::T, y) where {T} = 44
 @test sptest4(1,2) == 42
 @test sptest4(1, "cat") == 44
+
+# A method that binds a where-parameter across two arms of a Union: when the
+# argument satisfies the signature only with `T` left unconstrained, dispatch
+# must succeed without throwing in static-parameter matching.
+abstract type SPTestArr5{S,T,N} end
+sptest5(positions::AbstractVector{<:Union{NTuple{N,T}, SPTestArr5{Tuple{N}, T, 1}}}) where {N, T <: Real} =
+    (N, @isdefined(T) ? T : nothing)
+@test sptest5([(1.0, 2.0)]) === (2, Float64)        # T uniquely bound to Float64
+let (n, t) = sptest5([(1, 2.0)])
+    @test n === 2
+    @test t === nothing || t === Union{Int, Float64} || t === Real
+end
 
 # closures
 function clotest()
@@ -2816,6 +2970,14 @@ const T24460 = Tuple{T,T} where T
 g24460() = invoke(f24460, T24460, 1, 2)
 @test @inferred(g24460()) === 2.0
 
+@testset "invoke with builtins" begin
+    @test invoke(getfield, Tuple{Any, Symbol}, (a = 42,), :a) == 42
+    @test invoke(setfield!, Tuple{Any, Symbol, Any},  Base.RefValue(1), :x, 2) == 2
+    @test invoke(isdefined, Tuple{Any, Symbol}, (a = 1,), :a) == true
+    @test invoke(isdefined, Tuple{Any, Symbol}, (a = 1,), :b) == false
+    @test invoke(invoke, Tuple{Any, Type, Vararg}, sin, Tuple{Real}, 0) == 0.0
+end
+
 # issue #30679
 @noinline function f30679(::DataType)
     b = IOBuffer()
@@ -3607,6 +3769,12 @@ function f11355(arg::DataType)
     end
     return 100
 end
+function f11355(arg::TypeEq)
+    if Base.type_parameter(arg) <: Tuple
+        return 200
+    end
+    return 100
+end
 let t = Tuple{Type{Vector{Int}}}
     @test f11355(t) == 100
     t = Tuple{Type{Dict{K} where K}}
@@ -3884,14 +4052,14 @@ f12092(x::Int, y::Int...) = 2
 
 # issue #12063
 # NOTE: should have > MAX_TUPLETYPE_LEN arguments
-f12063(tt, g, p, c, b, v, cu::T, d::AbstractArray{T, 2}, ve) where {T} = 1
+f12063(tt, g, p, c, b, v, cu::T, d::AbstractMatrix{T}, ve) where {T} = 1
 f12063(args...) = 2
 g12063() = f12063(0, 0, 0, 0, 0, 0, 0.0, zeros(0,0), Int[])
 @test g12063() == 1
 
 # issue #11587
 mutable struct Sampler11587{N}
-    clampedpos::Array{Int,2}
+    clampedpos::Matrix{Int}
     buf::Array{Float64,N}
 end
 function Sampler11587()
@@ -3926,7 +4094,7 @@ struct B
     a::A
 end
 @eval function f1()
-    # Emitting this direction is not recommended but it can come from `convert` that does not
+    # Emitting this directly is not recommended but it can come from `convert` that does not
     # return the correct type.
     $(Expr(:new, B, 1))
 end
@@ -4287,6 +4455,30 @@ let z1 = Z14477C()
     @test !isdefined(z1.fld, :fld)
 end
 
+# Test _defaultctors "lowering"
+mutable struct _CtorLoweredQualityTest
+    x::Int
+end
+let cis = code_lowered(_CtorLoweredQualityTest, (Any,))
+    # The generic inner constructor is the longer one (with fieldtype/convert)
+    ci = last(cis)
+    # fieldtype should appear exactly once (not duplicated)
+    ft_count = sum(s -> count("Core.fieldtype", sprint(show, s)), ci.code)
+    @test ft_count == 1
+end
+
+struct _CtorSlotNarrowVal end
+struct _CtorSlotNarrowVal2 end
+Base.convert(::Type{_CtorSlotNarrowVal}, ::Any) = _CtorSlotNarrowVal()
+Base.convert(::Type{_CtorSlotNarrowVal}, x::_CtorSlotNarrowVal) = x
+mutable struct _CtorSlotNarrowHolder
+    x::_CtorSlotNarrowVal
+end
+let effects = Base.infer_effects((Union{_CtorSlotNarrowVal, _CtorSlotNarrowVal2},)) do a
+        _CtorSlotNarrowHolder(a)
+    end
+    @test Core.Compiler.is_nothrow(effects)
+end
 
 # issue #8846, generic macros
 macro m8846(a, b=0)
@@ -6272,7 +6464,7 @@ initvalue2(::Type{T}) where {T <: Number} = T(1)
 U = unboxedunions[1]
 
 @noinline compare(a, b) = (a === b) # make sure we are testing code-generation of `is`
-egal(x, y) = (ccall(:jl_egal, Cint, (Any, Any), x, y) != 0) # make sure we are NOT testing code-generate of `is`
+egal(x, y) = (ccall(:jl_egal, Cint, (Any, Any), x, y) != 0) # make sure we are NOT testing code-generation of `is`
 
 mutable struct UnionField
     u::U
@@ -6842,9 +7034,6 @@ Base._growat!(A, 4, 1)
 Base._growat!(A, 2, 3)
 @test getindex(A, 1) === 0x01
 @test getindex(A, 2) === missing
-@test getindex(A, 3) === missing
-@test getindex(A, 4) === missing
-@test getindex(A, 5) === missing
 @test getindex(A, 6) === 0x03
 @test getindex(A, 7) === missing
 @test getindex(A, 8) === missing
@@ -7107,7 +7296,7 @@ end
 # issue #21004
 const PTuple_21004{N,T} = NTuple{N,VecElement{T}}
 @test_throws ArgumentError("too few elements for tuple type $PTuple_21004") PTuple_21004(1)
-@test_throws UndefVarError(:T, :static_parameter) PTuple_21004_2{N,T} = NTuple{N, VecElement{T}}(1)
+@test_throws MethodError PTuple_21004_2{N,T} = NTuple{N, VecElement{T}}(1)
 
 #issue #22792
 foo_22792(::Type{<:Union{Int8,Int,UInt}}) = 1;
@@ -7428,9 +7617,9 @@ end
 @test repackage28445()
 
 # issue #28597
-@test_throws ArgumentError Array{Int, 2}(undef, 0, -10)
-@test_throws ArgumentError Array{Int, 2}(undef, -10, 0)
-@test_throws ArgumentError Array{Int, 2}(undef, -1, -1)
+@test_throws ArgumentError Matrix{Int}(undef, 0, -10)
+@test_throws ArgumentError Matrix{Int}(undef, -10, 0)
+@test_throws ArgumentError Matrix{Int}(undef, -1, -1)
 
 # issue #54244
 # test that zero sized array doesn't throw even with large axes
@@ -7805,9 +7994,33 @@ using Test
 struct T36104
     v::Vector{M36104.T36104}
 end
+const orig_T36104 = T36104
 struct T36104   # check that redefining it works, issue #21816
     v::Vector{T36104}
 end
+@test T36104 === orig_T36104
+# issue #61789: self-referential struct redefinition must reuse the binding
+struct R61789
+    x
+    next::R61789
+end
+const orig_R61789 = R61789
+struct R61789
+    x
+    next::R61789
+end
+@test R61789 === orig_R61789
+# negative case: a field type that genuinely differs must produce a new type
+struct R61789neg
+    x
+    next::R61789neg
+end
+const orig_R61789neg = R61789neg
+struct R61789neg
+    x::Int
+    next::R61789neg
+end
+@test R61789neg !== orig_R61789neg
 struct S36104{K,V}
     v::S36104{K,V}
     S36104{K,V}() where {K,V} = new()
@@ -8049,6 +8262,32 @@ let vnull1 = NullableHomogeneousPointerImmutable(),
     @test !opt_jl_egal(vnull2, v2)
 end
 
+# #62095 - egal on large structs (> 512 bytes) with both ptrs and bits has
+# incorrect alias info
+struct MixedGC
+    obj::Base.RefValue{Int}
+    bits::Int
+end
+# 65 elements, so it's large enough to fail on both 32 and 64 bit
+let x = ntuple(i -> MixedGC(Base.RefValue(i), i), Val(65))
+    y = ntuple(i -> MixedGC(x[i].obj, i*2), Val(65))
+    z = ntuple(i -> MixedGC(Base.RefValue(i), i), Val(65))
+
+    @test unopt_jl_egal(x, x)
+    @test unopt_jl_egal(y, y)
+    @test unopt_jl_egal(z, z)
+    @test !unopt_jl_egal(x, y)
+    @test !unopt_jl_egal(x, z)
+    @test !unopt_jl_egal(y, z)
+
+    @test opt_jl_egal(x, x)
+    @test opt_jl_egal(y, y)
+    @test opt_jl_egal(z, z)
+    @test !opt_jl_egal(x, y)
+    @test !opt_jl_egal(x, z)
+    @test !opt_jl_egal(y, z)
+end
+
 # Make sure non-allbits union is handled correctly
 @noinline returns_union37557(r) = r[]
 @noinline compare_union37557(r1, r2) = returns_union37557(r1) === returns_union37557(r2)
@@ -8146,7 +8385,10 @@ end
     setglobal!(m, :x, 2, :release)
     @test m.x === 2
     @test_throws ConcurrencyViolationError setglobal!(m, :x, 3, :not_atomic)
-    @test_throws ErrorException setglobal!(m, :x, 4., :release)
+    @test_throws TypeError setglobal!(m, :x, 4., :release)
+
+    f_set_bad_type(m) = setglobal!(m, :x, 4., :release)
+    @test_throws TypeError f_set_bad_type(m)
 
     m.x = 1
     @test m.x === 1
@@ -8182,6 +8424,25 @@ foo46503(a::Int, b::Nothing) = @invoke foo46503(a::Any, b)
 @test 0 <= foo46503(1, nothing) <= 1
 foo46503(@nospecialize(a), b::Union{Nothing, Float64}) = rand() + 10
 @test 10 <= foo46503(1, nothing) <= 11
+
+@testset "inference for `rest` with unknown state argument types" begin
+    @testset "`Array`, `Memory`" begin
+        for typ in (Vector{Float32}, Matrix{Float32}, Memory{Float32})
+            @test (isconcretetype ∘ Base.infer_return_type)(Base.rest, Tuple{typ, Any})
+            for e in (Base.Compiler.is_terminates, Base.Compiler.is_notaskstate, Base.Compiler.is_nonoverlayed)
+                @test (e ∘ Base.infer_effects)(Base.rest, Tuple{typ, Any})
+            end
+        end
+    end
+    @testset "`Tuple`" begin
+        typ = NTuple{5, Float32}
+        @test Base.infer_return_type(Base.rest, Tuple{typ, Any}) <: Tuple
+    end
+    @testset "`NamedTuple`" begin
+        typ = NamedTuple{(:a, :b, :c, :d, :e), NTuple{5, Float32}}
+        @test Base.infer_return_type(Base.rest, Tuple{typ, Any}) <: NamedTuple
+    end
+end
 
 @testset "effect override on Symbol(::String)" begin
     @test Core.Compiler.is_foldable(Base.infer_effects(Symbol, (String,)))
@@ -8433,9 +8694,35 @@ let ms = Base._methods_by_ftype(Tuple{typeof(sin), Int}, OverlayModule.mt, 1, Ba
     @test isempty(ms)
 end
 
+# fresh module to ensure uncached methods
+module OverlayMTTest
+    using Base.Experimental: @MethodTable, @overlay
+    @MethodTable(mt)
+
+    function overlay_only end
+    @overlay mt overlay_only(x::Int) = x * 2
+end
+
+# #60702 & #60716: Overlay methods must be found without prior cache population
+let world = Base.get_world_counter()
+    mi = Base.method_instance(OverlayMTTest.overlay_only, Tuple{Int};
+                              world, method_table=OverlayMTTest.mt)
+    @test mi isa Core.MethodInstance
+    @test mi.def.module === OverlayMTTest
+end
+
+# #60712: Global-only methods must NOT be found via custom MT
+let
+    @eval global_only_func(x::Int) = x + 1
+    world = Base.get_world_counter()
+    mi = Base.method_instance(global_only_func, Tuple{Int};
+                              world, method_table=OverlayMTTest.mt)
+    @test mi === nothing
+end
+
 # precompilation
 let load_path = mktempdir()
-    depot_path = mktempdir()
+    depot_path = mkdepottempdir()
     try
         pushfirst!(LOAD_PATH, load_path)
         pushfirst!(DEPOT_PATH, depot_path)
@@ -8467,7 +8754,7 @@ let load_path = mktempdir()
             end
             """)
 
-        # when referring an method table in another module,
+        # when referring to a method table in another module,
         # the overlay method needs to be discovered explicitly
         Bar = Base.require(Main, :Bar)
         @test length(Bar.mt) == 0
@@ -8477,11 +8764,45 @@ let load_path = mktempdir()
         filter!((≠)(load_path), LOAD_PATH)
         filter!((≠)(depot_path), DEPOT_PATH)
         rm(load_path, recursive=true, force=true)
-        try
-            rm(depot_path, force=true, recursive=true)
-        catch err
-            @show err
-        end
+    end
+end
+
+# Deduplication of method tables in jl_foreach_reachable_mtable:
+# when a method table is imported, it should not be visited multiple times.
+let load_path = mktempdir()
+    depot_path = mkdepottempdir()
+    try
+        pushfirst!(LOAD_PATH, load_path)
+        pushfirst!(DEPOT_PATH, depot_path)
+
+        write(joinpath(load_path, "MtDef.jl"),
+            """
+            module MtDef
+            Base.Experimental.@MethodTable(mt)
+            end
+            """)
+
+        MtDef = Base.require(Main, :MtDef)
+        @test length(MtDef.mt) == 0
+
+        write(joinpath(load_path, "MtUser.jl"),
+            """
+            module MtUser
+            using MtDef: mt
+            Base.Experimental.@overlay mt sin(x::Int) = 42
+            end
+            """)
+
+        # MtUser imports mt from MtDef, making it reachable from both modules'
+        # bindings during precompilation. Without deduplication in
+        # jl_foreach_reachable_mtable, the overlay method would be serialized
+        # twice, causing an assertion failure when activating methods on load.
+        MtUser = Base.require(Main, :MtUser)
+        @test length(MtDef.mt) == 1
+    finally
+        filter!((≠)(load_path), LOAD_PATH)
+        filter!((≠)(depot_path), DEPOT_PATH)
+        rm(load_path, recursive=true, force=true)
     end
 end
 
@@ -8552,6 +8873,21 @@ f_invalidate_me() = 2
 @test_throws ErrorException invoke(f_invoke_me, f_invoke_me_ci)
 @test_throws ErrorException f_call_me()
 
+mysin(x::Float64) = sin(x)
+@test mysin(1.0) == sin(1.0)
+const mysin_ci = Base.specialize_method(Base._which(Tuple{typeof(mysin), Float64})).cache
+mysin2(x::Float64) = invoke(mysin, mysin_ci, x)
+@test mysin2(1.0) == sin(1.0)
+@test any(1:3) do _
+    @allocated(mysin2(rand())) == 0
+end
+let this_world = Base.get_world_counter()
+    f(x) = invoke(mysin, mysin_ci, x)
+    @atomic mysin_ci.min_world = this_world + 10
+    @test_throws ErrorException f(1.0)
+end
+
+
 myfun57023a(::Type{T}) where {T} = (x = @ccall mycfun()::Ptr{T}; x)
 @test only(code_lowered(myfun57023a)).has_fcall
 myfun57023b(::Type{T}) where {T} = (x = @cfunction myfun57023a Ptr{T} (Ref{T},); x)
@@ -8615,6 +8951,11 @@ module M57638_3
 end
 @test M57638_3.x === 1
 
+@testset "no unnecessary methods for comparison functions with generically correct and performant fallback methods" begin
+    @test (isone ∘ length ∘ methods)(>, Tuple{Any, Any})
+    @test (isone ∘ length ∘ methods)(>=, Tuple{Any, Any})
+end
+
 module GlobalBindingMulti
     module M
         export S
@@ -8636,3 +8977,68 @@ primitive type ByteString58434 (18 * 8) end
 
 @test Base.datatype_isbitsegal(Tuple{ByteString58434}) == false
 @test Base.datatype_haspadding(Tuple{ByteString58434}) == (length(Base.padding(Tuple{ByteString58434})) > 0)
+
+# #60659 - Behavior of using'd ambiguous bindings
+module AmbiguousUsing60659
+    using Test
+    module A
+        export X
+        module B; struct X; end; export X; end
+        module C; struct X; end; export X; end
+        using .B, .C
+    end
+    module D; struct X; end; export X; end
+    using .D, .A
+    @test_throws UndefVarError X
+end
+
+# Behavior of TypeVar with lower bound
+f_def_typevar_with_lowerbound(x::T) where {T>:Int} = @isdefined(T) ? T : false
+let r = f_def_typevar_with_lowerbound(1.0)
+    @test r === false || r === Union{Int, Float64}
+end
+
+# Static parameters constrained indirectly through other static-parameter bounds
+# are defined.
+f1_sparam_defined_62099(t::Type{E}) where E = @isdefined(E)
+f2_sparam_defined_62099(t::Type{T}) where {E, T<:E} = @isdefined(E)
+f3_sparam_defined_62099(t::Type{T}) where {E, E<:T<:E} = @isdefined(E)
+ftuple_sparam_defined_62099(t::Type{T}) where {E, T<:Tuple{E}} = @isdefined(E)
+fvararg_sparam_defined_62099(t::Type{T}) where {E, T<:Tuple{Vararg{E}}} = @isdefined(E)
+g1_sparam_value_62099(t::Type{E}) where E = E
+g2_sparam_value_62099(t::Type{T}) where {E, T<:E} = E
+gtuple_sparam_value_62099(t::Type{T}) where {E, T<:Tuple{E}} = E
+gvararg_sparam_value_62099(t::Type{T}) where {E, T<:Tuple{Vararg{E}}} = E
+for T in (Int, Integer, Real, Any, Union{Int,String}, Type{Int}, Vector)
+    @test f1_sparam_defined_62099(T)
+    @test f2_sparam_defined_62099(T)
+    @test f3_sparam_defined_62099(T)
+    @test ftuple_sparam_defined_62099(Tuple{T})
+    @test fvararg_sparam_defined_62099(Tuple{T})
+end
+@test !fvararg_sparam_defined_62099(Tuple{})
+@test g1_sparam_value_62099(Type{Int}) === Type{Int}
+@test g2_sparam_value_62099(Type{Int}) === Type{Int}
+@test gtuple_sparam_value_62099(Tuple{Type{Int}}) === Type{Int}
+@test gvararg_sparam_value_62099(Tuple{Type{Int}}) === Type{Int}
+
+# An inferred / constant-folded type must not contain a `(tvar, constrains_bool)`
+# SimpleVector pair as a type parameter. The intersection-env svec format must
+# stay confined to env entries; downstream consumers of intersection results
+# (apply_type, return_type inference) must unwrap before using values as types.
+struct _EnvLeak_Foo{N} end
+function _envleak_build(n::Int)
+    VD = Vector{_EnvLeak_Foo{n}}
+    a = VD(undef, 1)
+    b = unsafe_wrap(VD, pointer(a), 1)
+    return typeof(b)
+end
+@test _envleak_build(3) === Vector{_EnvLeak_Foo{3}}
+
+# (#61914) when transforming UnionAll of Union to Union of UnionAll, don't
+# re-wrap members of the union that were not beneath the UnionAll with the type
+# variable.
+let T = TypeVar(:T)
+    a = UnionAll(T, Union{Vector{T}, Int64})
+    @test Union{T, a} == Union{a, T} == Union{T, Int64, Vector}
+end

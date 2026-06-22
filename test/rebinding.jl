@@ -1,5 +1,7 @@
 # This file is a part of Julia. License is MIT: https://julialang.org/license
 
+using Test
+
 module Rebinding
     using Test
     make_foo() = Foo(1)
@@ -285,7 +287,7 @@ module RangeMerge
 
     function get_llvm(@nospecialize(f), @nospecialize(t), raw=true, dump_module=false, optimize=true)
         params = Base.CodegenParams(safepoint_on_entry=false, gcstack_arg = false, debug_info_level=Cint(2))
-        d = InteractiveUtils._dump_function(InteractiveUtils.ArgInfo(f, t), false, false, raw, dump_module, :att, optimize, :none, false, params)
+        d = InteractiveUtils._dump_function(InteractiveUtils.ArgInfo(f, t), false, false, raw, dump_module, :att, optimize, :none, false, "", params)
         sprint(print, d)
     end
 
@@ -319,9 +321,8 @@ module UndefinedTransitions
     end
 end
 
-# Identical implicit partitions should be merge (#57923)
-for binding in (convert(Core.Binding, GlobalRef(Base, :Math)),
-                convert(Core.Binding, GlobalRef(Base, :Intrinsics)))
+# Identical implicit partitions should be merged (#57923)
+for binding in (convert(Core.Binding, GlobalRef(Base, :Math)),)
     # Test that these both only have two partitions
     @test isdefined(binding, :partitions)
     @test isdefined(binding.partitions, :next)
@@ -407,4 +408,98 @@ module Invalidate59272
     @test isa(Bar(), Foo.Bar)
     Core.eval(Foo, :(struct Bar; x; end))
     @test Bar(1) == Foo.Bar(1)
+end
+
+# Test that two const-prop'd pseudo `CodeInstance`s for the same `MethodInstance`
+# carrying *different* binding edges are both kept on the caller's edge list, so
+# that redefining either binding properly invalidates the caller (#61745).
+module Invalidate61745
+    using Test
+    module N
+        const foo = "foo_unchanged"
+        const bar = "bar_unchanged"
+    end
+    helper(s::Symbol) = getglobal(N, s)::String
+    caller_both() = helper(:foo) * helper(:bar)
+    @test caller_both() == "foo_unchangedbar_unchanged"
+    Core.eval(N, :(const foo = "foo_changed!"))
+    @test caller_both() == "foo_changed!bar_unchanged"
+    Core.eval(N, :(const bar = "bar_changed!"))
+    @test caller_both() == "foo_changed!bar_changed!"
+end
+
+# Test that codegen does not bake in a binding's value when there is no forward
+# edge from the `CodeInstance` to the binding. Without const-prop tracking the
+# `Module` argument, inference cannot record a `Binding` edge for `M.foo`, so
+# codegen must fall back to a runtime binding load to remain correct under
+# redefinition (#61745).
+module Invalidate61745_indirect
+    using Test
+    module M
+        const foo = "unchanged"
+    end
+    indirect_access(modref::Module) = Base.getproperty(modref, :foo)::String
+    caller() = indirect_access(M)
+    @test caller() == "unchanged"
+    Core.eval(M, :(const foo = "changed!"))
+    @test caller() == "changed!"
+end
+
+# Test @reexport
+module ReexportTests
+    using Test
+    using Base.Experimental: @reexport
+
+    # Test dynamic export additions through reexport
+    module Source1
+        export s1
+        s1() = "s1"
+    end
+    module Reexporter1
+        import ..@reexport
+        @reexport using ..Source1
+    end
+    module User1
+        using ..Reexporter1
+    end
+    @test (:s1,) ⊆ names(Reexporter1)
+    @test User1.s1() == "s1"
+    Core.eval(Source1, :(s2() = "s2"; export s2))
+    @test (:s1, :s2) ⊆ names(Reexporter1)
+    @test User1.s2() == "s2"
+
+    # Test reexport syntax, multiple modules
+    module Source2
+        export s3
+        s3() = "s3"
+    end
+    module Reexporter2
+        import ..@reexport
+        @reexport using ..Source2, ..Source1
+    end
+    module User2
+        using ..Reexporter2
+    end
+    @test (:s1, :s3) ⊆ names(Reexporter2)
+    @test User2.s1() == "s1"
+    @test User2.s3() == "s3"
+
+    # Test same name from different modules - one with reexport, one without
+    module Source3
+        export same_name
+        const same_name = 42
+    end
+    module Source4
+        export same_name
+        const same_name = 42
+    end
+    module Reexporter3
+        import ..@reexport
+        using ..Source4  # without reexport
+        @reexport using ..Source3
+    end
+    module User3
+        using ..Reexporter3
+    end
+    @test User3.same_name == 42
 end

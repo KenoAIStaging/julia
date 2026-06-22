@@ -138,7 +138,7 @@ for (fname, sz) in ((:jump_128, 128), (:jump_192, 192))
 
         This can be used to generate `2^$($seq_pow)` non-overlapping subsequences for parallel computations.
 
-        See also: [`$($fname)`](@ref), [`$($see_other!)`](@ref)
+        See also [`$($fname)`](@ref), [`$($see_other!)`](@ref).
 
         # Examples
         ```julia-repl
@@ -159,7 +159,7 @@ for (fname, sz) in ((:jump_128, 128), (:jump_192, 192))
 
         This can be used to generate `2^$($seq_pow)` non-overlapping subsequences for parallel computations.
 
-        See also: [`$($fname!)`](@ref), [`$($see_other)`](@ref)
+        See also [`$($fname!)`](@ref), [`$($see_other)`](@ref).
 
         # Examples
         ```julia-repl
@@ -289,7 +289,7 @@ for FT in (Float16, Float32, Float64)
     # in the interval [0, 1).  This is equivalent to, but more easily extensible than
     #     Float16(i >>>  5) * Float16(0x1.0p-11)
     #     Float32(i >>>  8) * Float32(0x1.0p-24)
-    #     Float32(i >>> 11) * Float64(0x1.0p-53)
+    #     Float64(i >>> 11) * Float64(0x1.0p-53)
     @eval @inline _uint2float(i::$(UT), ::Type{$(FT)}) =
         $(FT)(i >>> $(8 * sizeof(FT) - precision(FT))) * $(FT(2) ^ -precision(FT))
 

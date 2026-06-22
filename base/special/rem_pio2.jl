@@ -82,7 +82,7 @@ end
         y1 = r-w
         high = highword(y1)
         i = j-((high>>20)&0x7ff)
-        if i>49 # 3rd iteration need, 151 bits acc
+        if i>49 # 3rd iteration needed, 151 bits acc
             t  = r # will cover all possible cases
             w  = fn*pio2_3
             r  = t-w
@@ -97,6 +97,7 @@ end
 
 """
     fromfraction(f::Int128)
+
 Compute a tuple of values `(z1,z2)` such that
     ``z1 + z2 == f / 2^128``
 and the significand of `z1` has 27 trailing zeros.
@@ -211,6 +212,7 @@ end
 
 """
     rem_pio2_kernel(x::Union{Float32, Float64})
+
 Calculate `x` divided by `π/2` accurately for arbitrarily large `x`.
 Returns a pair `(k, r)`, where `k` is the quadrant of the result
 (multiple of π/2) and `r` is the remainder, such that ``k * π/2 = x - r``.

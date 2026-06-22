@@ -227,7 +227,7 @@ function validate_tags(tags::Dict)
     # Validate `os`/`arch`/`call_abi` combination
     throw_call_abi_mismatch() = throw(ArgumentError("Invalid os/arch/call_abi combination: $(tags["os"])/$(tags["arch"])/$(tags["call_abi"])"))
     if tags["os"] == "linux" && tags["arch"] ∈ ("armv7l", "armv6l")
-        # If an ARM linux has does not have `call_abi` set to something valid, be sad.
+        # If an ARM linux does not have `call_abi` set to something valid, be sad.
         if !haskey(tags, "call_abi") || tags["call_abi"] ∉ ("eabihf", "eabi")
             throw_call_abi_mismatch()
         end
@@ -620,22 +620,12 @@ const arch_march_isa_mapping = let
             "avx2" => get_set("x86_64", "haswell"),
             "avx512" => get_set("x86_64", "skylake_avx512"),
         ],
-        "armv6l" => [
-            "arm1176jzfs" => get_set("armv6l", "arm1176jzfs"),
-        ],
-        "armv7l" => [
-            "armv7l" => get_set("armv7l", "armv7l"),
-            "neonvfpv4" => get_set("armv7l", "armv7l+neon+vfpv4"),
-        ],
         "aarch64" => [
             "armv8_0" => get_set("aarch64", "armv8.0-a"),
             "armv8_1" => get_set("aarch64", "armv8.1-a"),
             "armv8_2_crypto" => get_set("aarch64", "armv8.2-a+crypto"),
             "a64fx" => get_set("aarch64", "a64fx"),
             "apple_m1" => get_set("aarch64", "apple_m1"),
-        ],
-        "powerpc64le" => [
-            "power8" => get_set("powerpc64le", "power8"),
         ],
         "riscv64" => [
             "riscv64" => get_set("riscv64", "riscv64"),
@@ -832,7 +822,7 @@ function parse_dl_name_version(path::String, os::String=_this_os_name())
         # On OSX, libraries look like `libnettle.6.3.dylib`
         dlregex = r"^(.*?)((?:\.[\d]+)*)\.dylib$"sa
     else
-        # On Linux and others BSD, libraries look like `libnettle.so.6.3.0`
+        # On Linux and other BSDs, libraries look like `libnettle.so.6.3.0`
         dlregex = r"^(.*?)\.so((?:\.[\d]+)*)$"sa
     end
 
@@ -858,7 +848,7 @@ function parse_dl_name_version(path::AbstractString, os::AbstractString=_this_os
 end
 
 function get_csl_member(member::Symbol)
-    # If CompilerSupportLibraries_jll is an stdlib, we can just grab things from it
+    # If CompilerSupportLibraries_jll is a stdlib, we can just grab things from it
     csl_pkgids = filter(pkgid -> pkgid.name == "CompilerSupportLibraries_jll", keys(Base.loaded_modules))
     if !isempty(csl_pkgids)
         CSL_mod = Base.loaded_modules[first(csl_pkgids)]
@@ -872,6 +862,42 @@ function get_csl_member(member::Symbol)
     return nothing
 end
 
+
+function _get_libgfortran_path()
+    # If CompilerSupportLibraries_jll is a stdlib, we can just directly ask for
+    # the path here, without checking `dllist()`:
+    libgfortran_path = get_csl_member(:libgfortran_path)
+    if libgfortran_path !== nothing
+        return libgfortran_path::String
+    end
+
+    # Otherwise, look for it having already been loaded by something
+    libgfortran_paths = filter!(x -> occursin("libgfortran", x), Libdl.dllist())
+    if !isempty(libgfortran_paths)
+        return first(libgfortran_paths)::String
+    end
+
+    # One day, I hope to not be linking against libgfortran in base Julia
+    return nothing
+end
+
+function _get_libstdcxx_handle()
+    # If CompilerSupportLibraries_jll is a stdlib, we can just directly open it
+    libstdcxx = get_csl_member(:libstdcxx)
+    if libstdcxx !== nothing
+        return nothing
+    end
+
+    # Otherwise, look for it having already been loaded by something
+    libstdcxx_paths = filter!(x -> occursin("libstdc++", x), Libdl.dllist())
+    if !isempty(libstdcxx_paths)
+        return Libdl.dlopen(first(libstdcxx_paths), Libdl.RTLD_NOLOAD)::Ptr{Cvoid}
+    end
+
+    # One day, I hope to not be linking against libstdc++ in base Julia
+    return nothing
+end
+
 """
     detect_libgfortran_version()
 
@@ -880,25 +906,7 @@ linked against (if any).  Returns `nothing` if no libgfortran version dependence
 detected.
 """
 function detect_libgfortran_version()
-    function get_libgfortran_path()
-        # If CompilerSupportLibraries_jll is an stdlib, we can just directly ask for
-        # the path here, without checking `dllist()`:
-        libgfortran_path = get_csl_member(:libgfortran_path)
-        if libgfortran_path !== nothing
-            return libgfortran_path::String
-        end
-
-        # Otherwise, look for it having already been loaded by something
-        libgfortran_paths = filter!(x -> occursin("libgfortran", x), Libdl.dllist())
-        if !isempty(libgfortran_paths)
-            return first(libgfortran_paths)::String
-        end
-
-        # One day, I hope to not be linking against libgfortran in base Julia
-        return nothing
-    end
-
-    libgfortran_path = get_libgfortran_path()
+    libgfortran_path = _get_libgfortran_path()
     name, version = parse_dl_name_version(libgfortran_path, os())
     if version === nothing
         # Even though we complain about this, we allow it to continue in the hopes that
@@ -922,25 +930,8 @@ it is linked against (if any).  `max_minor_version` is the latest version in the
 3.4 series of GLIBCXX where the search is performed.
 """
 function detect_libstdcxx_version(max_minor_version::Int=30)
-    function get_libstdcxx_handle()
-        # If CompilerSupportLibraries_jll is an stdlib, we can just directly open it
-        libstdcxx = get_csl_member(:libstdcxx)
-        if libstdcxx !== nothing
-            return nothing
-        end
-
-        # Otherwise, look for it having already been loaded by something
-        libstdcxx_paths = filter!(x -> occursin("libstdc++", x), Libdl.dllist())
-        if !isempty(libstdcxx_paths)
-            return Libdl.dlopen(first(libstdcxx_paths), Libdl.RTLD_NOLOAD)::Ptr{Cvoid}
-        end
-
-        # One day, I hope to not be linking against libgfortran in base Julia
-        return nothing
-    end
-
     # Brute-force our way through GLIBCXX_* symbols to discover which version we're linked against
-    libstdcxx = get_libstdcxx_handle()
+    libstdcxx = _get_libstdcxx_handle()
 
     if libstdcxx !== nothing
         # Try all GLIBCXX versions down to GCC v4.8:
@@ -1096,7 +1087,7 @@ function platforms_match(a::AbstractPlatform, b::AbstractPlatform)
 
         # Call the comparator, passing in which objects requested this comparison (one, the other, or both)
         # For some comparators this doesn't matter, but for non-symmetrical comparisons, it does.
-        if !(comparator(ak, bk, a_comp === comparator, b_comp === comparator)::Bool)
+        if !(@invokelatest(comparator(ak, bk, a_comp === comparator, b_comp === comparator))::Bool)
             return false
         end
     end

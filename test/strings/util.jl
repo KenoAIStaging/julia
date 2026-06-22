@@ -178,7 +178,7 @@ end
         @test collect(Iterators.partition("foobars",n))[1]=="foobars"
     end
 
-    # HOWEVER enumerate explicitly slices String "atoms" so `Chars` are returned
+    # HOWEVER enumerate explicitly slices String "atoms" so `Tuple{Int, Char}` pairs are returned
     let v=collect(Iterators.partition(enumerate("foobars"),1))
         @test v==Vector{Tuple{Int64, Char}}[[(1, 'f')],[(2, 'o')],[(3, 'o')],[(4, 'b')],[(5, 'a')],[(6, 'r')], [(7, 's')]]
     end
@@ -709,6 +709,11 @@ end
 
         @test isa(chopprefix(S("foo"), "fo"), SubString)
         @test isa(chopsuffix(S("foo"), "oo"), SubString)
+
+        @test chopprefix(S(""), 'z') == chopsuffix(S(""), 'z') == ""
+        @test chopprefix(S("吃齋"), '🍖') == chopsuffix(S("吃齋"), '🍖') == "吃齋"
+        @test chopprefix(S("äwesome"), 'ä') == "wesome"
+        @test chopsuffix(S("äwesome"), 'e') == "äwesom"
     end
 end
 

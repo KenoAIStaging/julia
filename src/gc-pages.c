@@ -66,7 +66,7 @@ char *jl_gc_try_alloc_pages_(int pg_cnt) JL_NOTSAFEPOINT
 }
 
 // Allocate the memory for a new page. Starts with `block_pg_cnt` number
-// of pages. Decrease 4x every time so that there are enough space for a few.
+// of pages. Decrease 4x every time so that there is enough space for a few
 // more chunks (or other allocations). The final page count is recorded
 // and will be used as the starting count next time. If the page count is
 // smaller `MIN_BLOCK_PG_ALLOC` a `jl_memory_exception` is thrown.
@@ -138,21 +138,23 @@ NOINLINE jl_gc_pagemeta_t *jl_gc_alloc_page(void) JL_NOTSAFEPOINT
         gc_alloc_map_set(meta->data, GC_PAGE_ALLOCATED);
         goto exit;
     }
-    // must map a new set of pages
-    char *data = jl_gc_try_alloc_pages();
-    meta = (jl_gc_pagemeta_t*)malloc_s(block_pg_cnt * sizeof(jl_gc_pagemeta_t));
-    for (int i = 0; i < block_pg_cnt; i++) {
-        jl_gc_pagemeta_t *pg = &meta[i];
-        pg->data = data + GC_PAGE_SZ * i;
-        gc_alloc_map_maybe_create(pg->data);
-        if (i == 0) {
-            gc_alloc_map_set(pg->data, GC_PAGE_ALLOCATED);
+    {
+        // must map a new set of pages
+        char *data = jl_gc_try_alloc_pages();
+        meta = (jl_gc_pagemeta_t*)malloc_s(block_pg_cnt * sizeof(jl_gc_pagemeta_t));
+        for (int i = 0; i < block_pg_cnt; i++) {
+            jl_gc_pagemeta_t *pg = &meta[i];
+            pg->data = data + GC_PAGE_SZ * i;
+            gc_alloc_map_maybe_create(pg->data);
+            if (i == 0) {
+                gc_alloc_map_set(pg->data, GC_PAGE_ALLOCATED);
+            }
+            else {
+                push_lf_back(&global_page_pool_clean, pg);
+            }
         }
-        else {
-            push_lf_back(&global_page_pool_clean, pg);
-        }
+        uv_mutex_unlock(&gc_pages_lock);
     }
-    uv_mutex_unlock(&gc_pages_lock);
 exit:
 #ifdef _OS_WINDOWS_
     VirtualAlloc(meta->data, GC_PAGE_SZ, MEM_COMMIT, PAGE_READWRITE);
@@ -163,7 +165,7 @@ exit:
 }
 
 // return a page to the freemap allocator
-void jl_gc_free_page(jl_gc_pagemeta_t *pg) JL_NOTSAFEPOINT
+NOINLINE void jl_gc_free_page(jl_gc_pagemeta_t *pg) JL_NOTSAFEPOINT
 {
     void *p = pg->data;
     gc_alloc_map_set((char*)p, GC_PAGE_FREED);

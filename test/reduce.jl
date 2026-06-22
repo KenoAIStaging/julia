@@ -532,13 +532,13 @@ let f(x) = x == 1 ? true : x == 2 ? false : 1
     @test_throws TypeError all(map(f,[1,3]))
 end
 
-# any and all with functors
+# any and all with callable structs
 
-struct SomeFunctor end
-(::SomeFunctor)(x) = true
+struct SomeCallable end
+(::SomeCallable)(x) = true
 
-@test @inferred any(SomeFunctor(), 1:10)
-@test @inferred all(SomeFunctor(), 1:10)
+@test @inferred any(SomeCallable(), 1:10)
+@test @inferred all(SomeCallable(), 1:10)
 
 
 # in
@@ -592,7 +592,7 @@ struct NonFunctionIsZero end
 @test count(!, [true false; false true], dims=:, init=Int16(0)) === 2
 @test isequal(count(identity, [true false; false true], dims=2, init=UInt(0)), reshape(UInt[1, 1], 2, 1))
 
-## cumsum, cummin, cummax
+## cumsum
 
 z = rand(10^6)
 let es = sum(BigFloat.(z)), es2 = sum(BigFloat.(z[1:10^5]))
@@ -776,4 +776,18 @@ end
 let A=[1;;]
     @test reduce(vcat, Any[A]) !== A
     @test reduce(hcat, Any[A]) !== A
+end
+
+# issue #61805
+@testset "foldr interaction with flatten" begin
+    @test foldr(*, Iterators.flatten([["a", "b"], ["c", "d"]])) == "abcd"
+
+    # Ideally, foldr would always get the right answer, but that currently requires that the iterator supports Iterators.reverse
+    # This tests a stateful iterator that cannot implement Iterators.reverse, ensuring it either errors or gets the right answer
+    res = try
+        foldr(tuple, Iterators.flatten((Iterators.Stateful(1:2), (3,))))
+    catch e
+        e
+    end
+    @test (res isa Exception) || res == (1, (2, 3))
 end

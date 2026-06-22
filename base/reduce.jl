@@ -198,9 +198,10 @@ foldl(op, itr; kw...) = mapfoldl(identity, op, itr; kw...)
 ## foldr & mapfoldr
 
 function mapfoldr_impl(f, op, nt, itr)
-    op′, itr′ = _xfadjoint(BottomRF(FlipArgs(op)), Generator(f, itr))
-    return foldl_impl(op′, nt, _reverse_iter(itr′))
+    op′, itr′ = _xfadjoint(BottomRF(FlipArgs(op)), Generator(f, _reverse_iter(itr)))
+    return foldl_impl(op′, nt, itr′)
 end
+
 
 _reverse_iter(itr) = Iterators.reverse(itr)
 _reverse_iter(itr::Union{Tuple,NamedTuple}) = length(itr) <= 32 ? reverse(itr) : Iterators.reverse(itr) #33235
@@ -218,7 +219,7 @@ Like [`mapreduce`](@ref), but with guaranteed right associativity, as in [`foldr
 provided, the keyword argument `init` will be used exactly once. In general, it will be
 necessary to provide `init` to work with empty collections.
 """
-mapfoldr(f, op, itr; init=_InitialValue()) = mapfoldr_impl(f, op, init, itr)
+mapfoldr(f::F, op::F2, itr; init=_InitialValue()) where {F,F2} = mapfoldr_impl(f, op, init, itr)
 
 
 """
@@ -237,7 +238,7 @@ julia> foldr(=>, 1:4; init=0)
 1 => (2 => (3 => (4 => 0)))
 ```
 """
-foldr(op, itr; kw...) = mapfoldr(identity, op, itr; kw...)
+foldr(op::F, itr; kw...) where {F} = mapfoldr(identity, op, itr; kw...)
 
 ## reduce & mapreduce
 

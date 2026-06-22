@@ -33,9 +33,9 @@ typedef struct {
   var = (decltype(var))alloca((n))
 #else
 #define JL_CPPALLOCA(var,n)                                                         \
-  JL_GCC_IGNORE_START("-Wc++-compat")                                               \
+  JL_CC_IGNORE_START("-Wc++-compat")                                               \
   var = alloca((n));                                                                \
-  JL_GCC_IGNORE_STOP
+  JL_CC_IGNORE_STOP
 #endif
 
 #ifdef __clang_gcanalyzer__
@@ -266,7 +266,7 @@ static jl_value_t *eval_value(jl_value_t *e, interpreter_state *s)
             assert(n > 0);
             if (s->sparam_vals && n <= jl_svec_len(s->sparam_vals)) {
                 jl_value_t *sp = jl_svecref(s->sparam_vals, n - 1);
-                defined = !jl_is_typevar(sp);
+                defined = !jl_is_svec(sp) && !jl_has_free_typevars(sp);
             }
             else {
                 // static parameter val unknown needs to be an error for ccall
@@ -324,8 +324,21 @@ static jl_value_t *eval_value(jl_value_t *e, interpreter_state *s)
         assert(n > 0);
         if (s->sparam_vals && n <= jl_svec_len(s->sparam_vals)) {
             jl_value_t *sp = jl_svecref(s->sparam_vals, n - 1);
-            if (jl_is_typevar(sp) && !s->preevaluation)
-                jl_undefined_var_error(((jl_tvar_t*)sp)->name, (jl_value_t*)jl_static_parameter_sym);
+            if ((jl_is_svec(sp) || jl_has_free_typevars(sp)) && !s->preevaluation) {
+                // look up the parameter name from the method's signature
+                jl_unionall_t *sig = (jl_unionall_t*)s->mi->def.method->sig;
+                jl_tvar_t *var = NULL;
+                for (ssize_t i = n; i > 0; i--) {
+                    if (jl_is_unionall(sig)) {
+                        var = sig->var;
+                        sig = (jl_unionall_t*)sig->body;
+                    }
+                    else {
+                        jl_error("malformed method signature");
+                    }
+                }
+                jl_undefined_var_error(var->name, (jl_value_t*)jl_static_parameter_sym);
+            }
             return sp;
         }
         // static parameter val unknown needs to be an error for ccall
@@ -539,13 +552,14 @@ static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, size_t ip,
             }
             s->locals[jl_source_nslots(s->src) + ip] = jl_box_ulong(jl_excstack_state(ct));
             if (jl_enternode_scope(stmt)) {
-                jl_value_t *scope = eval_value(jl_enternode_scope(stmt), s);
-                // GC preserve the scope, since it is not rooted in the `jl_handler_t *`
-                // and may be removed from jl_current_task by any nested block and then
-                // replaced later
-                JL_GC_PUSH1(&scope);
-                ct->scope = scope;
-                if (!jl_setjmp(__eh.eh_ctx, 1)) {
+                jl_value_t *old_scope = ct->scope; // Identical to __eh.scope
+                // GC preserve the old_scope, since it is not rooted in the `jl_handler_t *`,
+                // the newly entered scope is preserved through the current_task.
+                JL_GC_PUSH1(&old_scope);
+                jl_value_t *new_scope = eval_value(jl_enternode_scope(stmt), s);
+                jl_gc_wb_current_task(ct, new_scope);
+                ct->scope = new_scope;
+                if (!jl_setjmp(__eh.eh_ctx, 0)) {
                     ct->eh = &__eh;
                     eval_body(stmts, s, next_ip, toplevel);
                     jl_unreachable();
@@ -553,7 +567,7 @@ static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, size_t ip,
                 JL_GC_POP();
             }
             else {
-                if (!jl_setjmp(__eh.eh_ctx, 1)) {
+                if (!jl_setjmp(__eh.eh_ctx, 0)) {
                     ct->eh = &__eh;
                     eval_body(stmts, s, next_ip, toplevel);
                     jl_unreachable();
@@ -634,21 +648,6 @@ static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, size_t ip,
                     jl_value_t *res = jl_toplevel_eval(s->module, stmt);
                     s->locals[jl_source_nslots(s->src) + s->ip] = res;
                 }
-                else if (head == jl_globaldecl_sym) {
-                    jl_value_t *val = NULL;
-                    if (jl_expr_nargs(stmt) >= 2) {
-                        val = eval_value(jl_exprarg(stmt, 1), s);
-                        s->locals[jl_source_nslots(s->src) + s->ip] = val; // temporarily root
-                    }
-                    jl_declare_global(s->module, jl_exprarg(stmt, 0), val, 1);
-                    s->locals[jl_source_nslots(s->src) + s->ip] = jl_nothing;
-                }
-                else if (head == jl_const_sym) {
-                    jl_value_t *val = jl_expr_nargs(stmt) == 1 ? NULL : eval_value(jl_exprarg(stmt, 1), s);
-                    s->locals[jl_source_nslots(s->src) + s->ip] = val; // temporarily root
-                    jl_eval_const_decl(s->module, jl_exprarg(stmt, 0), val);
-                    s->locals[jl_source_nslots(s->src) + s->ip] = jl_nothing;
-                }
                 else if (head == jl_latestworld_sym) {
                     ct->world_age = jl_atomic_load_acquire(&jl_world_counter);
                 }
@@ -728,8 +727,7 @@ jl_value_t *jl_code_or_ci_for_interpreter(jl_method_instance_t *mi, size_t world
                 // under the assumption that the interpreter may need to
                 // access it frequently. TODO: Have some sort of usage-based
                 // cache here.
-                m->source = (jl_value_t*)src;
-                jl_gc_wb(m, src);
+                jl_gc_write(m, m->source, src);
             }
             ret = (jl_value_t*)src;
         }

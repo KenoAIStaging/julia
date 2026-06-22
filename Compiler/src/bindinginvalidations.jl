@@ -3,7 +3,8 @@
 using ..Compiler: _uncompressed_ir, specializations, get_ci_mi, convert, unsafe_load, cglobal, generating_output, has_image_globalref,
     PARTITION_MASK_KIND, PARTITION_KIND_GUARD, PARTITION_FLAG_EXPORTED, PARTITION_FLAG_DEPRECATED,
     BINDING_FLAG_ANY_IMPLICIT_EDGES, binding_kind, partition_restriction, is_some_imported,
-    is_some_binding_imported, is_some_implicit, SizeUnknown, maybe_add_binding_backedge!, walk_binding_partition, abstract_eval_partition_load, userefs
+    is_some_binding_imported, is_some_implicit, SizeUnknown, maybe_add_binding_backedge!, walk_binding_partition, abstract_eval_partition_load, userefs,
+    MaybeCompressed
 using .Core: SimpleVector, CodeInfo
 
 function foreachgr(visit, src::CodeInfo)
@@ -56,7 +57,7 @@ end
 function invalidate_method_for_globalref!(gr::GlobalRef, method::Method, invalidated_bpart::Core.BindingPartition, new_max_world::UInt)
     invalidate_all = false
     binding = convert(Core.Binding, gr)
-    if isdefined(method, :source)
+    if isdefined(method, :source) && isa(method.source, MaybeCompressed)
         src = _uncompressed_ir(method)
         invalidate_all = should_invalidate_code_for_globalref(gr, src)
     end
@@ -170,6 +171,7 @@ end
 
 function scan_new_method!(method::Method, image_backedges_only::Bool)
     isdefined(method, :source) || return
+    isa(method.source, MaybeCompressed) || return
     if image_backedges_only && !has_image_globalref(method)
         return
     end
@@ -178,7 +180,7 @@ function scan_new_method!(method::Method, image_backedges_only::Bool)
     foreachgr(src) do gr::GlobalRef
         b = convert(Core.Binding, gr)
         if binding_was_invalidated(b)
-            # TODO: We could turn this into an addition if condition. For now, use it as a reasonably cheap
+            # TODO: We could turn this into an additional if condition. For now, use it as a reasonably cheap
             # additional consistency check
             @assert !image_backedges_only
             @atomic method.did_scan_source |= 0x4
@@ -188,7 +190,7 @@ function scan_new_method!(method::Method, image_backedges_only::Bool)
     @atomic method.did_scan_source |= 0x1
 end
 
-function scan_new_methods!(extext_methods::Vector{Any}, internal_methods::Vector{Any}, image_backedges_only::Bool)
+function scan_new_methods!(internal_methods::Vector{Any}, image_backedges_only::Bool)
     if image_backedges_only && generating_output(true)
         # Replacing image bindings is forbidden during incremental precompilation - skip backedge insertion
         return
@@ -197,8 +199,5 @@ function scan_new_methods!(extext_methods::Vector{Any}, internal_methods::Vector
         if isa(method, Method)
            scan_new_method!(method, image_backedges_only)
         end
-    end
-    for tme::Core.TypeMapEntry in extext_methods
-        scan_new_method!(tme.func::Method, image_backedges_only)
     end
 end

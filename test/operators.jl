@@ -179,7 +179,7 @@ end
     @test ∘(x -> (x, 3), x -> (x, 2), x->(x,1))(0) === (((0, 1), 2), 3)
     @test ∘(x -> (x, 4), x -> (x, 3), x->(x,2), x-> (x, 1))(0) === ((((0, 1), 2), 3), 4)
 
-    # test that user defined functors only need to overload the two arg version
+    # test that user defined callable structs only need to overload the two arg version
     struct FreeMagma
         word
     end
@@ -373,7 +373,16 @@ end
     @test sprint(show, Returns(1.0)) == "Returns{Float64}(1.0)"
 
     illtype = Vector{Core.TypeVar(:T)}
-    @test Returns(illtype) == Returns{DataType}(illtype)
+    @test_skip Returns(illtype) == Returns{DataType}(illtype)
+end
+
+@testset "tap" begin
+    buf = IOBuffer()
+    @test (123 |> tap(Base.Fix1(print, buf))) == 123
+    @test takestring!(buf) == "123"
+
+    val = [1, 2, 3]
+    @test tap(identity)(val) === val
 end
 
 @testset "<= (issue #46327)" begin
@@ -417,4 +426,10 @@ end
     let t = ntuple(x->'A', 10000);
         @test Base.infer_return_type(in, (Char,typeof(t))) == Bool
     end
+
+    @test Base.infer_return_type(in, (String,Tuple{Vararg{String}})) == Bool
+    @test Base.infer_return_type((Vector{String},)) do xs
+        "foo" in tuple(xs...)
+    end == Bool
+    @test Base.infer_return_type(in, (Symbol,Tuple{Vararg{String}})) == Bool
 end

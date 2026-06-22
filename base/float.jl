@@ -166,9 +166,7 @@ IEEE 754 definition of the minimum exponent.
 """
 ieee754_exponent_min(::Type{T}) where {T<:IEEEFloat} = Int(1 - exponent_max(T))::Int
 
-exponent_min(::Type{Float16}) = ieee754_exponent_min(Float16)
-exponent_min(::Type{Float32}) = ieee754_exponent_min(Float32)
-exponent_min(::Type{Float64}) = ieee754_exponent_min(Float64)
+exponent_min(T::Union{Type{Float16},Type{Float32},Type{Float64}}) = ieee754_exponent_min(T)
 
 function ieee754_representation(
     ::Type{F}, sign_bit::Bool, exponent_field::Integer, significand_field::Integer
@@ -224,7 +222,7 @@ function ieee754_representation(
 end
 
 """
-    uabs(x::Integer)
+    Base.uabs(x::Integer)
 
 Return the absolute value of `x`, possibly returning a different type should the
 operation be susceptible to overflow. This typically arises when `x` is a two's complement
@@ -345,17 +343,8 @@ Float32(x::Float16) = fpext(Float32, x)
 Float64(x::Float32) = fpext(Float64, x)
 Float64(x::Float16) = fpext(Float64, x)
 
-AbstractFloat(x::Bool)    = Float64(x)
-AbstractFloat(x::Int8)    = Float64(x)
-AbstractFloat(x::Int16)   = Float64(x)
-AbstractFloat(x::Int32)   = Float64(x)
-AbstractFloat(x::Int64)   = Float64(x) # LOSSY
-AbstractFloat(x::Int128)  = Float64(x) # LOSSY
-AbstractFloat(x::UInt8)   = Float64(x)
-AbstractFloat(x::UInt16)  = Float64(x)
-AbstractFloat(x::UInt32)  = Float64(x)
-AbstractFloat(x::UInt64)  = Float64(x) # LOSSY
-AbstractFloat(x::UInt128) = Float64(x) # LOSSY
+# lossy for the 64- and 128-bit integer types
+AbstractFloat(x::Union{Bool, BitInteger}) = Float64(x)
 
 Bool(x::Float16) = x==0 ? false : x==1 ? true : throw(InexactError(:Bool, Bool, x))
 
@@ -391,7 +380,7 @@ Float64
 """
 float(::Type{T}) where {T<:Number} = typeof(float(zero(T)))
 float(::Type{T}) where {T<:AbstractFloat} = T
-float(::Type{Union{}}, slurp...) = Union{}(0.0)
+float(::Type{Union{}}, slurp...) = Union{}
 
 """
     unsafe_trunc(T, x)
@@ -425,7 +414,9 @@ end
 
 function unsafe_trunc(::Type{UInt128}, x::Float64)
     xu = reinterpret(UInt64,x)
-    k = Int(xu >> 52) & 0x07ff - 1075
+    # use `% Int` instead of `Int(...)` to preserve `:nothrow` (the shifted value
+    # fits in 11 bits, but `Int(::UInt64)` would otherwise add a bounds check)
+    k = ((xu >> 52) % Int) & 0x07ff - 1075
     xu = (xu & 0x000f_ffff_ffff_ffff) | 0x0010_0000_0000_0000
     if k <= 0
         UInt128(xu >> -k)
@@ -619,7 +610,6 @@ end
 
 ## floating point comparisons ##
 ==(x::T, y::T) where {T<:IEEEFloat} = eq_float(x, y)
-!=(x::T, y::T) where {T<:IEEEFloat} = ne_float(x, y)
 <( x::T, y::T) where {T<:IEEEFloat} = lt_float(x, y)
 <=(x::T, y::T) where {T<:IEEEFloat} = le_float(x, y)
 
@@ -709,7 +699,7 @@ See also: [`iszero`](@ref), [`isone`](@ref), [`isinf`](@ref), [`ismissing`](@ref
 isnan(x::AbstractFloat) = (x != x)::Bool
 isnan(x::Number) = false
 
-isfinite(x::AbstractFloat) = !isnan(x - x)
+isfinite(x::AbstractFloat) = !(isnan(x - x)::Bool)
 isfinite(x::Real) = decompose(x)[3] != 0
 isfinite(x::Integer) = true
 
@@ -808,13 +798,8 @@ precision(::Type{T}; base::Integer=2) where {T<:AbstractFloat} = _precision(T, b
 precision(::T; base::Integer=2) where {T<:AbstractFloat} = precision(T; base)
 
 
-"""
-    nextfloat(x::AbstractFloat, n::Integer)
-
-The result of `n` iterative applications of `nextfloat` to `x` if `n >= 0`, or `-n`
-applications of [`prevfloat`](@ref) if `n < 0`.
-"""
-function nextfloat(f::IEEEFloat, d::Integer)
+function _nextfloat(f::IEEEFloat, dneg::Bool, da::Integer)
+    # da must be > 0
     F = typeof(f)
     fumax = reinterpret(Unsigned, F(Inf))
     U = typeof(fumax)
@@ -824,8 +809,6 @@ function nextfloat(f::IEEEFloat, d::Integer)
     fneg = fi < 0
     fu = unsigned(fi & typemax(fi))
 
-    dneg = d < 0
-    da = uabs(d)
     if da > typemax(U)
         fneg = dneg
         fu = fumax
@@ -853,6 +836,14 @@ function nextfloat(f::IEEEFloat, d::Integer)
 end
 
 """
+    nextfloat(x::AbstractFloat, n::Integer)
+
+The result of `n` iterative applications of `nextfloat` to `x` if `n >= 0`, or `-n`
+applications of [`prevfloat`](@ref) if `n < 0`.
+"""
+nextfloat(f::AbstractFloat, d::Integer) = _nextfloat(f, isnegative(d), uabs(d))
+
+"""
     nextfloat(x::AbstractFloat)
 
 Return the smallest floating point number `y` of the same type as `x` such that `x < y`.
@@ -860,7 +851,7 @@ If no such `y` exists (e.g. if `x` is `Inf` or `NaN`), then return `x`.
 
 See also: [`prevfloat`](@ref), [`eps`](@ref), [`issubnormal`](@ref).
 """
-nextfloat(x::AbstractFloat) = nextfloat(x,1)
+nextfloat(x::AbstractFloat) = nextfloat(x, 1)
 
 """
     prevfloat(x::AbstractFloat, n::Integer)
@@ -868,7 +859,7 @@ nextfloat(x::AbstractFloat) = nextfloat(x,1)
 The result of `n` iterative applications of `prevfloat` to `x` if `n >= 0`, or `-n`
 applications of [`nextfloat`](@ref) if `n < 0`.
 """
-prevfloat(x::AbstractFloat, d::Integer) = nextfloat(x, -d)
+prevfloat(x::AbstractFloat, d::Integer) = _nextfloat(x, ispositive(d), uabs(d))
 
 """
     prevfloat(x::AbstractFloat)
@@ -876,7 +867,7 @@ prevfloat(x::AbstractFloat, d::Integer) = nextfloat(x, -d)
 Return the largest floating point number `y` of the same type as `x` such that `y < x`.
 If no such `y` exists (e.g. if `x` is `-Inf` or `NaN`), then return `x`.
 """
-prevfloat(x::AbstractFloat) = nextfloat(x,-1)
+prevfloat(x::AbstractFloat) = nextfloat(x, -1)
 
 for Ti in (Int8, Int16, Int32, Int64, Int128, UInt8, UInt16, UInt32, UInt64, UInt128)
     for Tf in (Float16, Float32, Float64)
@@ -899,7 +890,7 @@ for Ti in (Int8, Int16, Int32, Int64, Int128, UInt8, UInt16, UInt32, UInt64, UIn
                     if ($(Tf(typemin(Ti))) <= x < $(Tf(typemax(Ti))+one(Tf))) && isinteger(x)
                         return unsafe_trunc($Ti,x)
                     else
-                        throw(InexactError($(Expr(:quote,Ti.name.name)), $Ti, x))
+                        throw(InexactError($(Expr(:quote,nameof(Ti))), $Ti, x))
                     end
                 end
             end
@@ -920,7 +911,7 @@ for Ti in (Int8, Int16, Int32, Int64, Int128, UInt8, UInt16, UInt32, UInt64, UIn
                     if ($(Tf(typemin(Ti))) <= x < $(Tf(typemax(Ti)))) && isinteger(x)
                         return unsafe_trunc($Ti,x)
                     else
-                        throw(InexactError($(Expr(:quote,Ti.name.name)), $Ti, x))
+                        throw(InexactError($(Expr(:quote,nameof(Ti))), $Ti, x))
                     end
                 end
             end
@@ -1066,7 +1057,7 @@ julia> 1.0 + eps()/2
 ```
 
 More generally, for any floating-point numeric type, `eps` corresponds to an
-upper bound on the distance to the nearest floating-point complex value: if ``\text{fl}(x)`` is the closest
+upper bound on the distance to the nearest floating-point value: if ``\text{fl}(x)`` is the closest
 floating-point value to a number ``x`` (e.g. an arbitrary real number), then ``\text{fl}(x)``
 satisfies ``|x - \text{fl}(x)| ≤ \text{eps}(x)/2``, not including overflow cases.
 This allows the definition of `eps` to be extended to complex numbers,
