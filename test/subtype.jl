@@ -3293,3 +3293,21 @@ end
 # (e.g. Union{Int64,String}) are not expressible as a finite case split
 @test !((Tuple{T,Ref{T}} where T<:Union{Integer,AbstractString}) <:
     Union{Tuple{S,Ref{S}} where S<:Integer, Tuple{S,Ref{S}} where S<:AbstractString})
+
+# The bottom singleton class (Type{Union{}} / typeof(Union{})) spans two kinds
+# (TypeEq nodes and the TypeofBottom DataType), so Type{typeof(Union{})} is
+# under no single kind; a Type{Union{}} argument must not dispatch as DataType
+@test !(Type{Type{Union{}}} <: DataType)
+@test !(Core.Typeof(Type{Union{}}) <: DataType)
+@test !(Type{Type{Union{}}} <: TypeEq)
+# ... while the single-kind judgments are unaffected
+@test Type{Union{}} <: Core.TypeofBottom
+@test Core.TypeofBottom <: Type{Union{}}
+@test Type{Int} <: DataType
+let
+    local f
+    f(::DataType) = 1
+    f(@nospecialize _) = 2
+    @test f(Int) == 1
+    @test f(Type{Union{}}) == 2
+end

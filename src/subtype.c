@@ -743,6 +743,7 @@ int obviously_disjoint(jl_value_t *a, jl_value_t *b, int specificity) JL_NOTSAFE
 
 jl_value_t *simple_union(jl_value_t *a, jl_value_t *b);
 // compute a least upper bound of `a` and `b`
+
 static jl_value_t *simple_join(jl_value_t *a, jl_value_t *b)
 {
     if (a == jl_bottom_type || b == (jl_value_t*)jl_any_type || obviously_egal(a, b))
@@ -751,9 +752,11 @@ static jl_value_t *simple_join(jl_value_t *a, jl_value_t *b)
         return a;
     if (!(jl_is_type(a) || jl_is_typevar(a)) || !(jl_is_type(b) || jl_is_typevar(b)))
         return (jl_value_t*)jl_any_type;
-    if (jl_is_kind(a) && jl_is_typeeq(b) && jl_typeof(jl_typeeq_T(b)) == a)
+    if (jl_is_kind(a) && jl_is_typeeq(b) && jl_typeof(jl_typeeq_T(b)) == a &&
+        !jl_is_bottom_singleton_class(jl_typeeq_T(b)))
         return a;
-    if (jl_is_kind(b) && jl_is_typeeq(a) && jl_typeof(jl_typeeq_T(a)) == b)
+    if (jl_is_kind(b) && jl_is_typeeq(a) && jl_typeof(jl_typeeq_T(a)) == b &&
+        !jl_is_bottom_singleton_class(jl_typeeq_T(a)))
         return b;
     if (jl_is_typevar(a) && obviously_egal(b, ((jl_tvar_t*)a)->lb))
         return a;
@@ -778,9 +781,11 @@ static jl_value_t *simple_meet(jl_value_t *a, jl_value_t *b, int overesi)
         return jl_new_struct(jl_intersect_type, a, b);
     if (!(jl_is_type(a) || jl_is_typevar(a)) || !(jl_is_type(b) || jl_is_typevar(b)))
         return jl_bottom_type;
-    if (jl_is_kind(a) && jl_is_typeeq(b) && jl_typeof(jl_typeeq_T(b)) == a)
+    if (jl_is_kind(a) && jl_is_typeeq(b) && jl_typeof(jl_typeeq_T(b)) == a &&
+        !jl_is_bottom_singleton_class(jl_typeeq_T(b)))
         return b;
-    if (jl_is_kind(b) && jl_is_typeeq(a) && jl_typeof(jl_typeeq_T(a)) == b)
+    if (jl_is_kind(b) && jl_is_typeeq(a) && jl_typeof(jl_typeeq_T(a)) == b &&
+        !jl_is_bottom_singleton_class(jl_typeeq_T(a)))
         return a;
     if (jl_is_typevar(a) && obviously_egal(b, ((jl_tvar_t*)a)->ub))
         return a;
@@ -2426,7 +2431,12 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, jl_param_pos_t p
         jl_value_t *tp0 = jl_typeeq_T(x);
         if (!jl_is_typevar(tp0)) {
             // TypeEq(T) dispatches as the singleton type of T. For example,
-            // TypeEq(Int) is a subtype of DataType, but not of TypeEq.
+            // TypeEq(Int) is a subtype of DataType, but not of TypeEq. The
+            // bottom singleton class is the exception (see
+            // is_bottom_singleton_class): it is under no single kind, so
+            // answer as for `Type` itself, parallel to the typevar case.
+            if (jl_is_bottom_singleton_class(tp0))
+                return subtype((jl_value_t*)jl_anytype_type, y, e, param);
             return subtype(jl_typeof(tp0), y, e, param);
         }
         // `TypeEq(T)` for a free typevar `T` is the kind of all types matching
@@ -3019,7 +3029,7 @@ static int obvious_subtype(jl_value_t *x, jl_value_t *y, jl_value_t *y0, int *su
             if (((jl_datatype_t*)x)->name != ((jl_datatype_t*)y)->name) {
                 if (jl_is_typeeq(x) && jl_is_kind(y)) {
                     jl_value_t *t0 = jl_typeeq_T(x);
-                    if (jl_is_typevar(t0))
+                    if (jl_is_typevar(t0) || jl_is_bottom_singleton_class(t0))
                         return 0;
                     *subtype = jl_typeof(t0) == y;
                     return 1;

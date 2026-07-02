@@ -2009,11 +2009,20 @@ void jl_precompute_memoized_dt(jl_datatype_t *dt, int cacheable)
                 dt->isconcretetype = (jl_is_datatype(p) && ((jl_datatype_t*)p)->isconcretetype) ||
                     p == jl_bottom_type;
             if (dt->isdispatchtuple) {
+                // A `TypeEq` element denotes the singleton of its parameter and
+                // can be dispatched on exactly -- except when the parameter is
+                // the bottom singleton type, whose type-equality class contains
+                // representations of two kinds (see
+                // jl_is_bottom_singleton_class), so `Type{typeof(Union{})}` is
+                // a two-member set and exact (leaf) matching on it has no
+                // correct answer; leave such tuples to the general
+                // subtype/intersection lookup paths.
                 dt->isdispatchtuple =
                     (jl_is_datatype(p) && ((!jl_is_kind(p) && ((jl_datatype_t*)p)->isconcretetype) ||
                      (p == (jl_value_t*)jl_typeofbottom_type) || // == Type{Union{}}, so needs to be consistent
                      (((jl_datatype_t*)p)->name == jl_type_typename && !((jl_datatype_t*)p)->hasfreetypevars))) ||
-                    (jl_is_typeeq(p) && !jl_has_free_typevars(p));
+                    (jl_is_typeeq(p) && !jl_has_free_typevars(p) &&
+                     !jl_is_bottom_singleton_class(jl_typeeq_T(p)));
             }
         }
         if (jl_is_vararg(p))
