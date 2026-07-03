@@ -1142,8 +1142,11 @@ function schedule(t::Task, @nospecialize(arg); error=false)
             # lazy collection instead (this path must never block).
             w = @atomicswap t.waiting_on = nothing
             w isa WaitEntry && try_unlink_claimed!(w)
-            # A parked task is never in a workqueue and wait registrations do not
-            # go through `t.queue`, so any queue here is a sticky workqueue.
+            # A parked task is never in a workqueue and wait registrations
+            # (including in-flight libuv writes, whose sentinel waitee lives
+            # on the WaitEntry, see stream.jl) do not go through `t.queue`,
+            # so any queue here is a sticky workqueue. (The type assert also
+            # keeps this call statically resolvable for trimmed builds.)
             q = t.queue
             q === nothing || list_deletefirst!(q::StickyWorkqueue, t)
             setfield!(t, :result, arg)
@@ -1172,7 +1175,7 @@ function yield()
     try
         wait()
     catch
-        q = ct.queue; q === nothing || list_deletefirst!(q::StickyWorkqueue, ct)
+        q = ct.queue; q === nothing || list_deletefirst!(q, ct)
         rethrow()
     end
 end
@@ -1506,6 +1509,24 @@ when a cancellation is requested.
 """
 Core.cancellation_point!
 
+# Deliver a cancellation to a task parked through a sentinel wait protocol
+# (`t.queue` holds the waitee, no WaitEntry registration). Conservative
+# fallback for waitees that do not implement cancellation delivery: leave the
+# request pending; the wait is not interrupted, but the task observes the
+# request at its next cancellation point.
+cancel_wait!(@nospecialize(waitee), t::Task, @nospecialize(creq)) = false
+
+function cancel_wait!(q::StickyWorkqueue, t::Task, @nospecialize(creq))
+    # Tasks in a workqueue are runnable - we do not cancel anything, the
+    # pending request is observed when the task runs.
+    lock(q.lock)
+    try
+        return (t in q.queue)
+    finally
+        unlock(q.lock)
+    end
+end
+
 function cancel!(t::Task, crequest=CANCEL_REQUEST_SAFE)
     # TODO: Raise task priority
     @atomic :release t.cancellation_request = crequest
@@ -1566,9 +1587,18 @@ function cancel!(t::Task, crequest=CANCEL_REQUEST_SAFE)
                 schedule(t, conform_cancellation_request(crequest), error=true)
             end
         else
+            # No claimable wait registration. The task may still be parked
+            # through a sentinel protocol that stores the waitee in t.queue
+            # (e.g. in-flight libuv write requests, see stream.jl), in which
+            # case the waitee's `cancel_wait!` performs the delivery; a
+            # runnable task in a workqueue is left queued (the request is
+            # observed when it runs). Otherwise the task is running and we
+            # send the cancellation signal, which interrupts it if a reset
+            # point is established.
             q = t.queue
-            runnable = q isa StickyWorkqueue && @lock q.lock (t in q.queue)
-            if !runnable
+            if q !== nothing
+                invokelatest(cancel_wait!, q, t, crequest)
+            else
                 tid = Threads.threadid(t)
                 if tid != 0
                     ccall(:jl_send_cancellation_signal, Cvoid, (Int16,), (tid - 1) % Int16)
