@@ -4258,8 +4258,6 @@ void jl_init_types(void) JL_GC_DISABLED
                         jl_emptysvec,
                         0, 1, 6);
     XX(task);
-    jl_value_t *listt = jl_new_struct(jl_uniontype_type, jl_task_type, jl_nothing_type);
-    jl_svecset(jl_task_type->types, 0, listt);
     // Set field 20 (metrics_enabled) as const
     // Set fields 8 (_state), 24-27 (metric counters), 28 (waiting_on) and
     // 30 (cancellation_request) as atomic
