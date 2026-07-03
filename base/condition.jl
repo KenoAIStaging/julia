@@ -287,6 +287,7 @@ function wait(c::GenericCondition; first::Bool=false, waitee=c,
             return nothing
         end
         # We are delivering the request to ourselves as an exception.
+        acknowledge_cancellation!(ct, cr)
         throw(cr)
     end
     token = unlockall(c.lock)
