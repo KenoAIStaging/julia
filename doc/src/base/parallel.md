@@ -90,8 +90,6 @@ Base.CANCEL_REQUEST_ABANDON_EXTERNAL
 Base.CANCEL_REQUEST_ABANDON_ALL
 Base.@cancel_check
 Base.CANCEL_TOKEN
-Base.with_cancel_token
-Base.cancellation_token
 ```
 
 ## [Low-level synchronization using `schedule` and `wait`](@id low-level-schedule-wait)
