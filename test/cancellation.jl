@@ -1196,10 +1196,12 @@ end
     @test occursin("CancellationRequest: Safe Cancellation (CANCEL_REQUEST_SAFE)", output)
     @test p.exitcode == 1
 
-    # TODO(port): the @sync compute-spinner ^C test is deferred while the port
-    # of #60281 proceeds: it needs signal-thread episode marking + bound-source
-    # propagation (the -t1 child's listener task starves behind the compiled
-    # spinner). It is restored by the commits that port that machinery.
+    # TODO(port): the @sync compute-spinner ^C sub-test is deferred until the
+    # scoped-child delivery port lands (7a32ba2f40, "Deliver a pending ^C to
+    # scoped tasks without the listener"): signal-side marking covers the
+    # episode source, but the spinner here is bound to the @sync child source,
+    # which at JULIA_NUM_THREADS=1 nothing marks without that commit's
+    # per-thread bound-source propagation - the child spins forever.
 
     # Escalation: an unresponsive process warns after 1s, and a second ^C
     # abandons the stuck task; with the interactive evaluator gone, the
@@ -1464,10 +1466,24 @@ if Sys.isunix()
         expect("srv-open=true")
         expect("julia> ")
 
-        # TODO(port): the BigInt ^C sub-test (issue #56545) is deferred a few
-        # commits: its victim spends its time inside gc-unsafe GMP ccalls on
-        # the io thread, so listener-based delivery starves; restored when
-        # the signal-thread episode marking lands later in this series.
+        # cancelling a BigInt computation never yanks control out of libgmp
+        # in an unsafe spot the way the old asynchronous InterruptException
+        # delivery could (corrupting the heap - issue #56545): the loop is
+        # deliberately checkless - delivery lands either on an MPZ entry
+        # point's own cancellation point, asynchronously inside audited
+        # libgmp compute (unwound via the reset region published across the
+        # annotated call), or inside the allocation hooks (deferred and
+        # chained into the reset on exit) - and BigInt arithmetic in the
+        # session works correctly afterwards
+        sendline("println(\"EVAL-6\"); let b = big(3); while true; b = b*b % (big(10)^200); end; end")
+        expect("EVAL-6")
+        sleep(0.5)
+        kill(p, Base.SIGINT)
+        expect("CancellationRequest")
+        expect("julia> ")
+        sendline("println(string(factorial(big(30))))")
+        expect("265252859812191058636308480000000")
+        expect("julia> ")
 
         sendline("exit()")
         @test success(p)
