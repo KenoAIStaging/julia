@@ -539,10 +539,10 @@ function cancel!(src::CancellationTokenSource,
         throw(ArgumentError("invalid cancellation severity $(repr(request.request))"))
     end
     _raise_state!(src, sev) || return false
-    # Pairs with the compiler-order-only publication of per-task token
-    # bindings at compiled cancellation points (upcoming): after this fence,
-    # either the canceller observes the binding of a running task, or the
-    # task's next cancellation point observes our state write.
+    # Pair with the compiler-order-only publication of `bound_cancel_token`
+    # (and of foreign-call cancellation guards) at cancellation points: after
+    # this fence, either we observe the binding of a running task, or its
+    # next cancellation point observes our state write.
     Threads.atomic_fence_heavy()
     # Mark the subtree (waking parked waiters): each node is marked before
     # its children so a concurrent construction of a child source is
@@ -699,9 +699,11 @@ function _cancel_running!(src::CancellationTokenSource, sev::UInt8)
         else
             tid = ccall(:jl_get_task_tid, Int16, (Any,), t)
             if tid >= 0
-                # Best-effort: the signal only unwinds published (reset-safe)
-                # regions; a miss is recovered level-triggered at the task's
-                # next cancellation point.
+                # Best-effort: the signal only delivers to a published
+                # interruptible-region context (a compiled reset point, or a
+                # foreign call carrying a cancellation handler); a miss is
+                # recovered level-triggered at the task's next cancellation
+                # point.
                 ccall(:jl_send_cancellation_signal, Cvoid, (Int16,), tid)
             end
         end
