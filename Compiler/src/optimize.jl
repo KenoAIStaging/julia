@@ -55,7 +55,8 @@ const NUM_IR_FLAGS = 3 # sync with julia.h
 
 const IR_FLAGS_EFFECTS =
     IR_FLAG_CONSISTENT | IR_FLAG_EFFECT_FREE | IR_FLAG_NOTHROW |
-    IR_FLAG_TERMINATES | IR_FLAG_NOUB | IR_FLAG_NORTCALL
+    IR_FLAG_TERMINATES | IR_FLAG_NOUB | IR_FLAG_NORTCALL |
+    IR_FLAG_EFIIMO | IR_FLAG_INACCESSIBLEMEM_OR_ARGMEM
 
 const IR_FLAGS_REMOVABLE = IR_FLAG_EFFECT_FREE | IR_FLAG_NOTHROW | IR_FLAG_TERMINATES
 
@@ -85,7 +86,9 @@ function flags_for_effects(effects::Effects)
     if is_terminates(effects)
         flags |= IR_FLAG_TERMINATES
     end
-    if is_inaccessiblemem_or_argmemonly(effects)
+    if is_inaccessiblememonly(effects) || is_inaccessiblemem_or_argmemonly(effects)
+        # `ALWAYS_TRUE` is strictly stronger than `INACCESSIBLEMEM_OR_ARGMEM`; both
+        # satisfy what this flag advertises
         flags |= IR_FLAG_INACCESSIBLEMEM_OR_ARGMEM
     end
     if is_noub(effects)
