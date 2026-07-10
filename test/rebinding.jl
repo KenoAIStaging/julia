@@ -1239,6 +1239,21 @@ module GlobalSpeculation
     @test_throws DomainError SpecM9.thrower!([1.0, 4.0, -1.0, 9.0])
     @test SpecM9.acc === 3.0
 
+    # top-level thunks speculate too: the prologue's redundant re-declaration (and
+    # its :latestworld marker) is proven inert, and the fast path is additionally
+    # guarded on the world counter still being the thunk's inference world
+    @eval module SpecM13; tacc = 0.0; end
+    Core.eval(SpecM13, :(for i = 1:100
+        global tacc += i * 0.5
+    end))
+    @test SpecM13.tacc === 2525.0
+    # ... and a thunk whose world moved mid-loop still behaves (deopt correctness)
+    Core.eval(SpecM13, :(for i = 1:3
+        global tacc = tacc + 1.0
+        i == 2 && @eval SpecM13 some_fresh_method() = 1
+    end))
+    @test SpecM13.tacc === 2528.0
+
     # deoptimization: a value outside the compiled speculation stays correct, both
     # through the generic copy (old world) and after recompiling on the widened guard
     @eval module SpecM12

@@ -59,6 +59,25 @@ const BIF_FLAGS_SIMPLE = IR_FLAG_EFFECT_FREE | IR_FLAG_NOTHROW | IR_FLAG_TERMINA
 const BIF_DEBUG = RefValue{Bool}(false)
 bif_debug_bail(i::Int, reason::String) = BIF_DEBUG[] && println("bifurcation bail at stmt ", i, ": ", reason)
 
+# A weak `Core.declare_global` of a binding that is already declared is a runtime
+# no-op: `jl_declare_global` neither replaces the partition nor bumps the world.
+# Lowering pairs every such declaration with a `:latestworld` marker; a marker whose
+# declaration is provably a no-op is inert (see `latestworld_is_inert`), so neither
+# statement can observe a deferred store.
+function bif_noop_weak_declare(world::UInt, @nospecialize(stmt))
+    isexpr(stmt, :call) || return false
+    args = (stmt::Expr).args
+    length(args) == 4 || return false
+    f = args[1]
+    (isa(f, GlobalRef) && f.mod === Core && f.name === :declare_global) || return false
+    (isa(args[2], Module) && isa(args[3], QuoteNode) && isa((args[3]::QuoteNode).value, Symbol) &&
+     args[4] === false) || return false
+    b = convert(Core.Binding, GlobalRef(args[2]::Module, (args[3]::QuoteNode).value::Symbol))
+    kind = binding_kind(lookup_binding_partition(world, b))
+    return kind == PARTITION_KIND_DECLARED || kind == PARTITION_KIND_GLOBAL ||
+        is_some_const_binding(kind)
+end
+
 function bif_leaf_binding(world::UInt, b::Core.Binding)
     partition = lookup_binding_partition(world, b)
     return first(walk_to_leaf_partition(b, partition, world))
@@ -193,6 +212,13 @@ function bif_classify!(plan::BifurcationPlan, ci::CodeInfo, sv::OptimizationStat
             stmt = rhs
             head = stmt.head
         end
+        if head === :latestworld
+            # inert (redundant-declaration) markers cannot observe the deferral; a
+            # marker after a real world bump must bail (inference has already given
+            # up on precise reasoning past it anyway)
+            (i > 1 && bif_noop_weak_declare(world, code[i-1])) && continue
+            return false
+        end
         if head === :boundscheck || head === :meta || head === :loopinfo ||
            head === :code_coverage_effect || head === :inbounds || head === :isdefined ||
            head === :throw_undef_if_not || head === :copyast ||
@@ -201,6 +227,7 @@ function bif_classify!(plan::BifurcationPlan, ci::CodeInfo, sv::OptimizationStat
             continue # cannot access binding memory
         end
         if head === :call || head === :invoke
+            bif_noop_weak_declare(world, stmt) && continue # cannot touch any binding's value
             args = stmt.args
             firstarg = head === :invoke ? 2 : 1
             f = args[firstarg]
@@ -447,15 +474,25 @@ function bifurcate_speculated_globals!(ci::CodeInfo, sv::OptimizationState)
     code = ci.code
     stmt = code[cand]
     isexpr(stmt, :(=)) && (stmt = stmt.args[2])
-    isa(stmt, GlobalRef) || return nothing
+    if !isa(stmt, GlobalRef)
+        bif_debug_bail(cand, "candidate is not a direct GlobalRef read")
+        return nothing
+    end
     interp = sv.inlining.interp
     world = get_inference_world(interp)
     info = stmt_info[cand]::SpeculatedGlobalAccessInfo
     spec = info.spec
-    (isa(spec, Type) && spec !== Any && spec !== Union{} && !has_free_typevars(spec)) ||
+    if !(isa(spec, Type) && spec !== Any && spec !== Union{} && !has_free_typevars(spec))
+        bif_debug_bail(cand, "unusable speculation")
         return nothing
+    end
     plan = BifurcationPlan(stmt, bif_leaf_binding(world, info.b), spec)
-    bif_classify!(plan, ci, sv, world) || return nothing
+    if !bif_classify!(plan, ci, sv, world)
+        isempty(plan.reads) && bif_debug_bail(cand, "no reads matched the candidate binding")
+        return nothing
+    end
+    BIF_DEBUG[] && println("bifurcating on ", plan.gr, " :: ", plan.spec, " (",
+                           length(plan.reads), " reads, ", length(plan.stores), " stores)")
 
     𝕃 = optimizer_lattice(interp)
     fast_ssatypes, fast_entries, virt_join = bif_fast_types(ci, sv, plan, 𝕃)
@@ -474,6 +511,24 @@ function bifurcate_speculated_globals!(ci::CodeInfo, sv::OptimizationState)
 
     # prefix: the one read and its guards
     grmod, grname = plan.gr.mod, plan.gr.name
+    g0 = 0
+    if !isa(sv.linfo.def, Method)
+        # In a top-level thunk the speculated facts (in particular the fast copy's
+        # invokes) are only known valid at the world this code was inferred in:
+        # unlike a method, nothing re-validates a thunk against later worlds, and
+        # execution proceeds at whatever world its (inert) prologue markers observe.
+        # Guard on the world counter still being the inference world -- any
+        # definition anywhere since then deopts to the generic copy, which subsumes
+        # invalidation for this run-once code. The check is once per thunk entry;
+        # loops contain no world markers, so the age cannot move inside them.
+        wc = bif_push!(em, Expr(:foreigncall, Expr(:tuple, QuoteNode(:jl_get_world_counter)),
+                                UInt, Core.svec(), 0, QuoteNode(:ccall)),
+                       UInt, IR_FLAG_NOTHROW | IR_FLAG_EFFECT_FREE | IR_FLAG_TERMINATES,
+                       NoCallInfo(), 0, 0)
+        weq = bif_push!(em, Expr(:call, GlobalRef(Core, :(===)), SSAValue(wc), world),
+                        Bool, BIF_FLAGS_SIMPLE, NoCallInfo(), 0, 0)
+        g0 = bif_push!(em, GotoIfNot(SSAValue(weq), 0), Any, IR_FLAG_NOTHROW, NoCallInfo(), 0, 0)
+    end
     defchk = bif_push!(em, Expr(:call, GlobalRef(Core, :isdefinedglobal), grmod, QuoteNode(grname)),
                        Bool, BIF_FLAGS_SIMPLE, NoCallInfo(), 0, 0)
     g1 = bif_push!(em, GotoIfNot(SSAValue(defchk), 0), Any, IR_FLAG_NOTHROW, NoCallInfo(), 0, 0)
@@ -578,6 +633,7 @@ function bifurcate_speculated_globals!(ci::CodeInfo, sv::OptimizationState)
     end
 
     # patch branch targets
+    g0 != 0 && (em.code[g0] = GotoIfNot((em.code[g0]::GotoIfNot).cond, gmap[1]))
     em.code[g1] = GotoIfNot((em.code[g1]::GotoIfNot).cond, gmap[1])
     em.code[g2] = GotoIfNot((em.code[g2]::GotoIfNot).cond, gmap[1])
     if has_stores

@@ -4207,6 +4207,38 @@ struct AbstractEvalBasicStatementResult
     end
 end
 
+# Is this `:latestworld` marker provably a no-op? Lowering pairs every weak global
+# declaration with a marker, but `jl_declare_global` does not replace the partition
+# (and so does not bump the world) when the binding is already declared. Proving that
+# lets the rest of the frame -- typically a top-level thunk whose prologue re-declares
+# a long-existing global -- keep precise world reasoning, in particular the global
+# type speculations the bifurcation pass keys on. The proof is validated for this
+# inference's world range only, which is sound for cached code through the ordinary
+# validity bounds and for run-once thunks through the bifurcation pass's
+# world-freshness guard.
+function latestworld_is_inert(interp::AbstractInterpreter, frame::InferenceState)
+    pc = frame.currpc
+    pc > 1 || return false
+    prev = frame.src.code[pc-1]
+    isexpr(prev, :call) || return false
+    length(prev.args) == 4 || return false
+    f = prev.args[1]
+    (isa(f, GlobalRef) && f.mod === Core && f.name === :declare_global) || return false
+    m = prev.args[2]
+    s = prev.args[3]
+    (isa(m, Module) && isa(s, QuoteNode) && isa(s.value, Symbol) && prev.args[4] === false) ||
+        return false
+    gr = GlobalRef(m, s.value::Symbol)
+    partition = lookup_binding_partition!(interp, gr, frame)
+    kind = binding_kind(partition)
+    kind == PARTITION_KIND_DECLARED || kind == PARTITION_KIND_GLOBAL ||
+        is_some_const_binding(kind) || return false
+    # the proof depends on this partition: record the binding edge so cached code is
+    # invalidated if the declaration stops being redundant
+    frame.stmt_info[pc] = GlobalAccessInfo(convert(Core.Binding, gr))
+    return true
+end
+
 @inline function abstract_eval_basic_statement(
     interp::AbstractInterpreter, @nospecialize(stmt), sstate::StatementState, frame::InferenceState,
     result::Union{Nothing,Future{RTEffects}}=nothing)
@@ -4257,7 +4289,7 @@ end
                     (hd !== :boundscheck && is_meta_expr(stmt)))
                 rt = Nothing
             elseif hd === :latestworld
-                currsaw_latestworld = true
+                currsaw_latestworld = currsaw_latestworld || !latestworld_is_inert(interp, frame)
                 rt = Nothing
             else
                 result = abstract_eval_statement_expr(interp, stmt, sstate, frame)::Future{RTEffects}
