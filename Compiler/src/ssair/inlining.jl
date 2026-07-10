@@ -618,6 +618,36 @@ end
 
 function batch_inline!(ir::IRCode, todo::Vector{Pair{Int,Any}}, propagate_inbounds::Bool, interp::AbstractInterpreter)
     params = OptimizationParams(interp)
+    # Splicing an inlinee destructively updates its `IRCode` (unless
+    # `preserve_local_sources` copied it), so a local source that ends up in more
+    # than one todo -- e.g. because the bifurcation pass duplicated the call
+    # statement into both copies of the body -- must be copied for every use after
+    # the first.
+    let seen = IdSet{IRCode}()
+        dedupe = function (item::InliningTodo)
+            if item.ir in seen
+                return InliningTodo(item.mi, copy(item.ir), item.spec_info, item.di, item.effects)
+            end
+            push!(seen, item.ir)
+            return item
+        end
+        for i = 1:length(todo)
+            (idx, item) = todo[i]
+            if isa(item, InliningTodo)
+                newitem = dedupe(item)
+                newitem !== item && (todo[i] = Pair{Int,Any}(idx, newitem))
+            elseif isa(item, UnionSplit)
+                cases = item.cases
+                for j = 1:length(cases)
+                    case = cases[j]
+                    if isa(case.item, InliningTodo)
+                        newitem = dedupe(case.item)
+                        newitem !== case.item && (cases[j] = InliningCase(case.sig, newitem))
+                    end
+                end
+            end
+        end
+    end
     # Compute the new CFG first (modulo statement ranges, which will be computed below)
     state = CFGInliningState(ir)
     for (idx, item) in todo
