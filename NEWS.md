@@ -54,10 +54,14 @@ Compiler/Runtime improvements
     ([#41199], [#47574]).
   - Code using untyped global variables is now significantly faster: the runtime tracks
     a *speculated* type for every untyped global (the union of the types of all values
-    assigned to it so far), and the compiler uses it to emit a fast path specialized on
-    the speculated type -- guarded by a cheap runtime test -- with a generic call as the
-    fallback. Assigning a value of a new type widens the speculation; the guarded code
-    remains correct either way ([#8870]).
+    assigned to it so far), and the compiler versions function bodies on it -- one read
+    and one speculation test up front, a fast body in which the global's value is kept
+    unboxed in registers (with redundant stores to the global elided until the function
+    returns, throws, or the binding could otherwise be observed), and a generic body as
+    the fallback. Since unsynchronized globals are non-atomic, concurrent modification
+    remains permitted but may be observed to interleave at a coarser granularity than
+    program order. Assigning a value of a new type widens the speculation; compiled
+    speculations remain correct either way ([#8870]).
   - Stack traces now show full method signatures with argument types for inlined
     frames, matching the display of non-inlined frames ([#53925]).
   - Parallel package precompilation now coordinates CPU usage across both the

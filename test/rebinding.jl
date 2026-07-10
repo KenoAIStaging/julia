@@ -1187,4 +1187,67 @@ module GlobalSpeculation
     @test invokelatest(SpecM8.addone) === 1.5
     setglobal!(SpecM8, :n, 1)
     @test invokelatest(SpecM8.addone) === 2
+
+    # when the whole body can be versioned on the speculation guard, the global is
+    # read once, kept unboxed through the loop (write-after-write elided), and the
+    # pending store is materialized only at the exits
+    @eval module SpecM9
+        acc = 0.0
+        function spin!(n)
+            global acc
+            for i = 1:n
+                acc += i * 0.5
+            end
+        end
+        function thrower!(xs)
+            global acc
+            for x in xs
+                acc += sqrt(x)
+            end
+        end
+    end
+    SpecM9.spin!(2)
+    let (src, _) = only(code_typed(SpecM9.spin!, (Int,); optimize=true))
+        is_setglobal = stmt -> begin
+            Meta.isexpr(stmt, :call) || return false
+            f = stmt.args[1]
+            f isa GlobalRef && (f = getglobal(f.mod, f.name))
+            f === Core.setglobal!
+        end
+        # one materialization per exit (return, the unwind edge, and the one store
+        # in the generic copy); never one per iteration
+        @test 1 <= count(is_setglobal, src.code) <= 3
+        @test any(src.code) do stmt
+            Meta.isexpr(stmt, :call) || return false
+            f = stmt.args[1]
+            f isa GlobalRef && (f = getglobal(f.mod, f.name))
+            f === Core.Intrinsics.add_float
+        end
+        # the accumulator is loop-carried as an unboxed Float64 φ, not re-read from
+        # the binding (which would type it `Any`)
+        @test any(i -> src.code[i] isa Core.PhiNode && src.ssavaluetypes[i] === Float64,
+                  1:length(src.code))
+    end
+    setglobal!(SpecM9, :acc, 0.0)
+    SpecM9.spin!(100)
+    @test SpecM9.acc === sum((1:100) .* 0.5)
+
+    # an exception escaping mid-loop must leave the last completed iteration's value
+    # in the global: the deferred store materializes on the unwind edge
+    SpecM9.thrower!([1.0]) # compile
+    setglobal!(SpecM9, :acc, 0.0)
+    @test_throws DomainError SpecM9.thrower!([1.0, 4.0, -1.0, 9.0])
+    @test SpecM9.acc === 3.0
+
+    # deoptimization: a value outside the compiled speculation stays correct, both
+    # through the generic copy (old world) and after recompiling on the widened guard
+    @eval module SpecM12
+        v = 1.0
+        double!() = (global v; v = v + v)
+    end
+    @test SpecM12.double!() === 2.0
+    setglobal!(SpecM12, :v, 21) # widens the speculation and invalidates
+    @test invokelatest(SpecM12.double!) === 42
+    setglobal!(SpecM12, :v, 21.0)
+    @test invokelatest(SpecM12.double!) === 42.0
 end

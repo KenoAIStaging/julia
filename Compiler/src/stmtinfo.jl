@@ -494,15 +494,40 @@ end
 
 Records that this call was inferred against the *speculated* types of one or more of its
 arguments (see `Speculated`): `spec_argtypes` are the argument types the enclosed `info`
-was computed at; the call's actual argument types are wider. The inlining pass resolves
-this into an `isa`-guarded fast path for the speculated signature with the original
-generic call as the fallback. The enclosed info must never be treated as covering the
-full call.
+was computed at (with `spec_rt`/`spec_effects` the return type and effects of that
+inference); the call's actual argument types are wider. The optimizer resolves this
+either by bifurcating the whole function on the speculation guard (in which case the
+fast copy's arguments really have the speculated types and the enclosed info applies
+directly), or per call site into an `isa`-guarded fast path with the original generic
+call as the fallback. The enclosed info must never be treated as covering the full call.
 """
 struct SpeculatedCallInfo <: CallInfo
     spec_argtypes::Vector{Any}
     info::CallInfo
+    spec_rt
+    spec_effects::Effects
+    SpeculatedCallInfo(spec_argtypes::Vector{Any}, info::CallInfo, @nospecialize(spec_rt),
+                       spec_effects::Effects) =
+        new(spec_argtypes, info, spec_rt, spec_effects)
 end
 add_edges_impl(edges::Vector{Any}, info::SpeculatedCallInfo) = add_edges!(edges, info.info)
+
+"""
+    info::SpeculatedGlobalAccessInfo <: CallInfo
+
+Records that this statement reads an untyped global whose binding partition carried the
+speculated type `spec` when inference evaluated it (the read's sound type is `Any`; see
+`Speculated`). The bifurcation pass keys off this info: it must use exactly this
+speculation for its guard, not a fresh partition lookup, since the partition may have
+been replaced (and the speculation widened) after inference read it.
+"""
+struct SpeculatedGlobalAccessInfo <: CallInfo
+    b::Core.Binding
+    spec
+    SpeculatedGlobalAccessInfo(b::Core.Binding, @nospecialize(spec)) = new(b, spec)
+end
+function add_edges_impl(edges::Vector{Any}, info::SpeculatedGlobalAccessInfo)
+    push!(edges, info.b)
+end
 
 @specialize

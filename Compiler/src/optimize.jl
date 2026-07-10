@@ -274,6 +274,7 @@ include("ssair/legacy.jl")
 include("ssair/EscapeAnalysis.jl")
 include("ssair/passes.jl")
 include("ssair/irinterp.jl")
+include("bifurcate.jl")
 
 function ir_to_codeinf!(opt::OptimizationState{I}, frame::InferenceState{I}, edges::SimpleVector) where {I<:AbstractInterpreter}
     ir_to_codeinf!(opt, edges, compute_inlining_cost(frame.interp::I, frame.result, opt.optresult))
@@ -1070,6 +1071,9 @@ function run_passes_ipo_safe(
     end
 
     __stage__ = 0  # used by @pass
+    # resolve global-type speculation by versioning the whole body on the
+    # speculation guard (must run first: it rewrites the slotted CodeInfo)
+    bifurcate_speculated_globals!(ci, sv)
     # NOTE: The pass name MUST be unique for `optimize_until::String` to work
     @pass "CC: CONVERT"   ir = convert_to_ircode!(ci, sv)
     @pass "CC: SLOT2REG"  ir = slot2reg(ir, ci, sv)

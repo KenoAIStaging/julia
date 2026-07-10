@@ -3220,9 +3220,11 @@ function abstract_call_speculated(interp::AbstractInterpreter, arginfo::ArgInfo,
     end
     call = abstract_call(interp, ArgInfo(arginfo.fargs, spec_argtypes), si, vtypes, sv, max_methods)::Future
     return Future{CallMeta}(call, interp, sv) do call, interp, sv
-        srt = widenconst(ignorelimited(widenslotwrapper(call.rt)))
+        spec_rt = widenspeculation(ignorelimited(widenslotwrapper(call.rt)))
+        srt = widenconst(spec_rt)
         rt = (srt === Any || srt === Union{} || has_free_typevars(srt)) ? Any : Speculated(srt)
-        return CallMeta(rt, Any, Effects(), SpeculatedCallInfo(spec_argtypes, call.info))
+        return CallMeta(rt, Any, Effects(),
+            SpeculatedCallInfo(spec_argtypes, call.info, spec_rt, call.effects))
     end
 end
 
@@ -4236,6 +4238,13 @@ end
         end
         if !isa(stmt, Expr)
             (; rt, exct, effects, refinements) = abstract_eval_special_value(interp, stmt, sstate, frame)
+            if isa(stmt, GlobalRef) && isa(rt, Speculated)
+                # record the speculation the partition carried when we read it; the
+                # bifurcation pass must guard on exactly this type (the partition may
+                # be replaced after inference looked at it)
+                frame.stmt_info[frame.currpc] =
+                    SpeculatedGlobalAccessInfo(convert(Core.Binding, stmt), rt.spec)
+            end
         else
             hd = stmt.head
             if hd === :method
