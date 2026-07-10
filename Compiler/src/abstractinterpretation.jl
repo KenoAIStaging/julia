@@ -4208,14 +4208,17 @@ struct AbstractEvalBasicStatementResult
 end
 
 # Is this `:latestworld` marker provably a no-op? Lowering pairs every weak global
-# declaration with a marker, but `jl_declare_global` does not replace the partition
-# (and so does not bump the world) when the binding is already declared. Proving that
-# lets the rest of the frame -- typically a top-level thunk whose prologue re-declares
-# a long-existing global -- keep precise world reasoning, in particular the global
-# type speculations the bifurcation pass keys on. The proof is validated for this
-# inference's world range only, which is sound for cached code through the ordinary
-# validity bounds and for run-once thunks through the bifurcation pass's
-# world-freshness guard.
+# declaration with a marker, but `jl_declare_global` neither replaces the current
+# partition nor bumps the world counter when the binding is already declared (a
+# no-op) or not declared at all (the guard->DECLARED transition is backdated over the
+# guard partition's world range). Proving that lets the rest of the frame -- typically
+# a top-level thunk whose prologue declares its globals -- keep precise world
+# reasoning, in particular the global type speculations the bifurcation pass keys on.
+# A weak declaration that shadows an implicit import, by contrast, is a real world
+# event (subsequent reads resolve to the new binding), so its marker stays a barrier.
+# The proof is validated for this inference's world range, with the binding edge
+# recorded below; run-once top-level thunks are additionally protected by the
+# bifurcation pass's world-freshness guard.
 function latestworld_is_inert(interp::AbstractInterpreter, frame::InferenceState)
     pc = frame.currpc
     pc > 1 || return false
@@ -4232,9 +4235,9 @@ function latestworld_is_inert(interp::AbstractInterpreter, frame::InferenceState
     partition = lookup_binding_partition!(interp, gr, frame)
     kind = binding_kind(partition)
     kind == PARTITION_KIND_DECLARED || kind == PARTITION_KIND_GLOBAL ||
-        is_some_const_binding(kind) || return false
+        kind == PARTITION_KIND_GUARD || is_some_const_binding(kind) || return false
     # the proof depends on this partition: record the binding edge so cached code is
-    # invalidated if the declaration stops being redundant
+    # invalidated if the declaration stops being a non-event
     frame.stmt_info[pc] = GlobalAccessInfo(convert(Core.Binding, gr))
     return true
 end

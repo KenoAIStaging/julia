@@ -59,11 +59,12 @@ const BIF_FLAGS_SIMPLE = IR_FLAG_EFFECT_FREE | IR_FLAG_NOTHROW | IR_FLAG_TERMINA
 const BIF_DEBUG = RefValue{Bool}(false)
 bif_debug_bail(i::Int, reason::String) = BIF_DEBUG[] && println("bifurcation bail at stmt ", i, ": ", reason)
 
-# A weak `Core.declare_global` of a binding that is already declared is a runtime
-# no-op: `jl_declare_global` neither replaces the partition nor bumps the world.
-# Lowering pairs every such declaration with a `:latestworld` marker; a marker whose
-# declaration is provably a no-op is inert (see `latestworld_is_inert`), so neither
-# statement can observe a deferred store.
+# A weak `Core.declare_global` of a binding that is already declared (a runtime
+# no-op) or not declared at all (backdated guard->DECLARED, no world bump) cannot
+# touch any binding's value slot, so it cannot observe a deferred store; the
+# `:latestworld` marker lowering pairs with it is inert for the same reason (see
+# `latestworld_is_inert`). A weak declaration shadowing an implicit import is a real
+# world event and fails this test, which bails the pass via its marker.
 function bif_noop_weak_declare(world::UInt, @nospecialize(stmt))
     isexpr(stmt, :call) || return false
     args = (stmt::Expr).args
@@ -75,7 +76,7 @@ function bif_noop_weak_declare(world::UInt, @nospecialize(stmt))
     b = convert(Core.Binding, GlobalRef(args[2]::Module, (args[3]::QuoteNode).value::Symbol))
     kind = binding_kind(lookup_binding_partition(world, b))
     return kind == PARTITION_KIND_DECLARED || kind == PARTITION_KIND_GLOBAL ||
-        is_some_const_binding(kind)
+        kind == PARTITION_KIND_GUARD || is_some_const_binding(kind)
 end
 
 function bif_leaf_binding(world::UInt, b::Core.Binding)
@@ -213,9 +214,8 @@ function bif_classify!(plan::BifurcationPlan, ci::CodeInfo, sv::OptimizationStat
             head = stmt.head
         end
         if head === :latestworld
-            # inert (redundant-declaration) markers cannot observe the deferral; a
-            # marker after a real world bump must bail (inference has already given
-            # up on precise reasoning past it anyway)
+            # inert markers (after no-op or backdated weak declarations) cannot
+            # observe the deferral; a marker after a real world event must bail
             (i > 1 && bif_noop_weak_declare(world, code[i-1])) && continue
             return false
         end

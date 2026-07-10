@@ -1189,6 +1189,7 @@ struct restriction_kind_pair {
 JL_DLLEXPORT int jl_get_binding_leaf_partitions_restriction_kind(jl_binding_t *b JL_PROPAGATES_ROOT, struct restriction_kind_pair *rkp, size_t min_world, size_t max_world) JL_GLOBALLY_ROOTED;
 JL_DLLEXPORT jl_value_t *jl_get_binding_leaf_partitions_value_if_const(jl_binding_t *b JL_PROPAGATES_ROOT, int *maybe_depwarn, size_t min_world, size_t max_world);
 void check_safe_newbinding(jl_module_t *m, jl_sym_t *var);
+jl_binding_partition_t *jl_backdate_weak_declare_locked(jl_binding_t *b, jl_binding_partition_t *bpart);
 
 STATIC_INLINE int is10digit(char c) JL_NOTSAFEPOINT
 {

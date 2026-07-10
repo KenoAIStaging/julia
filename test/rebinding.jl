@@ -1239,9 +1239,10 @@ module GlobalSpeculation
     @test_throws DomainError SpecM9.thrower!([1.0, 4.0, -1.0, 9.0])
     @test SpecM9.acc === 3.0
 
-    # top-level thunks speculate too: the prologue's redundant re-declaration (and
-    # its :latestworld marker) is proven inert, and the fast path is additionally
-    # guarded on the world counter still being the thunk's inference world
+    # top-level thunks speculate too: the prologue's weak declaration is a world
+    # non-event (a no-op or a backdated guard->DECLARED transition), so its
+    # :latestworld marker is proven inert, and the fast path is additionally guarded
+    # on the world counter still being the thunk's inference world
     @eval module SpecM13; tacc = 0.0; end
     Core.eval(SpecM13, :(for i = 1:100
         global tacc += i * 0.5

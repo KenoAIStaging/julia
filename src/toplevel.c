@@ -352,6 +352,23 @@ void jl_declare_global(jl_module_t *m, jl_value_t *arg, jl_value_t *set_type, in
     while (1) {
         bpart = jl_get_binding_partition(b, new_world);
         enum jl_partition_kind kind = jl_binding_kind(bpart);
+        if (!strong && kind == PARTITION_KIND_GUARD) {
+            // A weak declaration of an undeclared binding is semantically invisible:
+            // reads of a declared-but-unassigned binding throw UndefVarError exactly
+            // like reads of an undeclared one, its declared type is `Any` either way,
+            // and the speculated type (#8870) is only a hint. Install the DECLARED
+            // partition retroactively over the guard partition's entire world range
+            // and do not bump the world counter, so the pervasive weak declarations
+            // (every `global x` statement and implicit global assignment) neither
+            // invalidate anything nor require a world barrier after them. Concurrent
+            // readers still holding the guard partition observe stale UndefVarError
+            // behavior, which is indistinguishable from ordering the racing
+            // operations the other way. Deletion epochs are preserved: the guard
+            // partition created by jl_delete_binding starts at the deletion world,
+            // so the backdated declaration never extends past it.
+            bpart = jl_backdate_weak_declare_locked(b, bpart);
+            break;
+        }
         if (kind != PARTITION_KIND_GLOBAL) {
             if (jl_bkind_is_some_implicit(kind) || kind == PARTITION_KIND_DECLARED) {
                 if (kind == new_kind) {

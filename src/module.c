@@ -1852,6 +1852,31 @@ JL_DLLEXPORT int jl_maybe_add_binding_backedge(jl_binding_t *b, jl_value_t *edge
     return 0;
 }
 
+// Install a DECLARED partition retroactively over a guard partition's entire world
+// range, without bumping the world counter (see the caller in jl_declare_global for
+// why this is semantically invisible). Must be called with world_counter_lock held
+// and `bpart` the current (head) partition of `b`, of kind PARTITION_KIND_GUARD.
+jl_binding_partition_t *jl_backdate_weak_declare_locked(jl_binding_t *b, jl_binding_partition_t *bpart)
+{
+    assert(jl_atomic_load_relaxed(&b->partitions) == bpart);
+    assert(jl_binding_kind(bpart) == PARTITION_KIND_GUARD);
+    // Creating the binding is a side effect that does not persist through incremental
+    // compilation of a closed module, even though it is invisible to the world counter
+    check_safe_newbinding(b->globalref->mod, b->globalref->name);
+    jl_binding_partition_t *new_bpart = new_binding_partition();
+    new_bpart->kind = (size_t)PARTITION_KIND_DECLARED | (bpart->kind & PARTITION_MASK_FLAG);
+    // ->restriction stays NULL: no speculated type until the first store
+    jl_atomic_store_relaxed(&new_bpart->min_world, jl_atomic_load_relaxed(&bpart->min_world));
+    jl_atomic_store_relaxed(&new_bpart->max_world, jl_atomic_load_relaxed(&bpart->max_world));
+    jl_binding_partition_t *next = jl_atomic_load_relaxed(&bpart->next);
+    if (next) {
+        jl_atomic_store_relaxed(&new_bpart->next, next);
+        jl_gc_wb_fresh(new_bpart, next);
+    }
+    jl_gc_write_atomic(b, b->partitions, jl_binding_partition_t, new_bpart, release);
+    return new_bpart;
+}
+
 JL_DLLEXPORT jl_binding_partition_t *jl_replace_binding_locked(jl_binding_t *b,
     jl_binding_partition_t *old_bpart, jl_value_t *restriction_val, enum jl_partition_kind kind, size_t new_world)
 {
