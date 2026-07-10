@@ -297,7 +297,7 @@ end
     @test_throws UndefKeywordError f34516()
     @test_throws UndefKeywordError f34516(1)
     g34516(@nospecialize(x); k=0) = 0
-    @test only(methods(Core.kwcall, (Any, typeof(g34516), Vararg))).nospecialize != 0
+    @test (only(methods(g34516)).kwsort::Method).nospecialize != 0
 end
 @testset "issue #21518" begin
     a = 0
@@ -389,11 +389,27 @@ f41416(a...="a"; b=true) = (b, a)
 @test f41416(3; b=false) === (false, (3,))
 
 Core.kwcall(i::Int) = "hi $i"
-let m = first(methods(Core.kwcall, (NamedTuple,typeof(kwf1),Vararg)))
+let m = first(methods(kwf1)).kwsort::Method
     @test m.name === :kwf1
+    @test m.sig <: Tuple{typeof(Core.kwcall), NamedTuple, typeof(kwf1), Vararg}
     @test Core.kwcall(1) == "hi 1"
     @test which(Core.kwcall, (Int,)).name === :kwcall
 end
+
+# keyword calls respect positional dispatch (issue #9498)
+f9498(x::Int; y=1) = 2
+f9498(x::Int) = 1
+@test f9498(100) == 1
+@test_throws MethodError f9498(100, y=1)
+g9498(x::Int) = 1
+g9498(x::Int; y=1) = 2
+@test g9498(100) == 2
+@test g9498(100, y=1) == 2
+h9498(x::Integer; y=1) = y
+h9498(x::Int) = 0
+@test h9498(big(1), y=3) == 3  # dispatches to the Integer method, which takes keywords
+@test h9498(3) == 0
+@test_throws MethodError h9498(3; y=1)  # dispatches to the Int method, which does not
 
 # issue #50518
 function f50518(xs...=["a", "b", "c"]...; debug=false)

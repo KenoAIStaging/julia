@@ -2590,6 +2590,239 @@ function invoke_rewrite(xs::Vector{Any})
     return newxs
 end
 
+# Model a call to `Core.kwcall(kwargs, applicable, f, args...)`, which dispatches to
+# a `Core.kwcall` method that forwards to `jl_kwcall_applicable`: it returns whether
+# some explicitly defined `Core.kwcall` method applies, or otherwise whether the
+# method that positional dispatch of `f(args...)` selects accepts keyword arguments.
+function abstract_kwcall_applicable(interp::AbstractInterpreter, argtypes::Vector{Any},
+                                    kwmatches::MethodMatches, sv::AbsIntState, max_methods::Int)
+    our_world = get_inference_world(interp)
+    rt = Bool
+    pos_infos = MethodMatchInfo[]
+    # the keyword call `applicable` asks about: Core.kwcall(kwargs, f, args...)
+    inner_argtypes = Any[argtypes[1], argtypes[2], argtypes[4:end]...]
+    inner_atype = argtypes_to_type(inner_argtypes)
+    valid = inner_atype !== Bottom
+    if valid
+        innermatches = find_simple_method_matches(interp, inner_atype, #=max_methods=#2)
+        if innermatches isa MethodMatches && !any_ambig(innermatches) &&
+           fully_covering(innermatches) && length(innermatches.applicable) == 1
+            update_valid_age!(sv, our_world, innermatches.valid_worlds)
+            push!(pos_infos, innermatches.info)
+            if innermatches.applicable[1].match.method !== Core._kwcall_fallback_method
+                # an explicitly defined kwcall method covers the call
+                rt = Const(true)
+            else
+                # reaches the generic fallback: decided by positional dispatch
+                pos_atype = argtypes_to_type(argtypes[4:end])
+                if pos_atype !== Bottom
+                    posmatches = find_simple_method_matches(interp, pos_atype, max_methods)
+                    if posmatches isa MethodMatches && !any_ambig(posmatches)
+                        update_valid_age!(sv, our_world, posmatches.valid_worlds)
+                        push!(pos_infos, posmatches.info)
+                        napplicable = length(posmatches.applicable)
+                        if napplicable == 0
+                            rt = Const(false)
+                        elseif fully_covering(posmatches)
+                            nkw = 0
+                            for tgt in posmatches.applicable
+                                nkw += (tgt.match.method.kwsort isa Method)
+                            end
+                            kwargst = widenconst(argtypes[2])
+                            if nkw == napplicable
+                                rt = Const(true)
+                            elseif nkw == 0
+                                if !hasintersect(kwargst, NamedTuple{(),Tuple{}})
+                                    rt = Const(false)
+                                elseif kwargst <: NamedTuple{(),Tuple{}}
+                                    # an empty keyword container degrades to a plain
+                                    # call, for which a method exists
+                                    rt = Const(true)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    info = KwCallInfo(kwmatches.info, pos_infos, InvokeCallInfo[])
+    return Future(CallMeta(rt, Union{}, EFFECTS_TOTAL, info))
+end
+
+# Infer a call to `Core.kwcall(kwargs, f, args...)`. When dispatch of this call is
+# known to reach the generic kwcall fallback method (defined in boot.jl), mirror its
+# runtime behavior precisely: find the method that positional dispatch of `f(args...)`
+# selects and process an invoke of the keyword sorter stored in its `kwsort` field
+# (see `jl_kwcall_fallback`). Union-typed arguments (most importantly the keyword
+# NamedTuple, whose type is a `Union` whenever a keyword value has one) are
+# union-split like an ordinary generic call. Otherwise (an explicitly defined kwcall
+# method applies, or the lookups are not sufficiently precise), fall back to inferring
+# this as an ordinary generic call of `Core.kwcall`.
+function abstract_kwcall(interp::AbstractInterpreter, arginfo::ArgInfo, si::StmtInfo,
+                         vtypes::Union{VarTable,Nothing}, sv::AbsIntState, max_methods::Int)
+    argtypes = arginfo.argtypes
+    atype = argtypes_to_type(argtypes)
+    function generic()
+        return abstract_call_gf_by_type(interp, Core.kwcall, arginfo, si, atype, vtypes, sv, max_methods)::Future
+    end
+    la = length(argtypes)
+    if la < 3 || si.saw_latestworld || isvarargtype(argtypes[end]) || atype === Bottom
+        return generic()
+    end
+    𝕃ᵢ = typeinf_lattice(interp)
+    our_world = get_inference_world(interp)
+    # check whether dispatch of this call is known to reach the generic fallback
+    kwmatches = find_simple_method_matches(interp, atype, #=max_methods=#2)
+    kwmatches isa MethodMatches || return generic()
+    if !(fully_covering(kwmatches) && length(kwmatches.applicable) == 1 && !any_ambig(kwmatches))
+        return generic()
+    end
+    only_kwmethod = kwmatches.applicable[1].match.method
+    if isdefined(Base, :_kwcall_applicable_method) && only_kwmethod === Base._kwcall_applicable_method
+        # this call dispatches to the Core.kwcall method for `applicable`, which
+        # forwards to `jl_kwcall_applicable`; model its result like `abstract_applicable`
+        update_valid_age!(sv, our_world, kwmatches.valid_worlds)
+        return abstract_kwcall_applicable(interp, argtypes, kwmatches, sv, max_methods)
+    end
+    only_kwmethod === Core._kwcall_fallback_method || return generic()
+    update_valid_age!(sv, our_world, kwmatches.valid_worlds)
+    # union-split the argument types, and resolve for each split the method that
+    # positional dispatch selects and its keyword sorter
+    if is_union_split_eligible(𝕃ᵢ, argtypes, InferenceParams(interp).max_union_splitting; fargs=arginfo.fargs)
+        split_argtypes = switchtupleunion(𝕃ᵢ, argtypes; fargs=arginfo.fargs)
+    else
+        split_argtypes = Vector{Any}[argtypes]
+    end
+    pos_infos = MethodMatchInfo[]
+    sorter_matches = MethodMatch[]
+    kept_argtypes = Vector{Any}[]
+    maythrow = false
+    for i = 1:length(split_argtypes)
+        argtypes_i = split_argtypes[i]::Vector{Any}
+        atype_i = argtypes_to_type(argtypes_i)
+        atype_i === Bottom && continue # this combination of arguments is unreachable
+        pos_atype = argtypes_to_type(argtypes_i[3:end])
+        pos_atype === Bottom && continue
+        posmatches = find_simple_method_matches(interp, pos_atype, max_methods)
+        posmatches isa MethodMatches || return generic()
+        if !(fully_covering(posmatches) && !any_ambig(posmatches))
+            return generic()
+        end
+        update_valid_age!(sv, our_world, posmatches.valid_worlds)
+        push!(pos_infos, posmatches.info)
+        for tgt in posmatches.applicable
+            posmatch = tgt.match
+            kwsort = posmatch.method.kwsort
+            if !(kwsort isa Method)
+                # this method accepts no keywords: the call throws for the
+                # argument subset it covers (unless the keyword container is
+                # empty, which is checked below)
+                maythrow = true
+                continue
+            end
+            method = kwsort
+            nargtype = typeintersect(method.sig, atype_i)
+            if nargtype === Bottom
+                maythrow = true # (should be unreachable)
+                continue
+            end
+            nargtype isa DataType || return generic() # other cases are not implemented below
+            tienv = ccall(:jl_type_intersection_with_env, Any, (Any, Any), nargtype, method.sig)::SimpleVector
+            ti = tienv[1]
+            env = tienv[2]::SimpleVector
+            fully_covers = atype_i <: method.sig && posmatch.fully_covers
+            push!(sorter_matches, MethodMatch(ti, env, method, fully_covers))
+            push!(kept_argtypes, argtypes_i)
+        end
+    end
+    if maythrow && hasintersect(widenconst(argtypes[2]), NamedTuple{(),Tuple{}})
+        # when the keyword container may be empty, a method without keywords is
+        # called plainly instead of throwing; leave this case to the runtime
+        return generic()
+    end
+    if isempty(sorter_matches)
+        if maythrow
+            # every method positional dispatch can select rejects the (non-empty)
+            # keyword arguments
+            info = KwCallInfo(kwmatches.info, pos_infos, InvokeCallInfo[])
+            return Future(CallMeta(Bottom, MethodError, EFFECTS_THROWS, info))
+        end
+        return generic()
+    end
+    nsplits = length(sorter_matches)
+    # infer an invoke of each keyword sorter
+    invoke_infos = Vector{InvokeCallInfo}(undef, nsplits)
+    inferidx = SafeBox{Int}(1)
+    rettype_box = SafeBox{Any}(Bottom)
+    exctype_box = SafeBox{Any}(Bottom)
+    effects_box = SafeBox{Effects}(EFFECTS_TOTAL)
+    kwinfo = kwmatches.info
+    gfresult = Future{CallMeta}()
+    𝕃ₚ = ipo_lattice(interp)
+    ⊑ₚ, ⋤ₚ, ⊔ₚ = partialorder(𝕃ₚ), strictneqpartialorder(𝕃ₚ), join(𝕃ₚ)
+    function inferkwsorters(interp, sv)
+        while inferidx[] <= nsplits
+            local match = sorter_matches[inferidx[]]
+            local mresult = abstract_call_method(interp, match.method, match.spec_types,
+                match.sparams, #=hardlimit=#nsplits > 1, si, sv)::Future
+            function handle1(interp, sv)
+                local i = inferidx[]
+                local match = sorter_matches[i]
+                local (; rt, exct, effects, edge, call_result) = mresult[]
+                local this_arginfo = ArgInfo(arginfo.fargs, kept_argtypes[i])
+                local const_call_result = abstract_call_method_with_const_args(interp,
+                    mresult[], Core.kwcall, this_arginfo, si, match, sv)
+                if const_call_result !== nothing
+                    local const_result = nothing
+                    local const_edge = nothing
+                    if const_call_result.rt ⊑ₚ rt
+                        (; rt, effects, const_result, const_edge) = const_call_result
+                    end
+                    if const_call_result.exct ⋤ₚ exct
+                        (; exct, const_result, const_edge) = const_call_result
+                    end
+                    if const_edge !== nothing
+                        edge = const_edge
+                        update_valid_age!(sv, get_inference_world(interp), world_range(const_edge))
+                    end
+                    if const_result !== nothing
+                        call_result = const_result
+                    end
+                end
+                invoke_infos[i] = InvokeCallInfo(edge, match, call_result, match.method.sig)
+                # NOTE unlike `invoke`, a match that does not fully cover its
+                # split needs no TypeError accounting: the positional matches
+                # jointly cover the call, so argument subsets not covered by
+                # this sorter are handled by another one (or by `maythrow`)
+                rettype_box[] = rettype_box[] ⊔ₚ widenwrappedconditional(rt)
+                exctype_box[] = exctype_box[] ⊔ₚ exct
+                effects_box[] = merge_effects(effects_box[], effects)
+                inferidx[] += 1
+                return true
+            end
+            if isready(mresult) && handle1(interp, sv)
+                continue
+            else
+                push!(sv.tasks, handle1)
+                return false
+            end
+        end
+        local rt = from_interprocedural!(interp, rettype_box[], sv, arginfo, nothing, vtypes)
+        local exct = exctype_box[]
+        local effects = effects_box[]
+        if maythrow
+            effects = Effects(effects; nothrow=false)
+            exct = exct ⊔ₚ MethodError
+        end
+        gfresult[] = CallMeta(rt, exct, effects, KwCallInfo(kwinfo, pos_infos, invoke_infos))
+        return true
+    end
+    # start making progress on the first sorter
+    inferkwsorters(interp, sv) || push!(sv.tasks, inferkwsorters)
+    return gfresult
+end
+
 function abstract_finalizer(interp::AbstractInterpreter, argtypes::Vector{Any}, vtypes, sv::AbsIntState)
     if length(argtypes) == 3
         finalizer_argvec = Any[argtypes[2], argtypes[3]]
@@ -3000,6 +3233,8 @@ function abstract_call_known(interp::AbstractInterpreter, @nospecialize(f),
                 return callfuture[]
             end
         end
+    elseif f === Core.kwcall
+        return abstract_kwcall(interp, arginfo, si, vtypes, sv, max_methods)
     elseif la == 3 && f === Core.:(>:)
         # mark issupertype as an exact alias for issubtype
         # swap T1 and T2 arguments and call <:

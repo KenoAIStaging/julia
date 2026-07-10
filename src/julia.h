@@ -412,6 +412,13 @@ typedef struct _jl_method_t {
     // forcing the conclusion to always true.
     _jl_purity_overrides_t purity;
 
+    // the keyword sorter Method implementing keyword-argument handling for
+    // calls that dispatch to this method, or `nothing`. The sorter has
+    // signature `Tuple{typeof(Core.kwcall), NamedTuple, sig...}` but is not
+    // present in any method table; it is reachable (and invoked) only
+    // through this field.
+    jl_value_t *kwsort;
+
 // hidden fields:
     jl_mutex_t writelock;
 } jl_method_t;
@@ -2018,6 +2025,9 @@ JL_DLLEXPORT jl_value_t *jl_get_latest_binding_value_if_resolved_debug_only(jl_b
 JL_DLLEXPORT jl_value_t *jl_get_latest_binding_value_if_resolved_and_const_debug_only(jl_binding_t *b JL_PROPAGATES_ROOT) JL_NOTSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_declare_const_gf(jl_module_t *mod, jl_sym_t *name);
 JL_DLLEXPORT jl_method_t *jl_method_def(jl_svec_t *argdata, jl_methtable_t *mt, jl_code_info_t *f, jl_module_t *module);
+JL_DLLEXPORT jl_method_t *jl_method_def_with_kwsort(jl_svec_t *argdata, jl_methtable_t *mt, jl_code_info_t *f, jl_module_t *module, jl_svec_t *kwargdata, jl_code_info_t *kwf);
+JL_DLLEXPORT jl_value_t *jl_kwcall_fallback(jl_value_t *kwargs, jl_value_t *f, jl_value_t *args);
+JL_DLLEXPORT int8_t jl_kwcall_applicable(jl_value_t *kwargs, jl_value_t *f, jl_value_t *args);
 JL_DLLEXPORT jl_code_info_t *jl_code_for_staged(jl_method_instance_t *linfo JL_PROPAGATES_ROOT, size_t world, jl_code_instance_t **cache JL_OUT_ROOTED_BY_ARG(0));
 JL_DLLEXPORT jl_code_info_t *jl_copy_code_info(jl_code_info_t *src);
 JL_DLLEXPORT size_t jl_get_world_counter(void) JL_NOTSAFEPOINT;

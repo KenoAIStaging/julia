@@ -89,7 +89,7 @@ const TAGS = Any[
 const NTAGS = length(TAGS)
 @assert NTAGS == 255
 
-const ser_version = 30 # do not make changes without bumping the version #!
+const ser_version = 31 # do not make changes without bumping the version #!
 
 format_version(::AbstractSerializer) = ser_version
 format_version(s::Serializer) = s.version
@@ -555,6 +555,12 @@ function serialize(s::AbstractSerializer, meth::Method)
     else
         serialize(s, nothing)
     end
+    # record whether this method is present in the method table: keyword
+    # sorters are not; they are reachable only through `kwsort` fields
+    intable = ccall(:jl_methtable_lookup, Any, (Any, UInt), meth.sig, Base.get_world_counter()) === meth
+    serialize(s, intable)
+    kwsort = meth.kwsort
+    serialize(s, kwsort isa Method ? kwsort : nothing)
     if isdefined(meth, :external_mt)
         error("cannot serialize Method objects with external method tables")
     end
@@ -1189,6 +1195,12 @@ function deserialize(s::AbstractSerializer, ::Type{Method})
     if format_version(s) >= 15
         recursion_relation = deserialize(s)
     end
+    intable = true
+    kwsort = nothing
+    if format_version(s) >= 31
+        intable = deserialize(s)::Bool
+        kwsort = deserialize(s)
+    end
     if makenew
         meth.module = mod
         meth.debuginfo = NullDebugInfo
@@ -1222,11 +1234,19 @@ function deserialize(s::AbstractSerializer, ::Type{Method})
         if recursion_relation !== nothing
             meth.recursion_relation = recursion_relation
         end
-        if !is_for_opaque_closure
+        if kwsort isa Method
+            meth.kwsort = kwsort
+        end
+        if !is_for_opaque_closure && intable
             mt = Core.methodtable
             if nothing === ccall(:jl_methtable_lookup, Any, (Any, UInt), sig, Base.get_world_counter()) # XXX: quite sketchy?
                 ccall(:jl_method_table_insert, Cvoid, (Any, Any, Ptr{Cvoid}), mt, meth, C_NULL)
             end
+        elseif !intable
+            # a method (e.g. a keyword sorter) that is not present in any
+            # method table; mark it permanently valid (cf. jl_method_def)
+            @atomic meth.primary_world = UInt(1)
+            @atomic meth.dispatch_status = UInt8(0x1) # METHOD_SIG_LATEST_WHICH
         end
         remember_object(s, meth, lnumber)
     end

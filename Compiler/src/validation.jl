@@ -8,7 +8,7 @@ const VALID_EXPR_HEADS = IdDict{Symbol,UnitRange{Int}}(
     :static_parameter => 1:1,
     :(&) => 1:1,
     :(=) => 2:2,
-    :method => 1:4,
+    :method => 1:5,
     :new => 1:typemax(Int),
     :splatnew => 2:2,
     :the_exception => 0:0,

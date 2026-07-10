@@ -76,9 +76,30 @@ function arg_decl_parts(m::Method, html=false)
     return tv, decls, file, line
 end
 
+# extract the declared keyword argument names from a keyword sorter method
+function kwarg_names_from_sorter(kwli::Method)
+    slotnames = ccall(:jl_uncompress_argnames, Vector{Symbol}, (Any,), kwli.slot_syms)
+    kws = filter(x -> !(x === empty_sym || '#' in string(x)), slotnames[(kwli.nargs + 1):end])
+    # ensure the kwarg... is always printed last. The order of the arguments are not
+    # necessarily the same as defined in the function
+    i = findfirst(x -> endswith(string(x)::String, "..."), kws)
+    if i !== nothing
+        push!(kws, kws[i])
+        deleteat!(kws, i)
+    end
+    isempty(kws) && push!(kws,  :var"...")
+    return kws
+end
+
 # NOTE: second argument is deprecated and is no longer used
 function kwarg_decl(m::Method, kwtype = nothing)
+    kwsort = m.kwsort
+    if kwsort isa Method
+        return kwarg_names_from_sorter(kwsort)
+    end
     if !(m.sig === Tuple || m.sig <: Tuple{Core.Builtin, Vararg}) # OpaqueClosure or Builtin
+        # methods with a keyword sorter defined explicitly (or by legacy
+        # lowering) in Core.kwcall's method table
         kwtype = typeof(Core.kwcall)
         sig_params = (unwrap_unionall(m.sig)::DataType).parameters
         sig = rewrap_unionall(Tuple{kwtype, NamedTuple, sig_params...}, m.sig)
@@ -104,19 +125,8 @@ function kwarg_decl(m::Method, kwtype = nothing)
                 kwli = ccall(:jl_methtable_lookup, Any, (Any, UInt), sig, get_world_counter())
             end
         end
-        if kwli !== nothing
-            kwli = kwli::Method
-            slotnames = ccall(:jl_uncompress_argnames, Vector{Symbol}, (Any,), kwli.slot_syms)
-            kws = filter(x -> !(x === empty_sym || '#' in string(x)), slotnames[(kwli.nargs + 1):end])
-            # ensure the kwarg... is always printed last. The order of the arguments are not
-            # necessarily the same as defined in the function
-            i = findfirst(x -> endswith(string(x)::String, "..."), kws)
-            if i !== nothing
-                push!(kws, kws[i])
-                deleteat!(kws, i)
-            end
-            isempty(kws) && push!(kws,  :var"...")
-            return kws
+        if kwli !== nothing && kwli !== Core._kwcall_fallback_method
+            return kwarg_names_from_sorter(kwli::Method)
         end
     end
     return Symbol[]

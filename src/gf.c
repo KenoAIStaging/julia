@@ -4291,6 +4291,23 @@ static jl_tupletype_t *egal_canonical_sig(jl_tupletype_t *types JL_PROPAGATES_RO
 
 // Try to get a MethodInstance for a precompile() call. This uses a special kind of lookup that
 // tries to find a method for which the requested signature is compileable.
+enum SIGNATURE_FULLY_COVERS {
+    NOT_FULLY_COVERS = 0,
+    FULLY_COVERS = 1,
+    SENTINEL    = 2,
+};
+
+static jl_method_match_t *make_method_match(jl_tupletype_t *spec_types, jl_svec_t *sparams, jl_method_t *method, enum SIGNATURE_FULLY_COVERS fully_covers)
+{
+    jl_task_t *ct = jl_current_task;
+    jl_method_match_t *match = (jl_method_match_t*)jl_gc_alloc(ct->ptls, sizeof(jl_method_match_t), jl_method_match_type);
+    match->spec_types = spec_types;
+    match->sparams = sparams;
+    match->method = method;
+    match->fully_covers = fully_covers;
+    return match;
+}
+
 JL_DLLEXPORT jl_value_t *jl_get_compile_hint_specialization(jl_tupletype_t *types JL_PROPAGATES_ROOT, size_t world)
 {
     if (jl_has_free_typevars((jl_value_t*)types))
@@ -4351,6 +4368,50 @@ JL_DLLEXPORT jl_value_t *jl_get_compile_hint_specialization(jl_tupletype_t *type
         // more than one the request is ambiguous and we ignore it.
         if (count == 1)
             match = (jl_method_match_t*)jl_array_ptr_ref(matches, 0);
+    }
+    // a precompile request for a keyword call that dispatches to the generic
+    // kwcall fallback: redirect the request to the keyword sorter of the
+    // method that positional dispatch selects (cf. jl_kwcall_fallback)
+    if (match != NULL && jl_kwcall_type != NULL &&
+        (jl_value_t*)match->method == jl_get_global(jl_core_module, jl_symbol("_kwcall_fallback_method"))) {
+        jl_value_t *unw = jl_unwrap_unionall((jl_value_t*)types);
+        if (jl_is_datatype(unw) && jl_nparams(unw) >= 3 && jl_tparam0(unw) == (jl_value_t*)jl_kwcall_type &&
+            !jl_is_vararg(jl_tparam(unw, jl_nparams(unw) - 1))) {
+            match = NULL;
+            size_t np = jl_nparams(unw);
+            jl_value_t *pos_types = NULL, *ti = NULL;
+            jl_svec_t *env = jl_emptysvec;
+            jl_method_match_t *matc = NULL;
+            JL_GC_PUSH4(&pos_types, &ti, &env, &matc);
+            pos_types = (jl_value_t*)jl_alloc_svec(np - 2);
+            for (i = 2; i < np; i++)
+                jl_svecset(pos_types, i - 2, jl_tparam(unw, i));
+            pos_types = jl_apply_tuple_type((jl_svec_t*)pos_types, 1);
+            size_t minw = 0, maxw = ~(size_t)0;
+            jl_value_t *posmatc = jl_gf_invoke_lookup_worlds(pos_types, jl_nothing, world, &minw, &maxw);
+            if (posmatc != jl_nothing) {
+                jl_value_t *kwsort = ((jl_method_match_t*)posmatc)->method->kwsort;
+                if (kwsort != jl_nothing && kwsort != NULL) {
+                    jl_method_t *sorter = (jl_method_t*)kwsort;
+                    ti = jl_type_intersection_env((jl_value_t*)types, (jl_value_t*)sorter->sig, &env);
+                    if (ti != jl_bottom_type && jl_is_datatype(ti)) {
+                        matc = make_method_match((jl_tupletype_t*)ti, env, sorter,
+                                                 jl_subtype((jl_value_t*)types, sorter->sig) ? FULLY_COVERS : NOT_FULLY_COVERS);
+                    }
+                }
+            }
+            jl_value_t *kwmi = jl_nothing;
+            if (matc != NULL) {
+                if (min_valid2 < minw)
+                    min_valid2 = minw;
+                if (max_valid2 > maxw)
+                    max_valid2 = maxw;
+                kwmi = jl_method_match_to_mi(matc, world, min_valid2, max_valid2);
+            }
+            JL_GC_POP();
+            JL_GC_POP();
+            return kwmi;
+        }
     }
     jl_value_t *mi = jl_nothing;
     if (match != NULL)
@@ -4723,6 +4784,104 @@ JL_DLLEXPORT jl_value_t *jl_apply_generic(jl_value_t *F, jl_value_t **args, uint
     return _jl_invoke(F, args, nargs, mfunc, world, TRIGGER_DISPATCH);
 }
 
+// Fallback implementation of `Core.kwcall(kwargs::NamedTuple, f, args...)`,
+// reached (via a small Julia wrapper defined in boot.jl) when no method in
+// Core.kwcall's table is more specific. It locates the method that plain
+// positional dispatch of `f(args...)` selects and then invokes that method's
+// keyword sorter (its `kwsort` field), so that keyword calls respect
+// positional dispatch. `args` is the positional arguments as a tuple.
+JL_DLLEXPORT jl_value_t *jl_kwcall_fallback(jl_value_t *kwargs, jl_value_t *f, jl_value_t *args)
+{
+    size_t world = jl_current_task->world_age;
+    size_t npos = jl_nfields(args);
+    jl_value_t **argv;
+    JL_GC_PUSHARGS(argv, npos + 3);
+    argv[0] = jl_kwcall_type->instance;
+    assert(argv[0] != NULL);
+    argv[1] = kwargs;
+    argv[2] = f;
+    for (size_t i = 0; i < npos; i++)
+        argv[3 + i] = jl_get_nth_field(args, i);
+    jl_method_instance_t *mi = jl_apply_lookup(&argv[2], npos + 1, world);
+    if (mi == NULL) {
+        // no (unambiguous) positional method: report a MethodError for the
+        // keyword call, like Base.kwerr
+        jl_method_error(argv[0], &argv[1], npos + 3, world);
+        // unreachable
+    }
+    jl_value_t *kwsort = mi->def.method->kwsort;
+    jl_value_t *ret;
+    if (kwsort == jl_nothing || kwsort == NULL) {
+        if (jl_nfields(kwargs) == 0)
+            // calling a method that accepts no keywords with an empty set of
+            // keywords is just a plain call
+            ret = jl_apply_generic(f, &argv[3], npos);
+        else
+            jl_method_error(argv[0], &argv[1], npos + 3, world);
+    }
+    else {
+        // Invoke the sorter as kwsort(::typeof(Core.kwcall), kwargs, f, args...).
+        // Look up (and cache) its specialization by the compilation signature
+        // (cf. `cache_method`) rather than by the exact argument types, so that
+        // @nospecialize'd arguments (e.g. Type-valued ones) do not create a new
+        // specialization per distinct argument type here.
+        jl_tupletype_t *tt = NULL;
+        jl_value_t *csig = NULL;
+        jl_svec_t *env = jl_emptysvec;
+        jl_method_instance_t *smi = NULL;
+        JL_GC_PUSH5(&kwsort, &tt, &csig, &env, &smi);
+        jl_method_t *sorter = (jl_method_t*)kwsort;
+        tt = arg_type_tuple(argv[0], &argv[1], npos + 3);
+        if (jl_is_unionall(sorter->sig)) {
+            int sub = jl_subtype_matching((jl_value_t*)tt, (jl_value_t*)sorter->sig, &env);
+            assert(sub); (void)sub;
+        }
+        csig = jl_normalize_to_compilable_sig(tt, env, sorter, 0);
+        if (!jl_egal(csig, (jl_value_t*)tt) && jl_is_unionall(sorter->sig)) {
+            jl_value_t *ti = jl_type_intersection_env(csig, (jl_value_t*)sorter->sig, &env);
+            assert(ti != jl_bottom_type); (void)ti;
+        }
+        smi = jl_specializations_get_linfo(sorter, csig, env);
+        ret = jl_invoke(argv[0], &argv[1], npos + 2, smi);
+        JL_GC_POP();
+    }
+    JL_GC_POP();
+    return ret;
+}
+
+// Check whether the keyword call `f(args...; kwargs...)` would dispatch to
+// some method, mirroring jl_kwcall_fallback (and normal dispatch of
+// Core.kwcall, which handles explicitly defined kwcall methods).
+JL_DLLEXPORT int8_t jl_kwcall_applicable(jl_value_t *kwargs, jl_value_t *f, jl_value_t *args)
+{
+    size_t world = jl_current_task->world_age;
+    size_t npos = jl_nfields(args);
+    jl_value_t **argv;
+    JL_GC_PUSHARGS(argv, npos + 3);
+    argv[0] = jl_kwcall_type->instance;
+    assert(argv[0] != NULL);
+    argv[1] = kwargs;
+    argv[2] = f;
+    for (size_t i = 0; i < npos; i++)
+        argv[3 + i] = jl_get_nth_field(args, i);
+    int8_t ret = 0;
+    jl_method_instance_t *kwmi = jl_apply_lookup(argv, npos + 3, world);
+    if (kwmi != NULL) {
+        jl_value_t *fallback = jl_get_global(jl_core_module, jl_symbol("_kwcall_fallback_method"));
+        if ((jl_value_t*)kwmi->def.method != fallback) {
+            // an explicitly defined kwcall method applies
+            ret = 1;
+        }
+        else {
+            jl_method_instance_t *mi = jl_apply_lookup(&argv[2], npos + 1, world);
+            if (mi != NULL)
+                ret = mi->def.method->kwsort != jl_nothing || jl_nfields(kwargs) == 0;
+        }
+    }
+    JL_GC_POP();
+    return ret;
+}
+
 // buggy way to lookup a method given a list of arguments
 JL_DLLEXPORT jl_method_instance_t *jl_method_lookup(jl_value_t **args, size_t nargs, size_t world)
 {
@@ -4903,23 +5062,6 @@ struct ml_matches_env {
     jl_value_t *t; // array of method matches
     jl_method_match_t *matc; // current working method match
 };
-
-enum SIGNATURE_FULLY_COVERS {
-    NOT_FULLY_COVERS = 0,
-    FULLY_COVERS = 1,
-    SENTINEL    = 2,
-};
-
-static jl_method_match_t *make_method_match(jl_tupletype_t *spec_types, jl_svec_t *sparams, jl_method_t *method, enum SIGNATURE_FULLY_COVERS fully_covers)
-{
-    jl_task_t *ct = jl_current_task;
-    jl_method_match_t *match = (jl_method_match_t*)jl_gc_alloc(ct->ptls, sizeof(jl_method_match_t), jl_method_match_type);
-    match->spec_types = spec_types;
-    match->sparams = sparams;
-    match->method = method;
-    match->fully_covers = fully_covers;
-    return match;
-}
 
 // callback for typemap_visitor
 //

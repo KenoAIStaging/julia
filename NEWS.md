@@ -22,6 +22,20 @@ New language features
 Language changes
 ----------------
 
+  - Keyword calls now respect positional dispatch: `f(args...; kws...)` first determines the
+    method that plain positional dispatch of `f(args...)` would select and then processes the
+    keyword arguments according to that method's signature. Previously, keyword calls dispatched
+    through a separate method table entry point (`Core.kwcall`), which could select a *different*
+    (less specific) method that happened to accept keywords, and keyword arguments passed to a
+    best-matching method without keywords were silently ignored in some method-definition orders.
+    Code that (usually inadvertently) relied on a keyword call being rerouted to a less specific
+    method will now get a `MethodError` stating that the selected method does not accept the given
+    keyword arguments; the fix is generally to accept (or forward) the keywords in the more
+    specific method, or to remove them from the call. Internally, the keyword sorter is now stored
+    in the new `kwsort` field of `Method` instead of being entered into the method table;
+    explicitly defined methods of `Core.kwcall` continue to work as before
+    ([#9498], [#42207], [#60499]).
+
   - `Type{T} <: S` now holds only if every type `==` to `T` is an instance of `S`, fixing a
     long-standing soundness hole where e.g. `Type{Int} <: DataType` held even though types like
     `Tuple{S} where S<:Int` are `==` (and `isa`) their canonical spelling without being `DataType`s.

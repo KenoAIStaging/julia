@@ -228,19 +228,46 @@ include("options.jl")
 # to forward to invoke
 function Core.kwcall(kwargs::NamedTuple, ::typeof(invoke), f, T, args...)
     @inline
-    # prepend kwargs and f to the invoke from the user
-    T = rewrap_unionall(Tuple{Core.Typeof(kwargs), Core.Typeof(f), (unwrap_unionall(T)::DataType).parameters...}, T)
-    return invoke(Core.kwcall, T, kwargs, f, args...)
+    # locate the method that invoke(f, T, args...) targets and dispatch
+    # through its keyword sorter (cf. the Core.kwcall fallback in boot.jl)
+    ftt = rewrap_unionall(Tuple{Core.Typeof(f), (unwrap_unionall(T)::DataType).parameters...}, T)
+    world = tls_world_age()
+    m = ccall(:jl_gf_invoke_lookup, Any, (Any, Any, UInt), ftt, nothing, world)
+    if m isa Method
+        kwsort = m.kwsort
+        if kwsort isa Method
+            args isa T || invoke(f, T, args...) # throws the appropriate TypeError
+            return invoke(Core.kwcall, kwsort, kwargs, f, args...)
+        end
+        if isempty(kwargs)
+            return invoke(f, T, args...)
+        end
+    end
+    # the method was not found (plain invoke will throw the right error), or it
+    # accepts no keywords: check for a legacy keyword sorter defined directly
+    # in Core.kwcall's method table before giving up
+    kwt = rewrap_unionall(Tuple{Core.Typeof(kwargs), Core.Typeof(f), (unwrap_unionall(T)::DataType).parameters...}, T)
+    kwtfull = rewrap_unionall(Tuple{typeof(Core.kwcall), Core.Typeof(kwargs), Core.Typeof(f), (unwrap_unionall(T)::DataType).parameters...}, T)
+    mkw = ccall(:jl_gf_invoke_lookup, Any, (Any, Any, UInt), kwtfull, nothing, world)
+    if mkw isa Method && mkw !== Core._kwcall_fallback_method
+        return invoke(Core.kwcall, kwt, kwargs, f, args...)
+    end
+    m isa Method || return invoke(f, T, args...) # throws the appropriate MethodError
+    throw(MethodError(Core.kwcall, (kwargs, f, args...), world))
 end
 # invoke does not have its own call cache, but kwcall for invoke does
 setfield!(typeof(invoke).name, :max_args, Int32(3), :monotonic) # invoke, f, T, args...
 
-# define applicable(f, T, args...; kwargs...), without kwargs wrapping
+# define applicable(f, args...; kwargs...), without kwargs wrapping
 # to forward to applicable
-function Core.kwcall(kwargs::NamedTuple, ::typeof(applicable), @nospecialize(args...))
+function Core.kwcall(kwargs::NamedTuple, ::typeof(applicable), @nospecialize(f), @nospecialize(args...))
     @inline
-    return applicable(Core.kwcall, kwargs, args...)
+    return ccall(:jl_kwcall_applicable, Int8, (Any, Any, Any), kwargs, f, args) != Int8(0)
 end
+# make the method above identifiable, so the compiler can model its result
+# (see `abstract_kwcall_applicable`)
+const _kwcall_applicable_method = ccall(:jl_gf_invoke_lookup, Any, (Any, Any, UInt),
+    Tuple{typeof(Core.kwcall), NamedTuple, typeof(applicable), Any, Vararg{Any}}, nothing, tls_world_age())::Method
 function Core._hasmethod(@nospecialize(f), @nospecialize(t)) # this function has a special tfunc (TODO: make this a Builtin instead like applicable)
     Core.@nospecializeinfer
     @noinline

@@ -956,6 +956,29 @@ end
 
 print_statement_costs(args...; kwargs...) = print_statement_costs(stdout, args...; kwargs...)
 
+# When a signature-based reflection query for `Core.kwcall(kwargs, f, args...)`
+# resolves to the generic kwcall fallback method, mirror its runtime behavior:
+# redirect the query to the keyword sorter (the `kwsort` field) of the method
+# that positional dispatch of `f(args...)` selects. Returns a `MethodMatch` for
+# the sorter, or `nothing` if no redirect applies.
+function _kwcall_match_redirect(@nospecialize(tt::Type), match::Core.MethodMatch, world::UInt)
+    match.method === Core._kwcall_fallback_method || return nothing
+    tt′ = unwrap_unionall(tt)
+    tt′ isa DataType || return nothing
+    length(tt′.parameters) >= 3 || return nothing
+    postt = rewrap_unionall(Tuple{tt′.parameters[3:end]...}, tt)
+    posmatch = ccall(:jl_gf_invoke_lookup_worlds, Any, (Any, Any, UInt, Ref{UInt}, Ref{UInt}),
+                     postt, nothing, world, Ref{UInt}(typemin(UInt)), Ref{UInt}(typemax(UInt)))
+    posmatch === nothing && return nothing
+    kwsort = (posmatch::Core.MethodMatch).method.kwsort
+    kwsort isa Method || return nothing
+    tienv = ccall(:jl_type_intersection_with_env, Any, (Any, Any), tt, kwsort.sig)::Core.SimpleVector
+    ti = tienv[1]
+    ti === Union{} && return nothing
+    env = tienv[2]::Core.SimpleVector
+    return Core.MethodMatch(ti, env, kwsort, tt <: kwsort.sig)
+end
+
 function _which(@nospecialize(tt::Type);
     method_table #=::Union{Nothing,Core.MethodTable,Compiler.MethodTableView}=# =nothing,
     world::UInt=get_world_counter(),
@@ -965,6 +988,10 @@ function _which(@nospecialize(tt::Type);
     if match === nothing
         raise && error("no unique matching method found for the specified argument types")
         return nothing
+    end
+    if method_table === nothing
+        kwmatch = _kwcall_match_redirect(tt, match, world)
+        kwmatch === nothing || return kwmatch
     end
     return match
 end
@@ -989,6 +1016,10 @@ function which(@nospecialize(f), @nospecialize(t))
             Base.showerror(io, me);
         end))
         throw(ee)
+    end
+    if f === Core.kwcall
+        kwmatch = _kwcall_match_redirect(tt, match, world)
+        kwmatch === nothing || return kwmatch.method
     end
     return match.method
 end
@@ -1117,11 +1148,20 @@ function hasmethod(f, t, kwnames::Tuple{Vararg{Symbol}}; world::UInt=get_world_c
     t = to_tuple_type(t)
     ft = Core.Typeof(f)
     u = unwrap_unionall(t)::DataType
-    tt = rewrap_unionall(Tuple{typeof(Core.kwcall), NamedTuple, ft, u.parameters...}, t)
-    match = ccall(:jl_gf_invoke_lookup, Any, (Any, Any, UInt), tt, nothing, world)
-    match === nothing && return false
-    kws = ccall(:jl_uncompress_argnames, Array{Symbol,1}, (Any,), (match::Method).slot_syms)
-    kws = kws[((match::Method).nargs + 1):end] # remove positional arguments
+    # find the method positional dispatch selects, and check the keyword names
+    # accepted by its keyword sorter
+    match = ccall(:jl_gf_invoke_lookup, Any, (Any, Any, UInt), signature_type(f, t), nothing, world)
+    kwmatch = match isa Method ? match.kwsort : nothing
+    if !(kwmatch isa Method)
+        # check for a keyword sorter defined explicitly (or by legacy
+        # lowering) in Core.kwcall's method table
+        tt = rewrap_unionall(Tuple{typeof(Core.kwcall), NamedTuple, ft, u.parameters...}, t)
+        kwmatch = ccall(:jl_gf_invoke_lookup, Any, (Any, Any, UInt), tt, nothing, world)
+        (kwmatch === nothing || kwmatch === Core._kwcall_fallback_method) && return false
+    end
+    kwmatch = kwmatch::Method
+    kws = ccall(:jl_uncompress_argnames, Array{Symbol,1}, (Any,), kwmatch.slot_syms)
+    kws = kws[(kwmatch.nargs + 1):end] # remove positional arguments
     isempty(kws) && return true # some kwfuncs simply forward everything directly
     for kw in kws
         endswith(String(kw), "...") && return true

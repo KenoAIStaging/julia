@@ -250,18 +250,30 @@
       (cond ((globalref? name) (caddr name))
             (else name))))
 
+;; extract static parameter names from the signature argument of a (method ...) expression
+(define (method-sig-static-parameters type-ex)
+  (if (eq? (car type-ex) 'block)
+      ;; extract ssavalue labels of sparams from the svec-of-sparams argument to `method`
+      (let ((sp-ssavals (cddr (cadddr (last type-ex)))))
+        (map (lambda (a)  ;; extract T from (= v (call (core TypeVar) (quote T) ...))
+               (cadr (caddr (caddr a))))
+             (filter (lambda (e)
+                       (and (pair? e) (eq? (car e) '=) (member (cadr e) sp-ssavals)))
+                     (cdr type-ex))))
+      '()))
+
 ;; extract static parameter names from a (method ...) expression
 (define (method-expr-static-parameters m)
-  (let ((type-ex (caddr m)))
-    (if (eq? (car type-ex) 'block)
-        ;; extract ssavalue labels of sparams from the svec-of-sparams argument to `method`
-        (let ((sp-ssavals (cddr (cadddr (last type-ex)))))
-          (map (lambda (a)  ;; extract T from (= v (call (core TypeVar) (quote T) ...))
-                 (cadr (caddr (caddr a))))
-               (filter (lambda (e)
-                         (and (pair? e) (eq? (car e) '=) (member (cadr e) sp-ssavals)))
-                       (cdr type-ex))))
-        '())))
+  (method-sig-static-parameters (caddr m)))
+
+;; the keyword-sorter (kwsig kwlam) tail of a 5-argument
+;; (method name sig lam kwsig kwlam) expression, or #f
+(define (method-expr-kwsorter m)
+  (and (length= m 6) (cddddr m)))
+
+;; static parameter names for the keyword sorter of a (method ...) expression
+(define (method-expr-kwsorter-static-parameters m)
+  (method-sig-static-parameters (car (cddddr m))))
 
 (define (nodot-sym-ref? e)
   (or (symbol? e)
@@ -460,6 +472,32 @@
     ,@(map make-assignment names vals)
     ,expr))
 
+;; collect the primitive 3-argument (method name sig lam) expressions in `e`,
+;; in the order they would execute, without descending into lambdas
+(define (find-primitive-method-defs e)
+  (cond ((or (atom? e) (quoted? e)) '())
+        ((eq? (car e) 'lambda) '())
+        ((and (eq? (car e) 'method) (length= e 4)) (list e))
+        (else (apply append (map find-primitive-method-defs (cdr e))))))
+
+;; Merge keyword sorter definitions into their corresponding positional method
+;; definitions. `posdefs` and `kwdefs` are expressions containing the same
+;; number of primitive (method name sig lam) definitions (one per optional-arg
+;; arity, in the same order). Each positional definition is destructively
+;; extended to (method name sig lam kwsig kwlam), which makes the runtime
+;; create the sorter method without entering it in any method table and store
+;; it in the positional method's `kwsort` field. Returns the merged `posdefs`;
+;; `kwdefs` is discarded.
+(define (merge-kwsorter-defs! posdefs kwdefs)
+  (let ((pos (find-primitive-method-defs posdefs))
+        (kws (find-primitive-method-defs kwdefs)))
+    (if (not (length= pos (length kws)))
+        (error "malformed keyword method definition"))
+    (map (lambda (p k)
+           (set-cdr! (cdddr p) (list (caddr k) (cadddr k))))
+         pos kws)
+    posdefs))
+
 (define (keywords-method-def-expr name sparams argl body rett)
   (let* ((kargl (cdar argl))  ;; keyword expressions (= k v)
          ;; fill in missing argnames for nospecialize-wrapped args first,
@@ -564,8 +602,12 @@
                                        annotations)))
           rett)
 
-        ;; call with no keyword args
-        ,(method-def-expr-
+        ;; call with no keyword args, merged with the keyword sorter
+        ;; definitions below into (method name sig lam kwsig kwlam) forms so
+        ;; that each sorter is attached to its positional method's `kwsort`
+        ;; field instead of being entered in the method table
+        ,(merge-kwsorter-defs!
+          (method-def-expr-
           name positional-sparams pargl-all
           `(block
             ,@(keep-first linenum? (without-generated prologue))
@@ -580,7 +622,7 @@
                    ret))))
 
         ;; call with unsorted keyword args. this sorts and re-dispatches.
-        ,(method-def-expr-
+        (method-def-expr-
           name positional-sparams
           `((|::|
              ;; if there are optional positional args, we need to be able to reference the function name
@@ -652,7 +694,7 @@
                               ,@keyvars
                               ,@(if (null? restkw) '() (list rkw))
                               ,@(map arg-name pargl)
-                              ,@splatted-vararg))))))
+                              ,@splatted-vararg)))))))
         ;; return primary function
         ,(if (not (symbol? name))
              '(null) name)))))
@@ -3283,7 +3325,9 @@
              (if (symbol? v)
                  (set! vars (cons v vars)))
              (if (not (length= e 2))
-                 (find-assigned-vars- (caddr e)))))
+                 (begin (find-assigned-vars- (caddr e))
+                        (if (method-expr-kwsorter e)
+                            (find-assigned-vars- (car (cddddr e))))))))
           ((assign-const-if-global)
             ;; like v = val, except that if `v` turns out global(either
             ;; implicitly or by explicit `global`), it gains an implicit `const`
@@ -3580,7 +3624,11 @@
          `(method
            ,(resolve-scopes- (cadr   e) scope)
            ,(resolve-scopes- (caddr  e) scope)
-           ,(resolve-scopes- (cadddr e) scope (method-expr-static-parameters e))))
+           ,(resolve-scopes- (cadddr e) scope (method-expr-static-parameters e))
+           ,@(if (method-expr-kwsorter e)
+                 (list (resolve-scopes- (car (cddddr e)) scope)
+                       (resolve-scopes- (cadr (cddddr e)) scope (method-expr-kwsorter-static-parameters e)))
+                 '())))
         (else
          (if (and (memq (car e) '(= const)) (symbol? (cadr e))
                   scope (null? (lam:args (scope:lam scope)))
@@ -3764,6 +3812,12 @@
                e)
              (begin (analyze-vars (caddr e) env captvars sp tab)
                     (assert (eq? (car (cadddr e)) 'lambda))
+                    (if (method-expr-kwsorter e)
+                        (begin (analyze-vars (car (cddddr e)) env captvars sp tab)
+                               (assert (eq? (car (cadr (cddddr e))) 'lambda))
+                               (analyze-vars-lambda (cadr (cddddr e)) env captvars sp
+                                                    (method-expr-kwsorter-static-parameters e)
+                                                    (car (cddddr e)) tab)))
                     (analyze-vars-lambda (cadddr e) env captvars sp
                                          (method-expr-static-parameters e)
                                          (caddr e) tab))))
@@ -4201,7 +4255,10 @@ f(x) = yt(x)
                                          (list e))))
                    (for-each (lambda (ex)
                                (for-each mark-captured
-                                         (map car (cadr (lam:vinfo (cadddr ex))))))
+                                         (map car (cadr (lam:vinfo (cadddr ex)))))
+                               (if (method-expr-kwsorter ex)
+                                   (for-each mark-captured
+                                             (map car (cadr (lam:vinfo (cadr (cddddr ex))))))))
                              all-methods)
                    (assign! (cadr e))))
              #f)
@@ -4402,7 +4459,14 @@ f(x) = yt(x)
                   (short (length= e 2))  ;; function f end
                   (lam2  (if short #f (cadddr e)))
                   (vis   (if short '(() () ()) (lam:vinfo lam2)))
-                  (cvs   (map car (cadr vis)))
+                  ;; the keyword sorter (kwsig kwlam) pair of a merged
+                  ;; (method name sig lam kwsig kwlam) definition, if any
+                  (kwtail (and (not short) (method-expr-kwsorter e)))
+                  (kwlam2 (and kwtail (cadr kwtail)))
+                  (kwvis  (if kwlam2 (lam:vinfo kwlam2) '(() () ())))
+                  (cvs   (delete-duplicates
+                          (append (map car (cadr vis))
+                                  (map car (cadr kwvis)))))
                   (local? (lambda (s) (and lam (symbol? s) (local-in? s lam locals))))
                   (local (and (not (globalref? (cadr e))) (local? name)))
                   (sig      (and (not short) (caddr e)))
@@ -4413,13 +4477,22 @@ f(x) = yt(x)
                   (r        (make-ssavalue))
                   (sig      (and sig (if (eq? (car sig) 'block)
                                          (last sig)
-                                         sig))))
+                                         sig)))
+                  (kwsig    (and kwtail (car kwtail)))
+                  (kwsp-inits (if (or (not kwsig) (not (eq? (car kwsig) 'block)))
+                                  '()
+                                  (map-cl-convert (butlast (cdr kwsig))
+                                                  fname lam namemap defined toplevel interp opaq toplevel-pure parsed-method-stack globals locals)))
+                  (kwsig    (and kwsig (if (eq? (car kwsig) 'block)
+                                           (last kwsig)
+                                           kwsig))))
              (if local
                  (begin (if (memq name (lam:args lam))
                             (error (string "cannot add method to function argument " name)))
                         (if (eqv? (string.char (string name) 0) #\@)
                             (error "macro definition not allowed inside a local scope"))))
              (if lam2 (prepare-lambda! lam2))
+             (if kwlam2 (prepare-lambda! kwlam2))
              (if (not local) ;; not a local function; will not be closure converted to a new type
                  (cond (short (if (has? defined (cadr e))
                                   e
@@ -4432,34 +4505,54 @@ f(x) = yt(x)
                                       ,e
                                       (latestworld)))))
                        ((null? cvs)
-                        `(block
-                          ,@sp-inits
-                          (= ,r (method ,(cadr e) ,(cl-convert
-                                          ;; anonymous functions with keyword args generate global
-                                          ;; functions that refer to the type of a local function
-                                          (rename-sig-types sig namemap)
-                                          fname lam namemap defined toplevel interp opaq toplevel-pure parsed-method-stack globals locals)
-                                  ,(let ((body (add-box-inits-to-body
-                                                lam2
-                                                (cl-convert (cadddr lam2) 'anon lam2 (table) (table) #f interp opaq toplevel-pure parsed-method-stack (table)
-                                                            (vinfo-to-table (car (lam:vinfo lam2)))))))
-                                     `(lambda ,(cadr lam2)
-                                        (,(clear-capture-bits (car vis))
-                                         ,@(cdr vis))
-                                        ,body))))
-                          (latestworld)
-                          ,r))
+                        (let ((convert-methdef-lambda
+                               (lambda (lam2 vis)
+                                 (let ((body (add-box-inits-to-body
+                                              lam2
+                                              (cl-convert (cadddr lam2) 'anon lam2 (table) (table) #f interp opaq toplevel-pure parsed-method-stack (table)
+                                                          (vinfo-to-table (car (lam:vinfo lam2)))))))
+                                   `(lambda ,(cadr lam2)
+                                      (,(clear-capture-bits (car vis))
+                                       ,@(cdr vis))
+                                      ,body))))
+                              (convert-methdef-sig
+                               (lambda (sig)
+                                 (cl-convert
+                                  ;; anonymous functions with keyword args generate global
+                                  ;; functions that refer to the type of a local function
+                                  (rename-sig-types sig namemap)
+                                  fname lam namemap defined toplevel interp opaq toplevel-pure parsed-method-stack globals locals))))
+                          `(block
+                            ,@sp-inits
+                            ,@kwsp-inits
+                            (= ,r (method ,(cadr e) ,(convert-methdef-sig sig)
+                                    ,(convert-methdef-lambda lam2 vis)
+                                    ,@(if kwlam2
+                                          (list (convert-methdef-sig kwsig)
+                                                (convert-methdef-lambda kwlam2 kwvis))
+                                          '())))
+                            (latestworld)
+                            ,r)))
                        (else
                         (let* ((exprs     (lift-toplevel (convert-lambda lam2 '|#anon| #t '() #f toplevel-pure parsed-method-stack)))
                                (top-stmts (cdr exprs))
-                               (newlam    (compact-and-renumber (linearize (car exprs)) 'none 0)))
+                               (newlam    (compact-and-renumber (linearize (car exprs)) 'none 0))
+                               (kwexprs   (and kwlam2 (lift-toplevel (convert-lambda kwlam2 '|#anon| #t '() #f toplevel-pure parsed-method-stack))))
+                               (kwtop-stmts (if kwexprs (cdr kwexprs) '()))
+                               (kwnewlam  (and kwexprs (compact-and-renumber (linearize (car kwexprs)) 'none 0))))
                           `(toplevel-butfirst
                             (block ,@sp-inits
+                                   ,@kwsp-inits
                                    (= ,r (method ,(cadr e) ,(cl-convert sig fname lam namemap defined toplevel interp opaq toplevel-pure parsed-method-stack globals locals)
-                                           ,(julia-bq-macro newlam)))
+                                           ,(julia-bq-macro newlam)
+                                           ,@(if kwlam2
+                                                 (list (cl-convert kwsig fname lam namemap defined toplevel interp opaq toplevel-pure parsed-method-stack globals locals)
+                                                       (julia-bq-macro kwnewlam))
+                                                 '())))
                                    (latestworld)
                                    ,r)
-                            ,@top-stmts))))
+                            ,@top-stmts
+                            ,@kwtop-stmts))))
 
                  ;; local case - lift to a new type at top level
                  (let* ((exists (get defined name #f))
@@ -4483,12 +4576,20 @@ f(x) = yt(x)
                                           (apply append  ;; merge captured vars from all definitions
                                                  cvs
                                                  (map (lambda (methdef)
-                                                        (map car (cadr (lam:vinfo (cadddr methdef)))))
+                                                        (let ((c (map car (cadr (lam:vinfo (cadddr methdef))))))
+                                                          (if (method-expr-kwsorter methdef)
+                                                              (append c (map car (cadr (lam:vinfo (cadr (cddddr methdef))))))
+                                                              c)))
                                                       alldefs))))
                         (all-sparams   (delete-duplicates  ;; static params from all definitions
                                         (apply append
                                                (if lam2 (lam:sp lam2) '())
-                                               (map (lambda (methdef) (lam:sp (cadddr methdef)))
+                                               (if kwlam2 (lam:sp kwlam2) '())
+                                               (map (lambda (methdef)
+                                                      (let ((sp (lam:sp (cadddr methdef))))
+                                                        (if (method-expr-kwsorter methdef)
+                                                            (append sp (lam:sp (cadr (cddddr methdef))))
+                                                            sp)))
                                                     alldefs))))
                         (capt-sp (simple-sort (intersect all-capt-vars all-sparams))) ; the intersection is the list of sparams that need to be captured
                         (capt-vars (diff all-capt-vars capt-sp)) ; remove capt-sp from capt-vars
@@ -4505,6 +4606,7 @@ f(x) = yt(x)
                                                     (if (or (expr-contains-p (lambda (v) (eq? v s))
                                                                              (lam:body lam)
                                                                              (lambda (ex) (not (or (eq? ex (caddr e))
+                                                                                                   (and kwtail (eq? ex (car kwtail)))
                                                                                                    (and (pair? ex)
                                                                                                         (eq? (car ex) 'local))))))
                                                             ;; var must be assigned within the signature block.
@@ -4525,13 +4627,15 @@ f(x) = yt(x)
                                identity))
                              '()))
                         (find-locals-in-method-sig (lambda (methdef)
-                                                     (expr-find-all
-                                                      (lambda (s) (and (symbol? s)
-                                                                       (not (eq? name s))
-                                                                       (not (memq s capt-sp))
-                                                                       (memq s (lam:sp lam))))
-                                                      (caddr methdef)
-                                                      identity)))
+                                                     (let ((pred (lambda (s) (and (symbol? s)
+                                                                                  (not (eq? name s))
+                                                                                  (not (memq s capt-sp))
+                                                                                  (memq s (lam:sp lam))))))
+                                                       (append
+                                                        (expr-find-all pred (caddr methdef) identity)
+                                                        (if (method-expr-kwsorter methdef)
+                                                            (expr-find-all pred (car (cddddr methdef)) identity)
+                                                            '())))))
                         (sig-locals (simple-sort
                                      (delete-duplicates  ;; locals used in sig from all definitions
                                       (apply append      ;; will convert these into sparams for dispatch
@@ -4556,7 +4660,13 @@ f(x) = yt(x)
                                     (renamemap (map cons closure-param-names closure-param-syms))
                                     (arg-defs (replace-vars
                                                (fix-function-arg-type sig `(globalref (thismodule) ,type-name) iskw namemap closure-param-syms)
-                                               renamemap)))
+                                               renamemap))
+                                    ;; the keyword sorter's signature refers to the closure
+                                    ;; type in third position (after kwcall and the kwargs)
+                                    (kwarg-defs (and kwtail
+                                                     (replace-vars
+                                                      (fix-function-arg-type kwsig `(globalref (thismodule) ,type-name) #t namemap closure-param-syms)
+                                                      renamemap))))
                                (append (map (lambda (gs tvar)
                                               (make-assignment gs `(call (core TypeVar) ',tvar (core Any))))
                                             closure-param-syms closure-param-names)
@@ -4565,7 +4675,13 @@ f(x) = yt(x)
                                                                   (if iskw
                                                                       (caddr (lam:args lam2))
                                                                       (car (lam:args lam2)))
-                                                                  #f closure-param-names #f toplevel-pure parsed-method-stack)))))))
+                                                                  #f closure-param-names #f toplevel-pure parsed-method-stack)
+                                                 ,@(if kwtail
+                                                       (list (cl-convert kwarg-defs fname lam namemap defined toplevel interp opaq toplevel-pure parsed-method-stack globals locals)
+                                                             (convert-lambda kwlam2
+                                                                             (caddr (lam:args kwlam2))
+                                                                             #f closure-param-names #f toplevel-pure parsed-method-stack))
+                                                       '())))))))
                         (mk-closure  ;; expression to make the closure
                          (let* ((var-exprs (map (lambda (v)
                                                   (let ((cv (assq v (cadr (lam:vinfo lam)))))
@@ -4596,6 +4712,7 @@ f(x) = yt(x)
                          (null)
                          ,@(map (lambda (v) `(moved-local ,v)) moved-vars)
                          ,@sp-inits
+                         ,@kwsp-inits
                          ,@mk-method
                          (latestworld))
                        (begin
@@ -4606,6 +4723,7 @@ f(x) = yt(x)
                            (latestworld)
                            ,@(map (lambda (v) `(moved-local ,v)) moved-vars)
                            ,@sp-inits
+                           ,@kwsp-inits
                            ,@mk-method
                            (latestworld)))))))))
           ((lambda)  ;; happens inside (thunk ...) and generated function bodies
@@ -5337,20 +5455,30 @@ f(x) = yt(x)
                  (error (string "Global method definition" (linenode-string current-loc)
                                 " needs to be placed at the top level, or use \"eval\".")))
              (if (length> e 2)
-                 (let* ((sig (let ((sig (compile (caddr e) break-labels #t #f)))
-                               (if (valid-ir-argument? sig)
-                                   sig
-                                   (let ((l (make-ssavalue)))
-                                     (emit `(= ,l ,sig))
-                                     l))))
-                        (lam (cadddr e))
-                        (lam (if (and (pair? lam) (eq? (car lam) 'lambda))
-                                 (linearize lam)
-                                 (let ((l  (make-ssavalue)))
-                                   (emit `(= ,l ,(compile lam break-labels #t #f)))
-                                   l))))
+                 (let* ((compile-sig
+                         (lambda (sig)
+                           (let ((sig (compile sig break-labels #t #f)))
+                             (if (valid-ir-argument? sig)
+                                 sig
+                                 (let ((l (make-ssavalue)))
+                                   (emit `(= ,l ,sig))
+                                   l)))))
+                        (compile-lam
+                         (lambda (lam)
+                           (if (and (pair? lam) (eq? (car lam) 'lambda))
+                               (linearize lam)
+                               (let ((l  (make-ssavalue)))
+                                 (emit `(= ,l ,(compile lam break-labels #t #f)))
+                                 l))))
+                        (sig (compile-sig (caddr e)))
+                        (lam (compile-lam (cadddr e)))
+                        (kwtail (if (method-expr-kwsorter e)
+                                    (let* ((kwsig (compile-sig (car (cddddr e))))
+                                           (kwlam (compile-lam (cadr (cddddr e)))))
+                                      (list kwsig kwlam))
+                                    '())))
                    (let ((val (make-ssavalue)))
-                    (emit `(= ,val (method ,(or (cadr e) '(false)) ,sig ,lam)))
+                    (emit `(= ,val (method ,(or (cadr e) '(false)) ,sig ,lam ,@kwtail)))
                     (if tail (emit-return tail val))
                     val))
                  (cond (tail  (emit-return tail e))

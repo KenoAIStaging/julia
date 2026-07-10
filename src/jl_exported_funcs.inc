@@ -303,6 +303,9 @@
     XX(jl_matching_methods) \
     XX(jl_maxrss) \
     XX(jl_method_def) \
+    XX(jl_method_def_with_kwsort) \
+    XX(jl_kwcall_fallback) \
+    XX(jl_kwcall_applicable) \
     XX(jl_method_instance_add_backedge) \
     XX(jl_method_table_add_backedge) \
     XX(jl_method_table_disable) \

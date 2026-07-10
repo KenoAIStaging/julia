@@ -96,8 +96,8 @@ static jl_value_t *eval_methoddef(jl_expr_t *ex, interpreter_state *s)
         return jl_declare_const_gf(modu, fname);
     }
 
-    jl_value_t *atypes = NULL, *meth = NULL, *fname = NULL;
-    JL_GC_PUSH3(&atypes, &meth, &fname);
+    jl_value_t *atypes = NULL, *meth = NULL, *fname = NULL, *kwatypes = NULL, *kwmeth = NULL;
+    JL_GC_PUSH5(&atypes, &meth, &fname, &kwatypes, &kwmeth);
 
     fname = eval_value(args[0], s);
     jl_methtable_t *mt = NULL;
@@ -105,7 +105,14 @@ static jl_value_t *eval_methoddef(jl_expr_t *ex, interpreter_state *s)
         mt = (jl_methtable_t*)fname;
     atypes = eval_value(args[1], s);
     meth = eval_value(args[2], s);
-    jl_method_t *ret = jl_method_def((jl_svec_t*)atypes, mt, (jl_code_info_t*)meth, s->module);
+    if (jl_expr_nargs(ex) >= 5) {
+        // (method name sig lam kwsig kwlam): define the keyword sorter from
+        // (kwsig, kwlam) and attach it to the method's `kwsort` field
+        kwatypes = eval_value(args[3], s);
+        kwmeth = eval_value(args[4], s);
+    }
+    jl_method_t *ret = jl_method_def_with_kwsort((jl_svec_t*)atypes, mt, (jl_code_info_t*)meth, s->module,
+                                                 (jl_svec_t*)kwatypes, (jl_code_info_t*)kwmeth);
     JL_GC_POP();
     return (jl_value_t *)ret;
 }

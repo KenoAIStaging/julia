@@ -386,6 +386,41 @@ getsplit_impl(info::InvokeCallInfo, idx::Int) = (@assert idx == 1; MethodLookupR
 getresult_impl(info::InvokeCallInfo, idx::Int) = (@assert idx == 1; info.result)
 
 """
+    info::KwCallInfo <: CallInfo
+
+Represents a keyword call `Core.kwcall(kwargs, f, args...)` whose dispatch reaches the
+generic `Core.kwcall` fallback method and that the compiler resolved to the keyword
+sorter (the `kwsort` field) of the method selected by positional dispatch of
+`f(args...)`. `info.kwtable_info` records the `Core.kwcall` method-table lookup
+(establishing that the call reaches the fallback), `info.pos_infos` records the
+positional method lookup for each union-split of the argument types, and
+`info.invoke_infos` carries the resolved invoke of each keyword sorter (one per split;
+empty if the positional method accepts no keywords, in which case the call throws).
+
+The invokes are exposed through the `nsplit`/`getsplit`/`getresult` interface, which
+lets the inliner treat this like an ordinary (union-split) call whose argument list
+coincides with the keyword sorter's argument list.
+"""
+struct KwCallInfo <: CallInfo
+    kwtable_info::MethodMatchInfo
+    pos_infos::Vector{MethodMatchInfo}
+    invoke_infos::Vector{InvokeCallInfo}
+end
+function add_edges_impl(edges::Vector{Any}, info::KwCallInfo)
+    add_edges_impl(edges, info.kwtable_info)
+    for pos_info in info.pos_infos
+        add_edges_impl(edges, pos_info)
+    end
+    for invoke_info in info.invoke_infos
+        add_edges_impl(edges, invoke_info)
+    end
+    nothing
+end
+nsplit_impl(info::KwCallInfo) = isempty(info.invoke_infos) ? nothing : length(info.invoke_infos)
+getsplit_impl(info::KwCallInfo, idx::Int) = getsplit(info.invoke_infos[idx], 1)
+getresult_impl(info::KwCallInfo, idx::Int) = getresult(info.invoke_infos[idx], 1)
+
+"""
     info::OpaqueClosureCallInfo
 
 Represents a resolved call of opaque closure, carrying the `info.match::MethodMatch` of

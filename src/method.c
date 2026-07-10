@@ -1090,6 +1090,7 @@ JL_DLLEXPORT jl_method_t *jl_new_method_uninit(jl_module_t *module)
     m->constprop = 0;
     m->purity.bits = 0;
     m->max_varargs = UINT8_MAX;
+    m->kwsort = jl_nothing;
     JL_MUTEX_INIT(&m->writelock, "method->writelock");
     return m;
 }
@@ -1264,10 +1265,12 @@ JL_DLLEXPORT jl_methcache_t *jl_method_get_cache(jl_method_t *method JL_PROPAGAT
     return jl_method_get_table(method)->cache;
 }
 
-JL_DLLEXPORT jl_method_t* jl_method_def(jl_svec_t *argdata,
-                                        jl_methtable_t *mt,
-                                        jl_code_info_t *f,
-                                        jl_module_t *module)
+static jl_method_t *jl_method_def_(jl_svec_t *argdata,
+                                   jl_methtable_t *mt,
+                                   jl_code_info_t *f,
+                                   jl_module_t *module,
+                                   jl_method_t *kwsort,
+                                   int table_insert)
 {
     // argdata is svec(svec(types...), svec(typevars...), functionloc)
     jl_svec_t *atypes = (jl_svec_t*)jl_svecref(argdata, 0);
@@ -1377,13 +1380,59 @@ JL_DLLEXPORT jl_method_t* jl_method_def(jl_svec_t *argdata,
     m->nargs = nargs;
     m->file = file;
     m->line = line;
+    if (kwsort != NULL) {
+        m->kwsort = (jl_value_t*)kwsort;
+        jl_gc_wb_fresh(m, kwsort);
+    }
     jl_method_set_source(m, f);
 
-    jl_method_table_insert(mt, m, NULL);
+    if (table_insert) {
+        jl_method_table_insert(mt, m, NULL);
+    }
+    else {
+        // this method is not present in any method table and is only
+        // reachable via a `kwsort` field; mark it valid since world 1 and
+        // (permanently) present-in-latest-world so that invoke-by-method
+        // edges to it verify (cf. `verify_invokesig`) and its specializations
+        // are collected into package images
+        jl_atomic_store_relaxed(&m->primary_world, 1);
+        jl_atomic_store_relaxed(&m->dispatch_status, METHOD_SIG_LATEST_WHICH);
+    }
     if (jl_newmeth_tracer)
         jl_call_tracer(jl_newmeth_tracer, (jl_value_t*)m);
     JL_GC_POP();
 
+    return m;
+}
+
+JL_DLLEXPORT jl_method_t* jl_method_def(jl_svec_t *argdata,
+                                        jl_methtable_t *mt,
+                                        jl_code_info_t *f,
+                                        jl_module_t *module)
+{
+    return jl_method_def_(argdata, mt, f, module, NULL, 1);
+}
+
+// Define a method along with its keyword sorter. The sorter is built from
+// (kwargdata, kwf) with signature Tuple{typeof(Core.kwcall), NamedTuple, sig...}
+// but is not entered into any method table; it is stored in the primary
+// method's `kwsort` field, where keyword dispatch (Core.kwcall's fallback and
+// the compiler) finds it after locating the primary method by positional
+// dispatch. `kwargdata`/`kwf` may be NULL to define a method without a sorter.
+JL_DLLEXPORT jl_method_t* jl_method_def_with_kwsort(jl_svec_t *argdata,
+                                                    jl_methtable_t *mt,
+                                                    jl_code_info_t *f,
+                                                    jl_module_t *module,
+                                                    jl_svec_t *kwargdata,
+                                                    jl_code_info_t *kwf)
+{
+    if (kwargdata == NULL || (jl_value_t*)kwargdata == jl_nothing)
+        return jl_method_def_(argdata, mt, f, module, NULL, 1);
+    jl_method_t *kwsort = NULL;
+    JL_GC_PUSH1(&kwsort);
+    kwsort = jl_method_def_(kwargdata, NULL, kwf, module, NULL, 0);
+    jl_method_t *m = jl_method_def_(argdata, mt, f, module, kwsort, 1);
+    JL_GC_POP();
     return m;
 }
 

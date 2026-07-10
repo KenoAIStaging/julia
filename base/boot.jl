@@ -383,6 +383,14 @@ _typeof_captured_variable(@nospecialize t) = (@_total_meta; t isa Type && has_fr
 
 # dispatch token indicating a kwarg (keyword sorter) call
 function kwcall end
+# Fallback definition for keyword calls: find the method that positional
+# dispatch of `f(args...)` selects and invoke the keyword sorter stored in its
+# `kwsort` field. This is where keyword calls to methods defined by the
+# current lowering land; explicitly defined (or legacy) `kwcall` methods are
+# more specific than this one and take precedence.
+function kwcall(kwargs::NamedTuple, @nospecialize(f), @nospecialize(args...))
+    ccall(:jl_kwcall_fallback, Any, (Any, Any, Any), kwargs, f, args)
+end
 # deprecated internal functions:
 kwfunc(@nospecialize(f)) = kwcall
 kwftype(@nospecialize(t)) = typeof(kwcall)

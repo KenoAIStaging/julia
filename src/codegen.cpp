@@ -992,12 +992,12 @@ static const auto jlopaque_closure_call_func = new JuliaFunction<>{
     get_func_attrs,
 };
 static const auto jlmethod_func = new JuliaFunction<>{
-    XSTR(jl_method_def),
+    XSTR(jl_method_def_with_kwsort),
     [](LLVMContext &C) {
         auto T_pjlvalue = getPointerTy(C);
         auto T_prjlvalue = PointerType::get(C, AddressSpace::Tracked);
         return FunctionType::get(T_prjlvalue,
-                {T_prjlvalue, T_prjlvalue, T_prjlvalue, T_pjlvalue}, false);
+                {T_prjlvalue, T_prjlvalue, T_prjlvalue, T_pjlvalue, T_prjlvalue, T_prjlvalue}, false);
     },
     nullptr,
 };
@@ -6851,14 +6851,25 @@ static jl_cgval_t emit_expr(jl_codectx_t &ctx, jl_value_t *expr, ssize_t ssaidx_
             emit_error(ctx, "method: invalid declaration");
             return jl_cgval_t();
         }
-        assert(nargs == 3);
+        assert(nargs == 3 || nargs == 5);
         Value *a1 = boxed(ctx, emit_expr(ctx, args[1]));
         Value *a2 = boxed(ctx, emit_expr(ctx, args[2]));
-        Value *mdargs[4] = {
+        Value *nullval = ConstantPointerNull::get(cast<PointerType>(ctx.types().T_prjlvalue));
+        Value *kwa1 = nullval;
+        Value *kwa2 = nullval;
+        if (nargs == 5) {
+            // (method name sig lam kwsig kwlam): also define the keyword
+            // sorter from (kwsig, kwlam) and attach it to the new method
+            kwa1 = boxed(ctx, emit_expr(ctx, args[3]));
+            kwa2 = boxed(ctx, emit_expr(ctx, args[4]));
+        }
+        Value *mdargs[6] = {
             /*argdata*/a1,
             ConstantPointerNull::get(cast<PointerType>(ctx.types().T_prjlvalue)),
             /*code*/a2,
-            /*module*/literal_pointer_val(ctx, (jl_value_t*)ctx.module)
+            /*module*/literal_pointer_val(ctx, (jl_value_t*)ctx.module),
+            /*kwargdata*/kwa1,
+            /*kwcode*/kwa2
         };
         jl_cgval_t meth = mark_julia_type(
             ctx,
@@ -10526,7 +10537,7 @@ static void init_jit_functions(void)
     add_named_global(jltopeval_func, &jl_toplevel_eval);
     add_named_global(jlcopyast_func, &jl_copy_ast);
     //add_named_global(jlnsvec_func, &jl_svec);
-    add_named_global(jlmethod_func, &jl_method_def);
+    add_named_global(jlmethod_func, &jl_method_def_with_kwsort);
     add_named_global(jlgenericfunction_func, &jl_declare_const_gf);
     add_named_global(jlenter_func, &jl_enter_handler);
     add_named_global(jl_current_exception_func, &jl_current_exception);

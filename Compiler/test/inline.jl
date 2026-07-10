@@ -1669,44 +1669,44 @@ using .Compiler: is_declared_inline, is_declared_noinline
     # @inline, @noinline, @constprop
     let @inline f(::Any; x::Int=1) = 2x
         @test is_declared_inline(only(methods(f)))
-        @test is_declared_inline(only(methods(Core.kwcall, (Any, typeof(f), Vararg))))
+        @test is_declared_inline((only(methods(f)).kwsort::Method))
     end
     let @noinline f(::Any; x::Int=1) = 2x
         @test is_declared_noinline(only(methods(f)))
-        @test is_declared_noinline(only(methods(Core.kwcall, (Any, typeof(f), Vararg))))
+        @test is_declared_noinline((only(methods(f)).kwsort::Method))
     end
     let Base.@constprop :aggressive f(::Any; x::Int=1) = 2x
         @test Compiler.is_aggressive_constprop(only(methods(f)))
-        @test Compiler.is_aggressive_constprop(only(methods(Core.kwcall, (Any, typeof(f), Vararg))))
+        @test Compiler.is_aggressive_constprop((only(methods(f)).kwsort::Method))
     end
     let Base.@constprop :none f(::Any; x::Int=1) = 2x
         @test Compiler.is_no_constprop(only(methods(f)))
-        @test Compiler.is_no_constprop(only(methods(Core.kwcall, (Any, typeof(f), Vararg))))
+        @test Compiler.is_no_constprop((only(methods(f)).kwsort::Method))
     end
     # @nospecialize
     let f(@nospecialize(A::Any); x::Int=1) = 2x
         @test only(methods(f)).nospecialize == 1
-        @test only(methods(Core.kwcall, (Any, typeof(f), Vararg))).nospecialize == 4
+        @test (only(methods(f)).kwsort::Method).nospecialize == 4
     end
     let f(::Any; x::Int=1) = (@nospecialize; 2x)
         @test only(methods(f)).nospecialize == -1
-        @test only(methods(Core.kwcall, (Any, typeof(f), Vararg))).nospecialize == -1
+        @test (only(methods(f)).kwsort::Method).nospecialize == -1
     end
     # Base.@assume_effects
     let Base.@assume_effects :notaskstate f(::Any; x::Int=1) = 2x
         @test Compiler.decode_effects_override(only(methods(f)).purity).notaskstate
-        @test Compiler.decode_effects_override(only(methods(Core.kwcall, (Any, typeof(f), Vararg))).purity).notaskstate
+        @test Compiler.decode_effects_override((only(methods(f)).kwsort::Method).purity).notaskstate
     end
     # propagate multiple metadata also
     let @inline Base.@assume_effects :notaskstate Base.@constprop :aggressive f(::Any; x::Int=1) = (@nospecialize; 2x)
         @test is_declared_inline(only(methods(f)))
         @test Compiler.is_aggressive_constprop(only(methods(f)))
-        @test is_declared_inline(only(methods(Core.kwcall, (Any, typeof(f), Vararg))))
-        @test Compiler.is_aggressive_constprop(only(methods(Core.kwcall, (Any, typeof(f), Vararg))))
+        @test is_declared_inline((only(methods(f)).kwsort::Method))
+        @test Compiler.is_aggressive_constprop((only(methods(f)).kwsort::Method))
         @test only(methods(f)).nospecialize == -1
-        @test only(methods(Core.kwcall, (Any, typeof(f), Vararg))).nospecialize == -1
+        @test (only(methods(f)).kwsort::Method).nospecialize == -1
         @test Compiler.decode_effects_override(only(methods(f)).purity).notaskstate
-        @test Compiler.decode_effects_override(only(methods(Core.kwcall, (Any, typeof(f), Vararg))).purity).notaskstate
+        @test Compiler.decode_effects_override((only(methods(f)).kwsort::Method).purity).notaskstate
     end
 end
 

@@ -3976,7 +3976,7 @@ void jl_init_types(void) JL_GC_DISABLED
     jl_method_type =
         jl_new_datatype(jl_symbol("Method"), core,
                         jl_any_type, jl_emptysvec,
-                        jl_perm_symsvec(33,
+                        jl_perm_symsvec(34,
                             "name",
                             "module",
                             "file",
@@ -4009,8 +4009,9 @@ void jl_init_types(void) JL_GC_DISABLED
                             "did_scan_source",
                             "constprop",
                             "max_varargs",
-                            "purity"),
-                        jl_svec(33,
+                            "purity",
+                            "kwsort"),
+                        jl_svec(34,
                             jl_symbol_type,
                             jl_module_type,
                             jl_symbol_type,
@@ -4043,7 +4044,8 @@ void jl_init_types(void) JL_GC_DISABLED
                             jl_uint8_type,
                             jl_uint8_type,
                             jl_uint8_type,
-                            jl_uint16_type),
+                            jl_uint16_type,
+                            jl_any_type), // union(jl_nothing_type, jl_method_type)
                         jl_emptysvec,
                         0, 1, 10);
     //const static uint32_t method_constfields[] = { 0b0, 0b0 }; // (1<<0)|(1<<1)|(1<<2)|(1<<3)|(1<<6)|(1<<9)|(1<<10)|(1<<17)|(1<<21)|(1<<22)|(1<<23)|(1<<24)|(1<<25)|(1<<26)|(1<<27)|(1<<28)|(1<<29)|(1<<30);
@@ -4385,6 +4387,29 @@ void post_boot_hooks(void)
     jl_value_t *kwcall_func  = core("kwcall");
     jl_kwcall_type = (jl_datatype_t*)jl_typeof(kwcall_func);
     jl_atomic_store_relaxed(&jl_kwcall_type->name->max_args, 0);
+    {
+        // make the generic kwcall fallback method (defined in boot.jl)
+        // identifiable, in particular for the compiler, which reroutes calls
+        // that dispatch to it through the positional method's `kwsort` field
+        jl_value_t *kwcall_sig = NULL, *va = NULL, *kwcall_fallback_method = NULL;
+        JL_GC_PUSH3(&kwcall_sig, &va, &kwcall_fallback_method);
+        va = (jl_value_t*)jl_wrap_vararg((jl_value_t*)jl_any_type, NULL, 0, 0);
+        jl_value_t *params[4] = {
+            (jl_value_t*)jl_kwcall_type,
+            core("NamedTuple"),
+            (jl_value_t*)jl_any_type,
+            va
+        };
+        kwcall_sig = jl_apply_tuple_type_v(params, 4);
+        size_t world = jl_atomic_load_acquire(&jl_world_counter);
+        size_t min_world = 0, max_world = ~(size_t)0;
+        jl_value_t *matc = jl_gf_invoke_lookup_worlds(kwcall_sig, jl_nothing, world, &min_world, &max_world);
+        assert(matc != jl_nothing);
+        kwcall_fallback_method = (jl_value_t*)((jl_method_match_t*)matc)->method;
+        assert(jl_is_method(kwcall_fallback_method));
+        jl_set_const(jl_core_module, jl_symbol("_kwcall_fallback_method"), kwcall_fallback_method);
+        JL_GC_POP();
+    }
 
     // Initialize TypeApp type reference for mutually recursive types
     jl_typeapp_type = (jl_datatype_t*)core("TypeApp");

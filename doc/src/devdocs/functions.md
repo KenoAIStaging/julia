@@ -123,15 +123,24 @@ jl_value_t *(jl_value_t*, jl_value_t**, uint32_t)
 
 ## Keyword arguments
 
-Keyword arguments work by adding methods to the kwcall function. This function
-is usually the "keyword argument sorter" or "keyword sorter", which then calls
-the inner body of the function (defined anonymously).
-Every definition in the kwsorter function has the same arguments as some definition in the normal
-method table, except with a single `NamedTuple` argument prepended, which gives
-the names and values of passed keyword arguments. The kwsorter's job is to move keyword arguments
-into their canonical positions based on name, plus evaluate and substitute any needed default value
-expressions. The result is a normal positional argument list, which is then passed to yet another
-compiler-generated function.
+Keyword arguments work by attaching a "keyword argument sorter" (or "keyword sorter") method to
+the `kwsort` field of each method defined with keywords. The sorter is a `Method` with the same
+arguments as its parent method, except with the `Core.kwcall` function and a single `NamedTuple`
+argument prepended; the `NamedTuple` gives the names and values of passed keyword arguments. The
+sorter is *not* entered into the method table: it is reachable only through the `kwsort` field.
+The kwsorter's job is to move keyword arguments into their canonical positions based on name, plus
+evaluate and substitute any needed default value expressions. The result is a normal positional
+argument list, which is then passed to yet another compiler-generated function.
+
+A keyword call `f(args...; kws...)` is lowered to `Core.kwcall((;kws...), f, args...)`. Unless an
+explicitly defined method of `Core.kwcall` applies (a legacy mechanism that remains supported),
+this call reaches a generic fallback method of `Core.kwcall` (see `jl_kwcall_fallback`), which
+determines the method that plain positional dispatch of `f(args...)` selects and then invokes the
+keyword sorter found in that method's `kwsort` field. This means keyword calls always respect
+positional dispatch; if the selected method accepts no keywords, a `MethodError` is thrown (or,
+when the keyword container is empty, a plain call is performed). The compiler special-cases
+`Core.kwcall` (see `abstract_kwcall`) so that this double dispatch is resolved statically and the
+sorter can be inlined like any other method.
 
 The easiest way to understand the process is to look at how a keyword argument method definition
 is lowered. The code:
@@ -166,7 +175,8 @@ This simply dispatches to the first method, passing along default values.
 Note that if the method doesn't accept rest keyword arguments then this argument
 is absent.
 
-Finally there is the kwsorter definition:
+Finally there is the kwsorter definition, which is stored in the `kwsort` field of the
+`circle(center, radius)` method rather than in the method table:
 
 ```
 function (::Core.kwcall)(kws, circle, center, radius)
