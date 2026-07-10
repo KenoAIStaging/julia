@@ -242,7 +242,7 @@ SparseArrays.droptol!
 SparseArrays.dropzeros!
 SparseArrays.dropzeros
 SparseArrays.permute
-permute!{Tv, Ti, Tp <: Integer, Tq <: Integer}(::SparseMatrixCSC{Tv,Ti}, ::SparseMatrixCSC{Tv,Ti}, ::AbstractArray{Tp,1}, ::AbstractArray{Tq,1})
+permute!{Tv, Ti}(::SparseMatrixCSC{Tv,Ti}, ::SparseMatrixCSC{Tv,Ti}, ::AbstractArray{<:Integer,1}, ::AbstractArray{<:Integer,1})
 SparseArrays.halfperm!
 SparseArrays.ftranspose!
 ```
