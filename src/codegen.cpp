@@ -427,8 +427,11 @@ struct jl_noaliascache_t {
         MDNode *data;           // Any user data that `pointerset/ref` are allowed to alias
         MDNode *type_metadata;  // Non-user-accessible type metadata incl. union selectors, etc.
         MDNode *constant;       // Memory that is immutable by the time LLVM can see it
+        MDNode *binding_flags;  // jl_binding_t::flags: written only by the runtime under the
+                                // world counter lock, never by compiled code or through any
+                                // binding operation that compiled code can call inline
 
-        jl_regions_t(): gcframe(nullptr), stack(nullptr), data(nullptr), type_metadata(nullptr), constant(nullptr) {}
+        jl_regions_t(): gcframe(nullptr), stack(nullptr), data(nullptr), type_metadata(nullptr), constant(nullptr), binding_flags(nullptr) {}
 
         void initialize(llvm::LLVMContext &context) {
             MDBuilder mbuilder(context);
@@ -439,6 +442,7 @@ struct jl_noaliascache_t {
             this->data = mbuilder.createAliasScope("jnoalias_data", domain);
             this->type_metadata = mbuilder.createAliasScope("jnoalias_typemd", domain);
             this->constant = mbuilder.createAliasScope("jnoalias_const", domain);
+            this->binding_flags = mbuilder.createAliasScope("jnoalias_bindingflags", domain);
         }
     } regions;
 
@@ -1717,7 +1721,7 @@ struct jl_aliasinfo_t {
                                      //                    => inst_a, inst_b do not alias.
     MDNode *noalias = nullptr;       // '!noalias': See '!alias.scope' above.
 
-    enum class Region { unknown, gcframe, stack, data, constant, type_metadata }; // See jl_regions_t
+    enum class Region { unknown, gcframe, stack, data, constant, type_metadata, binding_flags }; // See jl_regions_t
 
     explicit jl_aliasinfo_t() = default;
     explicit jl_aliasinfo_t(jl_codectx_t &ctx, Region r, MDNode *tbaa);
@@ -2165,16 +2169,19 @@ jl_aliasinfo_t::jl_aliasinfo_t(jl_codectx_t &ctx, Region r, MDNode *tbaa): tbaa(
         case Region::type_metadata:
             alias_scope = regions.type_metadata;
             break;
+        case Region::binding_flags:
+            alias_scope = regions.binding_flags;
+            break;
     }
 
-    MDNode *all_scopes[5] = { regions.gcframe, regions.stack, regions.data, regions.type_metadata, regions.constant };
+    MDNode *all_scopes[6] = { regions.gcframe, regions.stack, regions.data, regions.type_metadata, regions.constant, regions.binding_flags };
     if (alias_scope) {
         // The matching region is added to !alias.scope
         // All other regions are added to !noalias
 
         int i = 0;
         Metadata *scopes[1] = { alias_scope };
-        Metadata *noaliases[4];
+        Metadata *noaliases[5];
         for (auto const &scope: all_scopes) {
             if (scope == alias_scope) continue;
             noaliases[i++] = scope;
@@ -2195,6 +2202,10 @@ jl_aliasinfo_t jl_aliasinfo_t::fromTBAA(jl_codectx_t &ctx, MDNode *tbaa) {
     if (tbaa != nullptr) {
         MDNode *node = cast<MDNode>(tbaa->getOperand(1));
         if (cast<MDString>(node->getOperand(0))->getString() != "jtbaa") {
+            // The binding-flags branch gets its own scope region (it is a child of
+            // jtbaa_data, but is disjoint from every access the data region models)
+            if (cast<MDString>(node->getOperand(0))->getString() == "jtbaa_binding_flags")
+                return jl_aliasinfo_t(ctx, Region::binding_flags, tbaa);
 
             // Climb up to node just before root
             MDNode *parent_node = cast<MDNode>(node->getOperand(1));
@@ -3918,25 +3929,37 @@ static Value *emit_globalop_runtime_call(jl_codectx_t &ctx, StoreKind op, Value 
 {
     Value *m = literal_pointer_val(ctx, (jl_value_t*)mod);
     Value *s = literal_pointer_val(ctx, (jl_value_t*)sym);
-    ctx.builder.CreateCall(prepare_call(jlcheckbpwritable_func),
-        { bp, m, s });
+    // These runtime operations never write any binding's flags (only a
+    // re-declaration under the world counter lock does), so mark them noalias
+    // with the binding-flags scope: a re-type guard's flag load then stays
+    // hoistable out of a loop even though this (cold, rejoining) path is in it.
+    // StoreKind::Modify is excluded below: it calls back into arbitrary user
+    // code, which can re-declare a binding.
+    MDNode *na = MDNode::get(ctx.builder.getContext(),
+            { ctx.noalias().regions.binding_flags });
+    auto mark = [&] (CallInst *call) -> Value * {
+        call->setMetadata(LLVMContext::MD_noalias, na);
+        return call;
+    };
+    mark(ctx.builder.CreateCall(prepare_call(jlcheckbpwritable_func),
+        { bp, m, s }));
     switch (op) {
     case StoreKind::Set:
-        ctx.builder.CreateCall(prepare_call(jlcheckassign_func),
-                { bp, m, s, mark_callee_rooted(ctx, boxed(ctx, rval)) });
+        mark(ctx.builder.CreateCall(prepare_call(jlcheckassign_func),
+                { bp, m, s, mark_callee_rooted(ctx, boxed(ctx, rval)) }));
         return nullptr;
     case StoreKind::Replace:
-        return ctx.builder.CreateCall(prepare_call(jlcheckreplace_func),
-                { bp, m, s, boxed(ctx, cmp), boxed(ctx, rval) });
+        return mark(ctx.builder.CreateCall(prepare_call(jlcheckreplace_func),
+                { bp, m, s, boxed(ctx, cmp), boxed(ctx, rval) }));
     case StoreKind::Swap:
-        return ctx.builder.CreateCall(prepare_call(jlcheckswap_func),
-                { bp, m, s, mark_callee_rooted(ctx, boxed(ctx, rval)) });
+        return mark(ctx.builder.CreateCall(prepare_call(jlcheckswap_func),
+                { bp, m, s, mark_callee_rooted(ctx, boxed(ctx, rval)) }));
     case StoreKind::Modify:
         return ctx.builder.CreateCall(prepare_call(jlcheckmodify_func),
                 { bp, m, s, boxed(ctx, cmp), boxed(ctx, rval) });
     case StoreKind::SetOnce:
-        return ctx.builder.CreateCall(prepare_call(jlcheckassignonce_func),
-                { bp, m, s, mark_callee_rooted(ctx, boxed(ctx, rval)) });
+        return mark(ctx.builder.CreateCall(prepare_call(jlcheckassignonce_func),
+                { bp, m, s, mark_callee_rooted(ctx, boxed(ctx, rval)) }));
     case StoreKind::Unset:
         break; // Unset is not a valid operation for globals
     }
