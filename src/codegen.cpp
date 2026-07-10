@@ -3553,11 +3553,19 @@ static bool binding_records_supported(Triple::ObjectFormatType OF)
     return OF == Triple::ELF || OF == Triple::MachO || OF == Triple::COFF;
 }
 
+// Benchmarking variant: never emit patchable no-op sites or route image accesses
+// through the runtime-managed GOT; every re-type guard degrades to the runtime test
+// of the binding's flags (the fallback path other targets always use). This isolates
+// the cost of the dynamic guard for comparison against the patching branch.
+#define BPATCH_FLAG_CHECK_ONLY 1
+
 // Whether JIT-compiled typed-global accesses can be guarded with statically patchable
 // no-op sites (see jl_patch_retyped_binding_sites in jitlayers.cpp): an architecture
 // the runtime patcher knows how to rewrite, plus record support.
 static bool binding_patch_sites_supported(jl_codectx_t &ctx)
 {
+    if (BPATCH_FLAG_CHECK_ONLY)
+        return false;
     if (ctx.emission_context.imaging_mode)
         return false;
     const Triple &TT = ctx.emission_context.TargetTriple;
@@ -3572,6 +3580,8 @@ static bool binding_patch_sites_supported(jl_codectx_t &ctx)
 // fields, which a 32-bit target could not relocate) plus record support.
 static bool binding_got_supported(jl_codectx_t &ctx)
 {
+    if (BPATCH_FLAG_CHECK_ONLY)
+        return false;
     const Triple &TT = ctx.emission_context.TargetTriple;
     return ctx.emission_context.imaging_mode && TT.isArch64Bit() &&
            binding_records_supported(bpatch_object_format(ctx));
