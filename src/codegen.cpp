@@ -3758,7 +3758,9 @@ static BasicBlock *emit_retype_guard(jl_codectx_t &ctx, jl_binding_t *bnd, Value
         Value *slotp = emit_binding_got_slot(ctx, bnd);
         Value *deopt = ctx.builder.CreateICmpNE(slotp,
                 emit_ptrgep(ctx, bp, offsetof(jl_binding_t, value)));
-        ctx.builder.CreateCondBr(deopt, coldBB, fastBB);
+        MDBuilder MDB(C);
+        ctx.builder.CreateCondBr(deopt, coldBB, fastBB,
+                MDB.createBranchWeights({1, 2000}));
     }
     else {
         LoadInst *bflags = ctx.builder.CreateAlignedLoad(getInt8Ty(C),
@@ -3772,7 +3774,9 @@ static BasicBlock *emit_retype_guard(jl_codectx_t &ctx, jl_binding_t *bnd, Value
         Value *retyped = ctx.builder.CreateICmpNE(
                 ctx.builder.CreateAnd(bflags, ConstantInt::get(getInt8Ty(C), BINDING_FLAG_RETYPED)),
                 ConstantInt::get(getInt8Ty(C), 0));
-        ctx.builder.CreateCondBr(retyped, coldBB, fastBB);
+        MDBuilder MDB(C);
+        ctx.builder.CreateCondBr(retyped, coldBB, fastBB,
+                MDB.createBranchWeights({1, 2000}));
     }
     ctx.builder.SetInsertPoint(fastBB);
     return coldBB;
@@ -3882,7 +3886,9 @@ static jl_cgval_t emit_globalref(jl_codectx_t &ctx, jl_module_t *mod, jl_sym_t *
         BasicBlock *fastBB = ctx.builder.GetInsertBlock();
         BasicBlock *coldBB = BasicBlock::Create(C, "got_deopt", ctx.f);
         BasicBlock *contBB = BasicBlock::Create(C, "got_cont", ctx.f);
-        ctx.builder.CreateCondBr(ctx.builder.CreateIsNull(fastv), coldBB, contBB);
+        MDBuilder MDB(C);
+        ctx.builder.CreateCondBr(ctx.builder.CreateIsNull(fastv), coldBB, contBB,
+                MDB.createBranchWeights({1, 2000}));
         ctx.builder.SetInsertPoint(coldBB);
         Value *coldv = ctx.builder.CreateCall(prepare_call(jlgetbindingvalue_func), { bp });
         undef_var_error_ifnot(ctx, ctx.builder.CreateIsNotNull(coldv), name, (jl_value_t*)mod);
@@ -4102,7 +4108,9 @@ static jl_cgval_t emit_globalop(jl_codectx_t &ctx, jl_module_t *mod, jl_sym_t *s
                 Value *retyped2 = emit_retype_recheck(ctx, bp);
                 BasicBlock *verifyBB = BasicBlock::Create(C, "recheck_verify", ctx.f);
                 BasicBlock *okBB = BasicBlock::Create(C, "recheck_ok", ctx.f);
-                ctx.builder.CreateCondBr(retyped2, verifyBB, okBB);
+                MDBuilder MDB(C);
+                ctx.builder.CreateCondBr(retyped2, verifyBB, okBB,
+                        MDB.createBranchWeights({1, 2000}));
                 ctx.builder.SetInsertPoint(verifyBB);
                 mark_verified_globalop_result(ctx, op, fastV, rettyp, fname);
                 ctx.builder.CreateBr(okBB);

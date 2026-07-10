@@ -2942,7 +2942,9 @@ static jl_cgval_t typed_store(jl_codectx_t &ctx,
             // point, so the whole operation can still divert to the runtime path.
             Value *retyped = emit_retype_recheck(ctx, retype_bp);
             BasicBlock *ContBB = BasicBlock::Create(ctx.builder.getContext(), "recheck_cont", ctx.f);
-            ctx.builder.CreateCondBr(retyped, retype_deoptBB, ContBB);
+            MDBuilder MDB(ctx.builder.getContext());
+            ctx.builder.CreateCondBr(retyped, retype_deoptBB, ContBB,
+                    MDB.createBranchWeights({1, 2000}));
             ctx.builder.SetInsertPoint(ContBB);
         }
         if (op == StoreKind::Modify) {
