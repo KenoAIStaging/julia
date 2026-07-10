@@ -1378,12 +1378,41 @@ end
 function handle_call!(todo::Vector{Pair{Int,Any}},
     ir::IRCode, idx::Int, stmt::Expr, @nospecialize(info::CallInfo), flag::UInt32, sig::Signature,
     state::InliningState)
+    isa(info, SpeculatedCallInfo) &&
+        return handle_speculated_call!(todo, ir, idx, stmt, info, flag, sig, state)
     cases = compute_inlining_cases(info, flag, sig, state)
     cases === nothing && return nothing
     cases, handled_all_cases, fully_covered, joint_effects = cases
     atype = argtypes_to_type(sig.argtypes)
     atype === Union{} && return nothing # accidentally actually unreachable
     handle_cases!(todo, ir, idx, stmt, atype, cases, handled_all_cases, fully_covered, joint_effects)
+end
+
+# Resolve a call that was inferred against speculated argument types (#8870): inline the
+# cases computed for the speculated signature as a union split whose conditions are real
+# `isa` tests against the runtime (wider) argument types, with the original generic call
+# as the fallback. The speculated cases must never be treated as covering the call: the
+# hint is not a guarantee, so the fallback has to be a dynamic call (which
+# `!handled_all_cases` provides), not a `MethodError` branch.
+function handle_speculated_call!(todo::Vector{Pair{Int,Any}},
+    ir::IRCode, idx::Int, stmt::Expr, info::SpeculatedCallInfo, flag::UInt32, sig::Signature,
+    state::InliningState)
+    spec_argtypes = info.spec_argtypes
+    length(spec_argtypes) == length(sig.argtypes) || return nothing
+    spec_ft = widenconst(spec_argtypes[1])
+    spec_sig = Signature(singleton_type(spec_ft), spec_ft, spec_argtypes)
+    cases = compute_inlining_cases(info.info, flag, spec_sig, state)
+    cases === nothing && return nothing
+    cases, _, _, joint_effects = cases
+    # Union splitting with an uncovered fallback is only sound for dispatch tuples (a
+    # wider case signature could shadow a more specific method for a subset of the
+    # values its `isa` guard admits).
+    filter!(case::InliningCase->isdispatchtuple(case.sig), cases)
+    isempty(cases) && return nothing
+    atype = argtypes_to_type(sig.argtypes)
+    atype === Union{} && return nothing # accidentally actually unreachable
+    handle_cases!(todo, ir, idx, stmt, atype, cases, #=handled_all_cases=#false,
+        #=fully_covered=#false, Effects(joint_effects; nothrow=false))
 end
 
 function handle_call_result!(

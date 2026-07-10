@@ -2695,10 +2695,15 @@ binding_world_hints(world::UInt, sv::AbsIntState) = WorldWithRange(world, sv.val
         (valid_worlds, rt) = scan_leaf_partitions(interp, gr, binding_world_hints(world, sv)) do interp::AbstractInterpreter, ::Core.Binding, partition::Core.BindingPartition
             local rt
             kind = binding_kind(partition)
-            if is_some_guard(kind) || kind == PARTITION_KIND_DECLARED
+            if is_some_guard(kind)
                 # We do not currently assume an invalidation for guard -> defined transitions
                 # rt = Const(nothing)
                 rt = Type
+            elseif kind == PARTITION_KIND_DECLARED
+                # The declared type of an untyped global is always `Any` (its
+                # ->restriction is only a speculated type, #8870); upgrading it to a
+                # typed global replaces the partition, which invalidates us.
+                rt = Const(Any)
             elseif is_some_const_binding(kind)
                 rt = Const(Any)
             else
@@ -3161,9 +3166,72 @@ function abstract_call_unknown(interp::AbstractInterpreter, @nospecialize(ft),
     return abstract_call_gf_by_type(interp, nothing, arginfo, si, atype, vtypes, sv, max_methods)::Future
 end
 
+function has_speculated_argtype(argtypes::Vector{Any})
+    for i = 1:length(argtypes)
+        isa(argtypes[i], Speculated) && return true
+    end
+    return false
+end
+
+# Infer a call some of whose arguments carry a `Speculated` type hint (#8870).
+#
+# Speculation must never lose precision over the generic call: whenever the call
+# resolves to a usable method set at the *widened* argument types, we simply run that
+# generic inference (which union-splits natively where profitable). Only when the
+# generic call fails to resolve -- typically "too many methods" for an `Any` argument,
+# the untyped-global pathology this exists for -- do we infer the call against the
+# hinted types (the "speculated part") and record the result in a `SpeculatedCallInfo`,
+# from which the inlining pass emits an `isa`-guarded fast path with the original
+# generic call as the fallback (the "unspeculated part"). The overall answer must
+# remain sound for that generic fallback, so the return type is reported as `Any`
+# (kept as a new hint when the speculated part is more precise, so that chained uses
+# split too), the exception type as `Any`, and the effects as unknown -- exactly what
+# the failed generic resolution would have reported.
+function abstract_call_speculated(interp::AbstractInterpreter, arginfo::ArgInfo, si::StmtInfo,
+                                  vtypes::Union{VarTable,Nothing}, sv::AbsIntState, max_methods::Int)
+    argtypes = arginfo.argtypes
+    n = length(argtypes)
+    spec_argtypes = Vector{Any}(undef, n)
+    wide_argtypes = Vector{Any}(undef, n)
+    for i = 1:n
+        aᵢ = argtypes[i]
+        spec_argtypes[i] = isa(aᵢ, Speculated) ? aᵢ.spec : aᵢ
+        wide_argtypes[i] = widenspeculation(aᵢ)
+    end
+    wide_arginfo = ArgInfo(arginfo.fargs, wide_argtypes)
+    # Speculation only pays for callees that dispatch on the hinted types. Builtins (and
+    # callees we cannot identify even speculatively) evaluate their arguments dynamically
+    # anyway -- and inferring e.g. `isa` at the hinted types would be outright wrong for
+    # the fallback -- so simply widen the hints away for them.
+    ft = widenslotwrapper(spec_argtypes[1])
+    f = singleton_type(ft)
+    if isa(f, Builtin) || (f === nothing && (isa(ft, PartialOpaque) || hasintersect(widenconst(ft), Builtin)))
+        return abstract_call(interp, wide_arginfo, si, vtypes, sv, max_methods)
+    end
+    if max_methods == typemin(Int)
+        max_methods = f === nothing ? get_max_methods(interp, sv) : get_max_methods(interp, f, sv)
+    end
+    wide_atype = argtypes_to_type(wide_argtypes)
+    if wide_atype !== Bottom
+        matches = find_method_matches(interp, wide_argtypes, wide_atype; max_methods, fargs=arginfo.fargs)
+        if !isa(matches, FailedMethodMatch)
+            return abstract_call(interp, wide_arginfo, si, vtypes, sv, max_methods)
+        end
+    end
+    call = abstract_call(interp, ArgInfo(arginfo.fargs, spec_argtypes), si, vtypes, sv, max_methods)::Future
+    return Future{CallMeta}(call, interp, sv) do call, interp, sv
+        srt = widenconst(ignorelimited(widenslotwrapper(call.rt)))
+        rt = (srt === Any || srt === Union{} || has_free_typevars(srt)) ? Any : Speculated(srt)
+        return CallMeta(rt, Any, Effects(), SpeculatedCallInfo(spec_argtypes, call.info))
+    end
+end
+
 # call where the function is any lattice element
 function abstract_call(interp::AbstractInterpreter, arginfo::ArgInfo, si::StmtInfo,
                        vtypes::Union{VarTable,Nothing}, sv::AbsIntState, max_methods::Int=typemin(Int))
+    if has_speculated_argtype(arginfo.argtypes)
+        return abstract_call_speculated(interp, arginfo, si, vtypes, sv, max_methods)
+    end
     ft = widenslotwrapper(arginfo.argtypes[1])
     f = singleton_type(ft)
     if f === nothing
@@ -3974,11 +4042,23 @@ function abstract_eval_partition_load(interp::Union{AbstractInterpreter,Nothing}
     end
 
     if kind == PARTITION_KIND_DECLARED
-        # Could be replaced by a backdated const which has an effect, so we can't assume it won't.
-        # Besides, we would prefer not to merge the world range for this into the world range for
-        # _GLOBAL, because that would pessimize codegen.
-        effects = Effects(local_getglobal_effects, effect_free=ALWAYS_FALSE)
-        rt = Any
+        # An untyped global's partition carries a speculated type (#8870): the union of
+        # the types of every value stored so far. It is not sound to assume (a store of
+        # an uncovered value replaces this partition, but old-world code may still read
+        # the new value), so surface it as a `Speculated` hint, which call sites resolve
+        # into dynamically-guarded fast paths. An assigned untyped global can no longer
+        # be superseded by a backdated constant, so its reads get the ordinary global
+        # read effects; a never-assigned declaration could be, so we can't assume the
+        # access is effect-free. (We also prefer not to merge the world range for this
+        # into the world range for _GLOBAL, because that would pessimize codegen.)
+        spec = isdefined(partition, :restriction) ? partition.restriction : nothing
+        if isa(spec, Type) && spec !== Union{} && !has_free_typevars(spec)
+            effects = local_getglobal_effects
+            rt = spec === Any ? Any : Speculated(spec)
+        else
+            effects = Effects(local_getglobal_effects, effect_free=ALWAYS_FALSE)
+            rt = Any
+        end
     else
         rt = partition_restriction(partition)
         effects = local_getglobal_effects
@@ -4234,6 +4314,15 @@ end
 end
 @nospecializeinfer function widenreturn_noslotwrapper(𝕃ᵢ::AbstractLattice, @nospecialize(rt), info::BestguessInfo)
     return widenreturn_noslotwrapper(widenlattice(𝕃ᵢ), rt, info)
+end
+
+# `Speculated` is an intra-procedural hint only: the inter-procedural cache and the
+# optimizer must observe its sound content
+@nospecializeinfer function widenreturn(𝕃ᵢ::SpeculationsLattice, @nospecialize(rt), info::BestguessInfo)
+    return widenreturn(widenlattice(𝕃ᵢ), widenspeculation(rt), info)
+end
+@nospecializeinfer function widenreturn_noslotwrapper(𝕃ᵢ::SpeculationsLattice, @nospecialize(rt), info::BestguessInfo)
+    return widenreturn_noslotwrapper(widenlattice(𝕃ᵢ), widenspeculation(rt), info)
 end
 
 @nospecializeinfer function widenreturn(𝕃ᵢ::MustAliasesLattice, @nospecialize(rt), info::BestguessInfo)

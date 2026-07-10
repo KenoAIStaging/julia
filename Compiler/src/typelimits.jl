@@ -583,6 +583,24 @@ end
     return tmerge(widenlattice(lattice), typea, typeb)
 end
 
+@nospecializeinfer function tmerge(𝕃::SpeculationsLattice, @nospecialize(typea), @nospecialize(typeb))
+    if isa(typea, Speculated) || isa(typeb, Speculated)
+        typea === Union{} && return typeb
+        typeb === Union{} && return typea
+        if isa(typea, Speculated) && isa(typeb, Speculated)
+            # merge the hints; both sides' sound content is `Any`
+            spec = tmerge(JLTypeLattice(), typea.spec, typeb.spec)
+            return spec === Any ? Any : Speculated(spec)
+        end
+        # keep a one-sided hint only when it soundly covers the other side, otherwise
+        # the fast paths it advertises would never match that side's values
+        spec, other = isa(typea, Speculated) ? (typea.spec, typeb) : (typeb.spec, typea)
+        ⊑(widenlattice(𝕃), other, spec) && return isa(typea, Speculated) ? typea : typeb
+        return Any
+    end
+    return tmerge(widenlattice(𝕃), typea, typeb)
+end
+
 @nospecializeinfer function tmerge(𝕃::AnyMustAliasesLattice, @nospecialize(typea), @nospecialize(typeb))
     if is_valid_lattice_norec(𝕃, typea)
         typeb === Union{} && return typea

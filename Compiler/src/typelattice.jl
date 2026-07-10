@@ -118,6 +118,34 @@ function InterMustAlias(alias::MustAlias)
     InterMustAlias(alias.slot, alias.vartyp, alias.fldidx, alias.fldtyp)
 end
 
+"""
+    spec::Speculated
+
+A lattice element carrying a *speculated* type refinement (#8870). Its sound content is
+`Any`; `spec.spec` is a type hint that the runtime value is overwhelmingly likely (but
+not guaranteed) to conform to. It is currently produced by reads of untyped globals,
+whose binding partitions accumulate the union of the types of every value stored so far
+(see `jl_speculate_binding_type`), and by calls inferred against such hints, so that
+chained uses keep splitting.
+
+Any consumer that wants to profit from the hint must guard it dynamically: abstract
+interpretation infers calls with `Speculated` arguments against the hinted types and
+wraps the result in a `SpeculatedCallInfo`, which the inlining pass resolves into an
+`isa`-guarded fast path with the original generic call as the fallback. The hint going
+stale (the runtime widens it on stores, but is permitted to skip that) therefore costs
+performance, never soundness. The element is stripped to `Any` at every boundary the
+optimizer or the inter-procedural cache can observe.
+"""
+struct Speculated
+    spec
+    function Speculated(@nospecialize spec)
+        @assert isa(spec, Type) && spec !== Any && spec !== Union{} && !has_free_typevars(spec) "invalid speculation"
+        return new(spec)
+    end
+end
+
+@nospecializeinfer widenspeculation(@nospecialize typ) = isa(typ, Speculated) ? Any : typ
+
 struct PartialTypeVar
     tv::TypeVar
     # N.B.: Currently unused, but would allow turning something back
@@ -426,6 +454,19 @@ end
     return ⊑(widenlattice(𝕃), a, b)
 end
 
+@nospecializeinfer function ⊑(𝕃::SpeculationsLattice, @nospecialize(a), @nospecialize(b))
+    if isa(a, Speculated)
+        # the sound content of a `Speculated` is `Any`; two speculations order by hint
+        isa(b, Speculated) && return ⊑(widenlattice(𝕃), a.spec, b.spec)
+        return ⊑(widenlattice(𝕃), Any, b)
+    elseif isa(b, Speculated)
+        # every element is soundly below `Any`; sit below the speculation only when the
+        # hint covers it, so that tmerge keeps hints that remain accurate
+        return ⊑(widenlattice(𝕃), a, b.spec)
+    end
+    return ⊑(widenlattice(𝕃), a, b)
+end
+
 @nospecializeinfer function ⊑(lattice::PartialsLattice, @nospecialize(a), @nospecialize(b))
     if isa(a, PartialStruct)
         if isa(b, PartialStruct)
@@ -662,6 +703,14 @@ end
     return tmeet(widenlattice(𝕃), v, t)
 end
 
+@nospecializeinfer function tmeet(𝕃::SpeculationsLattice, @nospecialize(v), @nospecialize(t::AnyType))
+    if isa(v, Speculated)
+        # a meet means the consumer has real (checked) information; the hint is subsumed
+        v = Any
+    end
+    return tmeet(widenlattice(𝕃), v, t)
+end
+
 @nospecializeinfer function tmeet(lattice::InferenceLattice, @nospecialize(v), @nospecialize(t::AnyType))
     # TODO: This can probably happen and should be handled
     @assert !isa(v, LimitedAccuracy)
@@ -688,6 +737,7 @@ Widens extended lattice element `x` to native `Type` representation.
 """
 widenconst(::AnyConditional) = Bool
 widenconst(a::AnyMustAlias) = widenconst(widenmustalias(a))
+widenconst(::Speculated) = Any
 # a closed type value widens to the egality kind, mirroring how `jl_inst_arg_tuple_type`
 # keys runtime dispatch (`Const(v) ⊑ TypeEgal{v} ⊑ Type{v}`); an open one only to its
 # `==`-class `Type{v}`

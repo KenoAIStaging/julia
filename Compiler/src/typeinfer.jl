@@ -897,7 +897,7 @@ function type_annotate!(::AbstractInterpreter, sv::InferenceState)
     # widen slot wrappers from `slottypes`
     slottypes = sv.slottypes
     for i = 1:length(slottypes)
-        slottypes[i] = widenslotwrapper(slottypes[i])
+        slottypes[i] = widenspeculation(widenslotwrapper(slottypes[i]))
     end
 
     # compute the required type for each slot
@@ -917,7 +917,7 @@ function type_annotate!(::AbstractInterpreter, sv::InferenceState)
     for i = 1:nstmt
         expr = stmts[i]
         if was_reached(sv, i)
-            ssavaluetypes[i] = widenslotwrapper(ssavaluetypes[i]) # 3
+            ssavaluetypes[i] = widenspeculation(widenslotwrapper(ssavaluetypes[i])) # 3
         else # i.e. any runtime execution will never reach this statement
             push!(sv.unreachable, i)
             if is_meta_expr(expr) # keep any lexically scoped expressions
@@ -936,7 +936,7 @@ function type_annotate!(::AbstractInterpreter, sv::InferenceState)
             vartable = bbstate.vartable
             for slot in 1:nslots
                 vt = vartable[slot]
-                widened_type = widenslotwrapper(ignorelimited(vt.typ))
+                widened_type = widenspeculation(widenslotwrapper(ignorelimited(vt.typ)))
                 vartable[slot] = VarState(widened_type, vt.ssadef, vt.undef)
             end
         end

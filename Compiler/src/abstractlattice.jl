@@ -33,6 +33,17 @@ widenlattice(𝕃::PartialsLattice) = 𝕃.parent
 is_valid_lattice_norec(::PartialsLattice, @nospecialize(elem)) = isa(elem, PartialStruct) || isa(elem, PartialOpaque)
 
 """
+    struct SpeculationsLattice{𝕃<:AbstractLattice} <: AbstractLattice
+
+A lattice extending a base lattice `𝕃` and adjoining `Speculated`.
+"""
+struct SpeculationsLattice{𝕃<:AbstractLattice} <: AbstractLattice
+    parent::𝕃
+end
+widenlattice(𝕃::SpeculationsLattice) = 𝕃.parent
+is_valid_lattice_norec(::SpeculationsLattice, @nospecialize(elem)) = isa(elem, Speculated)
+
+"""
     struct ConditionalsLattice{𝕃<:AbstractLattice} <: AbstractLattice
 
 A lattice extending a base lattice `𝕃` and adjoining `Conditional`.
@@ -80,7 +91,7 @@ const AnyConditionalsLattice{𝕃<:AbstractLattice} = Union{ConditionalsLattice{
 const AnyMustAliasesLattice{𝕃<:AbstractLattice} = Union{MustAliasesLattice{𝕃}, InterMustAliasesLattice{𝕃}}
 
 const SimpleInferenceLattice = typeof(PartialsLattice(ConstsLattice()))
-const BaseInferenceLattice = typeof(MustAliasesLattice(ConditionalsLattice(SimpleInferenceLattice.instance)))
+const BaseInferenceLattice = typeof(MustAliasesLattice(ConditionalsLattice(SpeculationsLattice(SimpleInferenceLattice.instance))))
 const IPOResultLattice = typeof(InterMustAliasesLattice(InterConditionalsLattice(SimpleInferenceLattice.instance)))
 
 """

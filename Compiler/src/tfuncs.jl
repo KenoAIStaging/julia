@@ -1181,6 +1181,10 @@ end
     return _getfield_tfunc(widenlattice(𝕃), widenmustalias(s00), widenmustalias(name), setfield)
 end
 
+@nospecs function _getfield_tfunc(𝕃::SpeculationsLattice, s00, name, setfield::Bool)
+    return _getfield_tfunc(widenlattice(𝕃), widenspeculation(s00), widenspeculation(name), setfield)
+end
+
 @nospecs function _getfield_tfunc(𝕃::PartialsLattice, s00, name, setfield::Bool)
     if isa(s00, PartialStruct)
         s = widenconst(s00)

@@ -52,6 +52,12 @@ Compiler/Runtime improvements
     effect tracking; for those, the recommended pattern remains storing the field value in
     a local variable before the check (e.g. `val = x.field; if !isnothing(val) ... end`)
     ([#41199], [#47574]).
+  - Code using untyped global variables is now significantly faster: the runtime tracks
+    a *speculated* type for every untyped global (the union of the types of all values
+    assigned to it so far), and the compiler uses it to emit a fast path specialized on
+    the speculated type -- guarded by a cheap runtime test -- with a generic call as the
+    fallback. Assigning a value of a new type widens the speculation; the guarded code
+    remains correct either way ([#8870]).
   - Stack traces now show full method signatures with argument types for inlined
     frames, matching the display of non-inlined frames ([#53925]).
   - Parallel package precompilation now coordinates CPU usage across both the

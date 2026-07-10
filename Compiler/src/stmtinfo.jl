@@ -489,4 +489,20 @@ function add_edges_impl(edges::Vector{Any}, info::GlobalAccessInfo)
     push!(edges, info.b)
 end
 
+"""
+    info::SpeculatedCallInfo <: CallInfo
+
+Records that this call was inferred against the *speculated* types of one or more of its
+arguments (see `Speculated`): `spec_argtypes` are the argument types the enclosed `info`
+was computed at; the call's actual argument types are wider. The inlining pass resolves
+this into an `isa`-guarded fast path for the speculated signature with the original
+generic call as the fallback. The enclosed info must never be treated as covering the
+full call.
+"""
+struct SpeculatedCallInfo <: CallInfo
+    spec_argtypes::Vector{Any}
+    info::CallInfo
+end
+add_edges_impl(edges::Vector{Any}, info::SpeculatedCallInfo) = add_edges!(edges, info.info)
+
 @specialize

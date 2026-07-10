@@ -1159,4 +1159,32 @@ module GlobalSpeculation
     @test Base.binding_kind(SpecM10, :fresh_g) == Base.PARTITION_KIND_DECLARED
     @test spec_of(SpecM10, :fresh_g) === Int
 
+    # inference resolves reads of speculated globals into a fast path that inlines the
+    # speculated-type method, guarded by `isa`, with a generic-call fallback
+    @eval module SpecM8
+        n = 0
+        addone() = n + 1
+    end
+    let (src, _) = only(code_typed(SpecM8.addone, (); optimize=true))
+        @test any(src.code) do stmt
+            Meta.isexpr(stmt, :call) || return false
+            f = stmt.args[1]
+            f isa GlobalRef && (f = getglobal(f.mod, f.name))
+            f === Core.Intrinsics.add_int
+        end
+        # the generic fallback remains
+        @test any(src.code) do stmt
+            Meta.isexpr(stmt, :call) || return false
+            f = stmt.args[1]
+            f isa GlobalRef && (f = getglobal(f.mod, f.name))
+            f === (+)
+        end
+    end
+    @test invokelatest(SpecM8.addone) === 1
+    # widening invalidates: new worlds split on the widened union; the store itself
+    # remains permitted and correct
+    setglobal!(SpecM8, :n, 0.5)
+    @test invokelatest(SpecM8.addone) === 1.5
+    setglobal!(SpecM8, :n, 1)
+    @test invokelatest(SpecM8.addone) === 2
 end
