@@ -3814,7 +3814,15 @@ static jl_cgval_t emit_globalref(jl_codectx_t &ctx, jl_module_t *mod, jl_sym_t *
         }
         return mark_julia_const(ctx, constval);
     }
-    if (rkp.kind != PARTITION_KIND_GLOBAL) {
+    // An untyped global that has been assigned to (its partition carries a speculated
+    // type, #8870) reads like a global of type `Any`: the value slot stays authoritative
+    // across every transition out of this epoch (widening keeps it; a superseding
+    // constant stores its value into it; deletion NULLs it), so the plain null-checked
+    // load below needs no re-type guard. The speculated type is a hint only and must
+    // never be used as `ty` here. A never-assigned declaration keeps the runtime path
+    // (it may be superseded by a backdated constant).
+    int declared_kind = rkp.kind == PARTITION_KIND_DECLARED;
+    if (rkp.kind != PARTITION_KIND_GLOBAL && !(declared_kind && rkp.restriction != NULL)) {
         return emit_globalref_runtime(ctx, bnd, mod, name);
     }
     Value *bp = julia_binding_gv(ctx, bnd);
@@ -3823,7 +3831,7 @@ static jl_cgval_t emit_globalref(jl_codectx_t &ctx, jl_module_t *mod, jl_sym_t *
     }
     if (bnd != rkp.binding_if_global)
         bp = julia_binding_gv(ctx, rkp.binding_if_global);
-    jl_value_t *ty = rkp.restriction;
+    jl_value_t *ty = declared_kind ? nullptr : rkp.restriction;
     if (ty == nullptr)
         ty = (jl_value_t*)jl_any_type;
     jl_binding_t *holder = rkp.binding_if_global;

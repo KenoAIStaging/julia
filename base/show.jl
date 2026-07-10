@@ -3436,6 +3436,10 @@ function print_partition(io::IO, partition::Core.BindingPartition)
         print(io, "ambiguous binding - guard entry")
     elseif kind == PARTITION_KIND_DECLARED
         print(io, "weak global binding declared using `global` (implicit type Any)")
+        if isdefined(partition, :restriction)
+            print(io, ", speculated type ")
+            print(io, partition.restriction)
+        end
     elseif kind == PARTITION_KIND_IMPLICIT_GLOBAL
         print(io, "implicit `using` resolved to global ")
         print(io, partition_restriction(partition).globalref)

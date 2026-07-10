@@ -118,7 +118,7 @@ const xxx,xxxx,xxxxx = 10,20,30
 const c0 = v0 = v1 = 123
 #---------------------
 1   123
-2   (call core.declare_global TestMod :v1 true)
+2   (call core.declare_global TestMod :v1 false)
 3   latestworld
 4   (call core.get_binding_type TestMod :v1)
 5   (= slot₁/tmp %₁)
@@ -128,7 +128,7 @@ const c0 = v0 = v1 = 123
 9   (= slot₁/tmp (call top.convert %₄ slot₁/tmp))
 10  slot₁/tmp
 11  (call core.setglobal! TestMod :v1 %₁₀)
-12  (call core.declare_global TestMod :v0 true)
+12  (call core.declare_global TestMod :v0 false)
 13  latestworld
 14  (call core.get_binding_type TestMod :v0)
 15  (= slot₂/tmp %₁)
@@ -146,7 +146,7 @@ const c0 = v0 = v1 = 123
 # Global assignment
 xx = 10
 #---------------------
-1   (call core.declare_global TestMod :xx true)
+1   (call core.declare_global TestMod :xx false)
 2   latestworld
 3   (call core.get_binding_type TestMod :xx)
 4   (= slot₁/tmp 10)

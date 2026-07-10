@@ -402,7 +402,12 @@ end
 #
 # (This should do what fl_defined_julia_global does for flisp lowering)
 function is_defined_and_owned_global(mod, name, world::UInt=Base.get_world_counter())
-    return Base.invoke_in_world(world, Base.binding_kind, mod, name) === Base.PARTITION_KIND_GLOBAL
+    kind = Base.invoke_in_world(world, Base.binding_kind, mod, name)
+    kind === Base.PARTITION_KIND_GLOBAL && return true
+    # an untyped global declares weak (#8870): it is "defined by" the module once it
+    # has been assigned a value
+    return kind === Base.PARTITION_KIND_DECLARED &&
+        Base.invoke_in_world(world, Base.isdefinedglobal, mod, name)
 end
 
 # "Reserve" a binding: create the binding if it doesn't exist but do not assign

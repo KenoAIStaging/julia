@@ -144,7 +144,9 @@ function convert_global_assignment(ctx, ex, var, rhs0)
     binfo = get_binding(ctx, var)
     @jl_assert binfo.kind == :global ex var
     stmts = SyntaxList(ctx)
-    decl = make_globaldecl(ctx, ex, binfo.mod, binfo.name, true)
+    # The declaration is weak (PARTITION_KIND_DECLARED): an implicitly-assigned global
+    # carries no declared type, only a speculated one maintained by the stores (#8870).
+    decl = make_globaldecl(ctx, ex, binfo.mod, binfo.name, false)
     if kind(decl) !== K"TOMBSTONE"
         push!(stmts, decl)
     end

@@ -3933,10 +3933,12 @@ f(x) = yt(x)
            `(block (= ,rhs1 ,rhs0) ,ex ,rhs1))
       ;; If this assignment is associated with a type declaration, we will have
       ;; inserted it into the `globals` table before reaching this point.  If it
-      ;; isn't there, we must generate a declare_global call now.
+      ;; isn't there, we must generate a declare_global call now. The declaration is
+      ;; weak (PARTITION_KIND_DECLARED): an implicitly-assigned global carries no
+      ;; declared type, only a speculated one maintained by the stores (#8870).
       ,.(if (or toplevel-pure (get globals ref #f))
             '()
-            `((call (core declare_global) ,(cadr ref) (inert ,(caddr ref)) (true))
+            `((call (core declare_global) ,(cadr ref) (inert ,(caddr ref)) (false))
               (latestworld))))))
 
 ;; convert assignment to a closed variable to a setfield! call.

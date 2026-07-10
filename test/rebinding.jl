@@ -1071,3 +1071,92 @@ end
         @test (b.flags & 0x10) == 0x00
     end
 end
+# #8870: untyped globals accumulate a speculated type, which inference resolves into
+# dynamically-guarded fast paths
+module GlobalSpeculation
+    using Test
+    spec_of(m::Module, s::Symbol) =
+        ccall(:jl_get_binding_speculation, Any, (Any, Csize_t),
+              convert(Core.Binding, GlobalRef(m, s)), Base.get_world_counter())
+
+    # an implicitly-assigned global declares weak and tracks the union of stored types
+    @eval module SpecM1; end
+    Core.eval(SpecM1, :(x = 1))
+    @test Base.binding_kind(SpecM1, :x) == Base.PARTITION_KIND_DECLARED
+    @test spec_of(SpecM1, :x) === Int
+    Core.eval(SpecM1, :(x = 2))
+    @test spec_of(SpecM1, :x) === Int
+    Core.eval(SpecM1, :(x = 2.5))
+    @test spec_of(SpecM1, :x) == Union{Float64,Int}
+    Core.eval(SpecM1, :(x = "three"))
+    @test spec_of(SpecM1, :x) == Union{Float64,Int,String}
+    # the fourth distinct type saturates the speculation, permanently
+    Core.eval(SpecM1, :(x = 0x04))
+    @test spec_of(SpecM1, :x) === Any
+    Core.eval(SpecM1, :(x = 5))
+    @test spec_of(SpecM1, :x) === Any
+    # ... and the declared type of an untyped global remains `Any` throughout
+    @test Core.get_binding_type(SpecM1, :x) === Any
+
+    # every store entry point widens
+    @eval module SpecM2; y = 1; end
+    setglobal!(SpecM2, :y, 1.5)
+    @test spec_of(SpecM2, :y) == Union{Float64,Int}
+    Core.modifyglobal!(SpecM2, :y, +, im)
+    @test spec_of(SpecM2, :y) == Union{Complex{Float64},Float64,Int}
+
+    # a bare declaration has no speculation until assigned
+    @eval module SpecM3; global z; end
+    @test spec_of(SpecM3, :z) === nothing
+    setglobal!(SpecM3, :z, :sym)
+    @test spec_of(SpecM3, :z) === Symbol
+
+    # a declared type suppresses speculation entirely
+    @eval module SpecM4; global t::Integer = 1; end
+    @test Base.binding_kind(SpecM4, :t) == Base.PARTITION_KIND_GLOBAL
+    @test spec_of(SpecM4, :t) === nothing
+
+    # upgrading to a declared type replaces the speculation
+    @eval module SpecM5; w = 1; end
+    @test spec_of(SpecM5, :w) === Int
+    Core.eval(SpecM5, :(global w::Number))
+    @test Base.binding_kind(SpecM5, :w) == Base.PARTITION_KIND_GLOBAL
+    @test spec_of(SpecM5, :w) === nothing
+
+    # a value-holding untyped global still refuses to become a generic function
+    @eval module SpecM6; f = 1; end
+    @test_throws ErrorException Core.eval(SpecM6, :(function f end))
+
+    # ... but may be replaced by a value-carrying const, whose value is stored into the
+    # (single, shared) value slot so that stale compiled reads observe it
+    @eval module SpecM7
+        v = 1
+        readv() = v
+    end
+    @test SpecM7.readv() === 1
+    let w = Base.get_world_counter()
+        Core.eval(SpecM7, :(const v = 2))
+        @test invokelatest(SpecM7.readv) === 2
+        @test Base.invoke_in_world(w, SpecM7.readv) === 2
+    end
+    # a const over an *assigned* untyped global is never backdated
+    @eval module SpecM7b
+        v = 1
+        readv() = v
+    end
+    let w = Base.get_world_counter()
+        Core.eval(SpecM7b, :(v = 1.5))
+        Core.eval(SpecM7b, :(const v = "c"))
+        @test Base.binding_kind(Base.lookup_binding_partition(w,
+            convert(Core.Binding, GlobalRef(SpecM7b, :v)))) != Base.PARTITION_KIND_BACKDATED_CONST
+    end
+
+    # an in-function global assignment also declares weak and speculates
+    @eval module SpecM10
+        setit() = (global fresh_g = 42)
+    end
+    SpecM10.setit()
+    @test Base.binding_kind(SpecM10, :fresh_g) == Base.PARTITION_KIND_DECLARED
+    @test spec_of(SpecM10, :fresh_g) === Int
+
+end

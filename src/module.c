@@ -671,11 +671,14 @@ JL_DLLEXPORT jl_binding_partition_t *jl_declare_constant_val3(
         } else if (jl_bkind_is_some_explicit_import(kind)) {
             jl_errorf("cannot declare %s.%s constant; it was already declared as an import",
                       jl_symbol_name(mod->name), jl_symbol_name(var));
-        } else if (kind == PARTITION_KIND_GLOBAL) {
+        } else if (kind == PARTITION_KIND_GLOBAL ||
+                   (kind == PARTITION_KIND_DECLARED && jl_atomic_load_relaxed(&b->value) != NULL)) {
             // #62154: replacing a declared global by a constant is permitted when the
             // declaration carries a value; it is treated as a re-type plus an
             // assignment of that value to the binding (see below). A valueless
             // constant declaration has no value to assign, so it stays an error.
+            // An untyped global that has been assigned to (implicit global assignments
+            // declare weak, #8870) supersedes a value epoch the same way.
             if (!val)
                 jl_errorf("cannot declare %s.%s constant; it was already declared global",
                           jl_symbol_name(mod->name), jl_symbol_name(var));
@@ -696,6 +699,9 @@ JL_DLLEXPORT jl_binding_partition_t *jl_declare_constant_val3(
             for (;;) {
                 enum jl_partition_kind prev_kind = jl_binding_kind(prev_bpart);
                 if (jl_bkind_is_some_constant(prev_kind) || prev_kind == PARTITION_KIND_GLOBAL ||
+                    // an assigned untyped global (its partition carries a speculated
+                    // type, #8870) was a real value epoch: never backdate over it
+                    (prev_kind == PARTITION_KIND_DECLARED && prev_bpart->restriction != NULL) ||
                     jl_bkind_is_some_import(prev_kind)) {
                     need_backdate = 0;
                     break;
@@ -1161,7 +1167,10 @@ JL_DLLEXPORT jl_value_t *jl_get_existing_strong_gf(jl_binding_t *b, size_t new_w
     enum jl_partition_kind kind = jl_binding_kind(bpart);
     if (jl_bkind_is_some_constant(kind) && kind != PARTITION_KIND_IMPLICIT_CONST)
         return bpart->restriction;
-    if (jl_bkind_is_some_guard(kind) || kind == PARTITION_KIND_DECLARED) {
+    // An untyped global that has been assigned to holds a value like a strong global
+    // does (implicit global assignments declare weak, #8870); a bare declaration does not.
+    if (jl_bkind_is_some_guard(kind) ||
+        (kind == PARTITION_KIND_DECLARED && jl_atomic_load_relaxed(&b->value) == NULL)) {
         check_safe_newbinding(b->globalref->mod, b->globalref->name);
         return NULL;
     }
@@ -1962,11 +1971,13 @@ JL_DLLEXPORT void jl_disable_binding(jl_globalref_t *gr)
         return;
     }
 
-    if (jl_binding_kind(bpart) == PARTITION_KIND_GLOBAL) {
+    if (jl_binding_kind(bpart) == PARTITION_KIND_GLOBAL ||
+        jl_binding_kind(bpart) == PARTITION_KIND_DECLARED) {
         // #62154: deleting a declared global ends its epoch: whatever the binding is
         // re-established as next (a constant, an import, a global of another type) is
         // not required to keep the value slot conforming to this epoch's type, so code
-        // compiled against it must verify its accesses from now on. Activate the
+        // compiled against it must verify its accesses from now on (untyped globals
+        // also compile to guarded direct loads of the value slot, #8870). Activate the
         // guards before the deletion is published (the slot still holds the epoch's
         // old, conforming value, so early activation is harmless).
         jl_atomic_fetch_or_relaxed(&b->flags, BINDING_FLAG_RETYPED);
@@ -2096,6 +2107,90 @@ void jl_binding_deprecation_warning(jl_binding_t *b)
     }
 }
 
+// The maximum number of union components a speculated type may accumulate before it
+// saturates to Any. The hint's value comes from compiled fast paths that test it with
+// an `isa`, so it must stay cheap to check.
+#define BINDING_SPECULATION_MAX_UNION 3
+
+// #8870: a PARTITION_KIND_DECLARED (untyped global) partition carries in ->restriction
+// a *speculated* type: the union of the types of every value stored so far (NULL until
+// the first store, saturating to Any, see above). Unlike the declared type of a
+// PARTITION_KIND_GLOBAL, it never restricts or converts a store; inference merely uses
+// it to compile speculative fast paths that are guarded dynamically. A hint that is too
+// narrow (widening is skipped in contexts where partitions cannot be replaced, and the
+// modify path widens after committing) therefore costs performance, never correctness.
+//
+// Widen the speculation so it covers `rhs`, replacing the binding partition and bumping
+// the world counter: code inferred against the narrower speculation carries a partition
+// edge and gets invalidated, so new compilations see the widened hint.
+static void jl_speculate_binding_type(jl_binding_t *b, jl_value_t *rhs)
+{
+    jl_module_t *mod = b->globalref->mod;
+    // Partition replacement is not permitted here; leave the (perf-only) hint stale.
+    if (jl_current_task->ptls->in_pure_callback)
+        return;
+    if (jl_options.incremental && jl_generating_output() && !is_module_open(mod))
+        return;
+    jl_value_t *new_spec = NULL;
+    JL_GC_PUSH2(&new_spec, &rhs);
+    JL_LOCK(&world_counter_lock);
+    size_t new_world = jl_atomic_load_relaxed(&jl_world_counter) + 1;
+    jl_binding_partition_t *bpart = jl_get_binding_partition(b, new_world);
+    // Re-check under the lock: another thread may have widened concurrently, or the
+    // binding may have been replaced by something other than an untyped global.
+    if (jl_binding_kind(bpart) == PARTITION_KIND_DECLARED) {
+        jl_value_t *spec = bpart->restriction;
+        JL_GC_PROMISE_ROOTED(spec);
+        if (spec == NULL) {
+            new_spec = jl_typeof(rhs);
+        }
+        else if (spec != (jl_value_t*)jl_any_type && !jl_isa(rhs, spec)) {
+            jl_value_t *ts[2] = {spec, jl_typeof(rhs)};
+            new_spec = jl_type_union(ts, 2);
+            if (jl_count_union_components(new_spec) > BINDING_SPECULATION_MAX_UNION)
+                new_spec = (jl_value_t*)jl_any_type;
+        }
+        if (new_spec != NULL) {
+            if (jl_atomic_load_relaxed(&bpart->min_world) == new_world) {
+                // Not yet published (declared under this same world-counter hold);
+                // safe to fill in directly.
+                jl_gc_write(bpart, bpart->restriction, jl_value_t, new_spec);
+            }
+            else {
+                jl_replace_binding_locked(b, bpart, new_spec, PARTITION_KIND_DECLARED, new_world);
+                jl_atomic_store_release(&jl_world_counter, new_world);
+            }
+        }
+    }
+    JL_UNLOCK(&world_counter_lock);
+    JL_GC_POP();
+}
+
+// Widen the speculated type of an untyped global after a value has already been
+// committed to it (the modify path validates only pre-commit and computes the stored
+// value inside its CAS loop).
+static void jl_speculate_binding_type_post_store(jl_binding_t *b, jl_value_t *val)
+{
+    jl_binding_partition_t *bpart = jl_get_binding_partition(b, jl_atomic_load_acquire(&jl_world_counter));
+    if (jl_binding_kind(bpart) != PARTITION_KIND_DECLARED)
+        return;
+    jl_value_t *spec = bpart->restriction;
+    JL_GC_PROMISE_ROOTED(spec);
+    if (spec == NULL || (spec != (jl_value_t*)jl_any_type && jl_typeof(val) != spec && !jl_isa(val, spec)))
+        jl_speculate_binding_type(b, val);
+}
+
+// The speculated type of the binding's current partition in `world`, or `nothing` if
+// the partition is not an untyped global or has never been stored to.
+JL_DLLEXPORT jl_value_t *jl_get_binding_speculation(jl_binding_t *b, size_t world)
+{
+    jl_binding_partition_t *bpart = jl_get_binding_partition(b, world);
+    if (jl_binding_kind(bpart) != PARTITION_KIND_DECLARED)
+        return jl_nothing;
+    jl_value_t *spec = bpart->restriction;
+    return spec == NULL ? jl_nothing : spec;
+}
+
 // For a generally writable binding (checked using jl_check_binding_currently_writable in this world age), check whether
 // we can actually write the value `rhs` to it.
 jl_value_t *jl_check_binding_assign_value(jl_binding_t *b JL_PROPAGATES_ROOT, jl_module_t *mod, jl_sym_t *var, jl_value_t *rhs, const char *msg)
@@ -2118,7 +2213,18 @@ jl_value_t *jl_check_binding_assign_value(jl_binding_t *b JL_PROPAGATES_ROOT, jl
         // guards of compiled code, so every stale write reaches this check.)
         jl_binding_not_writable_error(b, mod, var, kind);
     }
-    jl_value_t *old_ty = kind == PARTITION_KIND_DECLARED ? (jl_value_t*)jl_any_type : bpart->restriction;
+    if (kind == PARTITION_KIND_DECLARED) {
+        // An untyped global never restricts the store; its ->restriction is the
+        // speculated type (see jl_speculate_binding_type), widened here -- before the
+        // store commits -- when the incoming value is not covered.
+        jl_value_t *spec = bpart->restriction;
+        JL_GC_PROMISE_ROOTED(spec);
+        if (spec == NULL || (spec != (jl_value_t*)jl_any_type && jl_typeof(rhs) != spec && !jl_isa(rhs, spec)))
+            jl_speculate_binding_type(b, rhs);
+        JL_GC_POP();
+        return (jl_value_t*)jl_any_type;
+    }
+    jl_value_t *old_ty = bpart->restriction;
     JL_GC_PROMISE_ROOTED(old_ty);
     if (old_ty != (jl_value_t*)jl_any_type && jl_typeof(rhs) != old_ty && !jl_isa(rhs, old_ty)) {
         jl_type_error_global(msg, mod, var, old_ty, rhs);
@@ -2306,6 +2412,17 @@ JL_DLLEXPORT jl_value_t *jl_checked_modify(jl_binding_t *b, jl_module_t *mod, jl
         // see jl_check_binding_assign_value: no longer a writable global in the latest world
         jl_binding_not_writable_error(b, mod, var, latest_kind);
     bpart = latest_bpart;
+    if (latest_kind == PARTITION_KIND_DECLARED) {
+        // An untyped global: ->restriction is the speculated type (never a store
+        // restriction). The value the modify op commits is only known after the fact,
+        // so widen the speculation post-store; a fast path reading the momentarily
+        // stale hint diverts through its dynamic guard, which is merely slower.
+        jl_value_t *result = modify_value((jl_value_t*)jl_any_type, &b->value, (jl_value_t*)b, op, rhs, 1, b, mod, var);
+        JL_GC_PUSH1(&result);
+        jl_speculate_binding_type_post_store(b, jl_fieldref_noalloc(result, 1));
+        JL_GC_POP();
+        return result;
+    }
     jl_value_t *ty = bpart->restriction;
     JL_GC_PROMISE_ROOTED(ty);
     return modify_value(ty, &b->value, (jl_value_t*)b, op, rhs, 1, b, mod, var);

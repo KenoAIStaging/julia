@@ -777,7 +777,11 @@ enum jl_partition_kind {
     // Declared: The binding was declared using `global` or similar. This acts in most ways like
     // PARTITION_KIND_GLOBAL with an `Any` restriction, except that it may be redefined to a stronger
     // binding like `const` or an explicit import.
-    //  ->restriction is NULL.
+    //  ->restriction holds the *speculated* type of the binding (#8870): NULL until the
+    //  first store, otherwise the union of the types of every value stored while this
+    //  partition governed the binding (saturating to Any). It never restricts a store;
+    //  inference uses it to emit dynamically-guarded fast paths, and stores of values it
+    //  does not cover widen it by replacing the partition (see jl_speculate_binding_type).
     PARTITION_KIND_DECLARED     = 0x8,
     // Guard: The binding was looked at, but no global or import was resolved at the time
     //  ->restriction is NULL.

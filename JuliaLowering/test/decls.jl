@@ -497,8 +497,9 @@ end
         Core.@latestworld
 
         @test Base.binding_kind(test_mod, sym1) == Base.PARTITION_KIND_CONST
-        @test Base.binding_kind(test_mod, sym2) == Base.PARTITION_KIND_GLOBAL
-        @test Base.binding_kind(test_mod, sym3) == Base.PARTITION_KIND_GLOBAL
+        # implicit global assignments declare weak (#8870)
+        @test Base.binding_kind(test_mod, sym2) == Base.PARTITION_KIND_DECLARED
+        @test Base.binding_kind(test_mod, sym3) == Base.PARTITION_KIND_DECLARED
         @test getproperty(test_mod, sym1) ==
             getproperty(test_mod, sym2) ==
             getproperty(test_mod, sym3)
