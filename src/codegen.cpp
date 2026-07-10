@@ -342,6 +342,8 @@ struct jl_tbaacache_t {
     MDNode *tbaa_unionselbyte;   // a selector byte in isbits Union struct fields
     MDNode *tbaa_data;       // Any user data that `pointerset/ref` are allowed to alias
     MDNode *tbaa_binding;        // jl_binding_t::value
+    MDNode *tbaa_binding_flags;  // jl_binding_t::flags (never stored by compiled code,
+                                 // so re-type guard loads cannot alias binding stores)
     MDNode *tbaa_value;          // jl_value_t, that is not jl_array_t or jl_genericmemory_t
     MDNode *tbaa_mutab;              // mutable type
     MDNode *tbaa_datatype;               // datatype
@@ -360,6 +362,7 @@ struct jl_tbaacache_t {
 
     jl_tbaacache_t(): tbaa_root(nullptr), tbaa_gcframe(nullptr), tbaa_stack(nullptr),
                     tbaa_unionselbyte(nullptr), tbaa_data(nullptr), tbaa_binding(nullptr),
+                    tbaa_binding_flags(nullptr),
                     tbaa_value(nullptr), tbaa_mutab(nullptr), tbaa_datatype(nullptr),
                     tbaa_immut(nullptr), tbaa_ptrarraybuf(nullptr), tbaa_arraybuf(nullptr),
                     tbaa_array(nullptr), tbaa_arrayptr(nullptr), tbaa_arraysize(nullptr),
@@ -388,6 +391,7 @@ struct jl_tbaacache_t {
         MDNode *tbaa_data_scalar;
         std::tie(tbaa_data, tbaa_data_scalar) = tbaa_make_child(mbuilder, "jtbaa_data");
         tbaa_binding = tbaa_make_child(mbuilder, "jtbaa_binding", tbaa_data_scalar).first;
+        tbaa_binding_flags = tbaa_make_child(mbuilder, "jtbaa_binding_flags", tbaa_data_scalar).first;
         MDNode *tbaa_value_scalar;
         std::tie(tbaa_value, tbaa_value_scalar) =
             tbaa_make_child(mbuilder, "jtbaa_value", tbaa_data_scalar);
@@ -3749,6 +3753,11 @@ static BasicBlock *emit_retype_guard(jl_codectx_t &ctx, jl_binding_t *bnd, Value
         LoadInst *bflags = ctx.builder.CreateAlignedLoad(getInt8Ty(C),
                 emit_ptrgep(ctx, bp, offsetof(jl_binding_t, flags)), Align(1));
         bflags->setOrdering(AtomicOrdering::Unordered);
+        // Compiled code never stores the flags, so the guard load cannot alias binding
+        // value stores: with its own TBAA branch, LICM may hoist the guard out of a
+        // (safepoint-free) loop over the access instead of re-testing every iteration.
+        jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_binding_flags);
+        ai.decorateInst(bflags);
         Value *retyped = ctx.builder.CreateICmpNE(
                 ctx.builder.CreateAnd(bflags, ConstantInt::get(getInt8Ty(C), BINDING_FLAG_RETYPED)),
                 ConstantInt::get(getInt8Ty(C), 0));

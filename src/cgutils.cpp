@@ -2566,6 +2566,11 @@ static Value *emit_retype_recheck(jl_codectx_t &ctx, Value *bp)
     // earlier load of the flags (e.g. the guard itself on flag-guard targets), which
     // would defeat the re-check
     bflags->setOrdering(AtomicOrdering::Monotonic);
+    // The flags are never stored by compiled code, so this load cannot alias the
+    // binding value store it is ordered after; the Monotonic ordering (plus the fence
+    // above) is what keeps it in place, not the memory dependence.
+    jl_aliasinfo_t ai = jl_aliasinfo_t::fromTBAA(ctx, ctx.tbaa().tbaa_binding_flags);
+    ai.decorateInst(bflags);
     setName(ctx.emission_context, bflags, "retype_recheck");
     return ctx.builder.CreateICmpNE(
             ctx.builder.CreateAnd(bflags, ConstantInt::get(getInt8Ty(ctx.builder.getContext()), BINDING_FLAG_RETYPED)),
