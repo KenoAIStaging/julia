@@ -3199,30 +3199,41 @@ function abstract_call_speculated(interp::AbstractInterpreter, arginfo::ArgInfo,
         wide_argtypes[i] = widenspeculation(aᵢ)
     end
     wide_arginfo = ArgInfo(arginfo.fargs, wide_argtypes)
-    # Speculation only pays for callees that dispatch on the hinted types. Builtins (and
-    # callees we cannot identify even speculatively) evaluate their arguments dynamically
-    # anyway -- and inferring e.g. `isa` at the hinted types would be outright wrong for
-    # the fallback -- so simply widen the hints away for them.
+    # The speculated inference runs as if the world had not moved past any preceding
+    # barrier: the fast paths built from it are guarded on exactly that.
+    si_spec = si.saw_latestworld ? StmtInfo(si.used, false) : si
     ft = widenslotwrapper(spec_argtypes[1])
     f = singleton_type(ft)
     if isa(f, Builtin) || (f === nothing && (isa(ft, PartialOpaque) || hasintersect(widenconst(ft), Builtin)))
-        return abstract_call(interp, wide_arginfo, si, vtypes, sv, max_methods)
+        # In the per-call-site strategy the same statement serves both the guarded
+        # fast path and the generic fallback, so a builtin folded at the hinted types
+        # (e.g. `isa`) would be outright wrong for the fallback: widen the hints away.
+        # After a world barrier, however, the fast and generic paths are separate
+        # copies of the statement, so the builtin may be folded speculatively like
+        # any other call; only the identified-builtin case is worth it.
+        (si.saw_latestworld && isa(f, Builtin)) ||
+            return abstract_call_unspeculated(interp, wide_arginfo, si, vtypes, sv, max_methods)
     end
     if max_methods == typemin(Int)
         max_methods = f === nothing ? get_max_methods(interp, sv) : get_max_methods(interp, f, sv)
     end
-    wide_atype = argtypes_to_type(wide_argtypes)
-    if wide_atype !== Bottom
-        matches = find_method_matches(interp, wide_argtypes, wide_atype; max_methods, fargs=arginfo.fargs)
-        if !isa(matches, FailedMethodMatch)
-            return abstract_call(interp, wide_arginfo, si, vtypes, sv, max_methods)
+    if !si.saw_latestworld
+        # whenever the call resolves at the widened argument types, plain generic
+        # inference is at least as good as speculation; after a barrier there is no
+        # sound generic resolution to prefer
+        wide_atype = argtypes_to_type(wide_argtypes)
+        if wide_atype !== Bottom
+            matches = find_method_matches(interp, wide_argtypes, wide_atype; max_methods, fargs=arginfo.fargs)
+            if !isa(matches, FailedMethodMatch)
+                return abstract_call_unspeculated(interp, wide_arginfo, si, vtypes, sv, max_methods)
+            end
         end
     end
-    call = abstract_call(interp, ArgInfo(arginfo.fargs, spec_argtypes), si, vtypes, sv, max_methods)::Future
+    call = abstract_call(interp, ArgInfo(arginfo.fargs, spec_argtypes), si_spec, vtypes, sv, max_methods)::Future
     return Future{CallMeta}(call, interp, sv) do call, interp, sv
         spec_rt = widenspeculation(ignorelimited(widenslotwrapper(call.rt)))
-        srt = widenconst(spec_rt)
-        rt = (srt === Any || srt === Union{} || has_free_typevars(srt)) ? Any : Speculated(srt)
+        rt = valid_speculation(spec_rt) ? Speculated(spec_rt) :
+            valid_speculation(widenconst(spec_rt)) ? Speculated(widenconst(spec_rt)) : Any
         return CallMeta(rt, Any, Effects(),
             SpeculatedCallInfo(spec_argtypes, call.info, spec_rt, call.effects))
     end
@@ -3231,9 +3242,16 @@ end
 # call where the function is any lattice element
 function abstract_call(interp::AbstractInterpreter, arginfo::ArgInfo, si::StmtInfo,
                        vtypes::Union{VarTable,Nothing}, sv::AbsIntState, max_methods::Int=typemin(Int))
-    if has_speculated_argtype(arginfo.argtypes)
+    if has_speculated_argtype(arginfo.argtypes) || si.saw_latestworld
+        # after a world barrier every method-dispatched call is generic in the sound
+        # typing; its resolution at the inference world is recorded as a speculation
         return abstract_call_speculated(interp, arginfo, si, vtypes, sv, max_methods)
     end
+    return abstract_call_unspeculated(interp, arginfo, si, vtypes, sv, max_methods)
+end
+
+function abstract_call_unspeculated(interp::AbstractInterpreter, arginfo::ArgInfo, si::StmtInfo,
+                       vtypes::Union{VarTable,Nothing}, sv::AbsIntState, max_methods::Int=typemin(Int))
     ft = widenslotwrapper(arginfo.argtypes[1])
     f = singleton_type(ft)
     if f === nothing
@@ -4139,6 +4157,32 @@ abstract_load_all_consistent_leaf_partitions(::Nothing, g::GlobalRef, wwr::World
 
 function abstract_eval_globalref(interp::AbstractInterpreter, g::GlobalRef, saw_latestworld::Bool, sv::AbsIntState{I}) where {I<:AbstractInterpreter}
     if saw_latestworld
+        # The sound answer is fully generic: the world may have moved, so nothing
+        # this partition says can narrow the type or the effects. In a top-level
+        # frame the partition at the inference world is still a valid *hint* (see
+        # `Speculated`): a thunk's execution world age equals its inference world by
+        # construction, and the bifurcation pass compiles every world-age refresh in
+        # its fast copy into a guard that the world counter did not move, so
+        # everything the optimizer derives from the hint is dynamically validated.
+        # Note no `update_valid_age!`: the sound answer does not depend on this
+        # partition. Method frames get no hint: their fixed world age need not be
+        # the inference world.
+        if !InferenceParams(interp).assume_bindings_static &&
+           !isa(frame_instance(sv).def, Method)
+            b = convert(Core.Binding, g)
+            world = get_inference_world(interp::I)
+            leafb, partition = walk_to_leaf_partition(b, lookup_binding_partition(world, b), world)
+            kind = binding_kind(partition)
+            if kind == PARTITION_KIND_DECLARED
+                spec = partition.restriction
+                if isa(spec, Type) && spec !== Any && spec !== Union{} && !has_free_typevars(spec)
+                    return RTEffects(Speculated(spec), Any, generic_getglobal_effects)
+                end
+            elseif is_defined_const_binding(kind) && kind != PARTITION_KIND_BACKDATED_CONST
+                return RTEffects(Speculated(Const(partition_restriction(partition))), Any,
+                                 generic_getglobal_effects)
+            end
+        end
         return RTEffects(Any, Any, generic_getglobal_effects)
     end
     # For inference purposes, we don't particularly care which global binding we end up loading, we only
@@ -4207,41 +4251,6 @@ struct AbstractEvalBasicStatementResult
     end
 end
 
-# Is this `:latestworld` marker provably a no-op? Lowering pairs every weak global
-# declaration with a marker, but `jl_declare_global` neither replaces the current
-# partition nor bumps the world counter when the binding is already declared (a
-# no-op) or not declared at all (the guard->DECLARED transition is backdated over the
-# guard partition's world range). Proving that lets the rest of the frame -- typically
-# a top-level thunk whose prologue declares its globals -- keep precise world
-# reasoning, in particular the global type speculations the bifurcation pass keys on.
-# A weak declaration that shadows an implicit import, by contrast, is a real world
-# event (subsequent reads resolve to the new binding), so its marker stays a barrier.
-# The proof is validated for this inference's world range, with the binding edge
-# recorded below; run-once top-level thunks are additionally protected by the
-# bifurcation pass's world-freshness guard.
-function latestworld_is_inert(interp::AbstractInterpreter, frame::InferenceState)
-    pc = frame.currpc
-    pc > 1 || return false
-    prev = frame.src.code[pc-1]
-    isexpr(prev, :call) || return false
-    length(prev.args) == 4 || return false
-    f = prev.args[1]
-    (isa(f, GlobalRef) && f.mod === Core && f.name === :declare_global) || return false
-    m = prev.args[2]
-    s = prev.args[3]
-    (isa(m, Module) && isa(s, QuoteNode) && isa(s.value, Symbol) && prev.args[4] === false) ||
-        return false
-    gr = GlobalRef(m, s.value::Symbol)
-    partition = lookup_binding_partition!(interp, gr, frame)
-    kind = binding_kind(partition)
-    kind == PARTITION_KIND_DECLARED || kind == PARTITION_KIND_GLOBAL ||
-        kind == PARTITION_KIND_GUARD || is_some_const_binding(kind) || return false
-    # the proof depends on this partition: record the binding edge so cached code is
-    # invalidated if the declaration stops being a non-event
-    frame.stmt_info[pc] = GlobalAccessInfo(convert(Core.Binding, gr))
-    return true
-end
-
 @inline function abstract_eval_basic_statement(
     interp::AbstractInterpreter, @nospecialize(stmt), sstate::StatementState, frame::InferenceState,
     result::Union{Nothing,Future{RTEffects}}=nothing)
@@ -4292,7 +4301,7 @@ end
                     (hd !== :boundscheck && is_meta_expr(stmt)))
                 rt = Nothing
             elseif hd === :latestworld
-                currsaw_latestworld = currsaw_latestworld || !latestworld_is_inert(interp, frame)
+                currsaw_latestworld = true
                 rt = Nothing
             else
                 result = abstract_eval_statement_expr(interp, stmt, sstate, frame)::Future{RTEffects}

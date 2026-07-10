@@ -589,8 +589,8 @@ end
         typeb === Union{} && return typea
         if isa(typea, Speculated) && isa(typeb, Speculated)
             # merge the hints; both sides' sound content is `Any`
-            spec = tmerge(JLTypeLattice(), typea.spec, typeb.spec)
-            return spec === Any ? Any : Speculated(spec)
+            spec = tmerge(widenlattice(𝕃), typea.spec, typeb.spec)
+            return valid_speculation(spec) ? Speculated(spec) : Any
         end
         # keep a one-sided hint only when it soundly covers the other side, otherwise
         # the fast paths it advertises would never match that side's values

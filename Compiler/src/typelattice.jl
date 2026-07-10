@@ -139,9 +139,15 @@ optimizer or the inter-procedural cache can observe.
 struct Speculated
     spec
     function Speculated(@nospecialize spec)
-        @assert isa(spec, Type) && spec !== Any && spec !== Union{} && !has_free_typevars(spec) "invalid speculation"
+        @assert isa(spec, Const) || (isa(spec, Type) && spec !== Any && spec !== Union{} &&
+            !has_free_typevars(spec)) "invalid speculation"
         return new(spec)
     end
+end
+
+@nospecializeinfer function valid_speculation(@nospecialize spec)
+    return isa(spec, Const) || (isa(spec, Type) && spec !== Any && spec !== Union{} &&
+        !has_free_typevars(spec))
 end
 
 @nospecializeinfer widenspeculation(@nospecialize typ) = isa(typ, Speculated) ? Any : typ

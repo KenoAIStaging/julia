@@ -59,24 +59,19 @@ const BIF_FLAGS_SIMPLE = IR_FLAG_EFFECT_FREE | IR_FLAG_NOTHROW | IR_FLAG_TERMINA
 const BIF_DEBUG = RefValue{Bool}(false)
 bif_debug_bail(i::Int, reason::String) = BIF_DEBUG[] && println("bifurcation bail at stmt ", i, ": ", reason)
 
-# A weak `Core.declare_global` of a binding that is already declared (a runtime
-# no-op) or not declared at all (backdated guard->DECLARED, no world bump) cannot
-# touch any binding's value slot, so it cannot observe a deferred store; the
-# `:latestworld` marker lowering pairs with it is inert for the same reason (see
-# `latestworld_is_inert`). A weak declaration shadowing an implicit import is a real
-# world event and fails this test, which bails the pass via its marker.
-function bif_noop_weak_declare(world::UInt, @nospecialize(stmt))
+# A weak `Core.declare_global` never touches any binding's value slot, so it cannot
+# observe a deferred store (its possible throws are covered by the enter/rethrow
+# wrapper). It may, however, bump the world -- when it shadows an implicit import --
+# which the world guard compiled from its paired `:latestworld` marker detects,
+# deoptimizing to the generic copy at exactly that point.
+function bif_weak_declare(@nospecialize(stmt))
     isexpr(stmt, :call) || return false
     args = (stmt::Expr).args
     length(args) == 4 || return false
     f = args[1]
     (isa(f, GlobalRef) && f.mod === Core && f.name === :declare_global) || return false
-    (isa(args[2], Module) && isa(args[3], QuoteNode) && isa((args[3]::QuoteNode).value, Symbol) &&
-     args[4] === false) || return false
-    b = convert(Core.Binding, GlobalRef(args[2]::Module, (args[3]::QuoteNode).value::Symbol))
-    kind = binding_kind(lookup_binding_partition(world, b))
-    return kind == PARTITION_KIND_DECLARED || kind == PARTITION_KIND_GLOBAL ||
-        kind == PARTITION_KIND_GUARD || is_some_const_binding(kind)
+    return isa(args[2], Module) && isa(args[3], QuoteNode) &&
+        isa((args[3]::QuoteNode).value, Symbol) && args[4] === false
 end
 
 function bif_leaf_binding(world::UInt, b::Core.Binding)
@@ -126,8 +121,9 @@ mutable struct BifurcationPlan
     reads::BitSet                     # `GlobalRef` stmts of the binding (incl. `:(=)` rhs)
     stores::BitSet                    # own `setglobal!` call stmts
     returns::BitSet
+    markers::BitSet                   # accepted `:latestworld` stmts (guarded in FAST)
     function BifurcationPlan(gr::GlobalRef, leaf::Core.Binding, @nospecialize(spec))
-        return new(gr, leaf, spec, nothing, BitSet(), BitSet(), BitSet())
+        return new(gr, leaf, spec, nothing, BitSet(), BitSet(), BitSet(), BitSet())
     end
 end
 
@@ -214,10 +210,15 @@ function bif_classify!(plan::BifurcationPlan, ci::CodeInfo, sv::OptimizationStat
             head = stmt.head
         end
         if head === :latestworld
-            # inert markers (after no-op or backdated weak declarations) cannot
-            # observe the deferral; a marker after a real world event must bail
-            (i > 1 && bif_noop_weak_declare(world, code[i-1])) && continue
-            return false
+            # In the fast copy a world marker compiles to a guard that the world
+            # counter still equals the inference world, side-exiting into the generic
+            # copy -- whose copy of the marker performs the full world-age refresh --
+            # when it moved. In a method body the world cannot move (codegen ignores
+            # the marker), so the fast copy simply drops it. Either way nothing may
+            # carry SSA values across the marker into the generic copy: the side-exit
+            # edge would break def-use dominance there.
+            push!(plan.markers, i)
+            continue
         end
         if head === :boundscheck || head === :meta || head === :loopinfo ||
            head === :code_coverage_effect || head === :inbounds || head === :isdefined ||
@@ -227,7 +228,7 @@ function bif_classify!(plan::BifurcationPlan, ci::CodeInfo, sv::OptimizationStat
             continue # cannot access binding memory
         end
         if head === :call || head === :invoke
-            bif_noop_weak_declare(world, stmt) && continue # cannot touch any binding's value
+            bif_weak_declare(stmt) && continue # cannot touch any binding's value
             args = stmt.args
             firstarg = head === :invoke ? 2 : 1
             f = args[firstarg]
@@ -256,16 +257,24 @@ function bif_classify!(plan::BifurcationPlan, ci::CodeInfo, sv::OptimizationStat
             flags = ssaflags[i]
             info = stmt_info[i]
             spec_argtypes = nothing
+            rt = ssavaluetypes[i]
+            fully_inaccessible = false
             if isa(info, SpeculatedCallInfo)
                 # in the fast copy, the speculated inference is what executes
                 flags = (flags & ~BIF_FLAGS_EFFECTS) | flags_for_effects(info.spec_effects)
                 spec_argtypes = info.spec_argtypes
+                rt = info.spec_rt
+                # unlike the flag, the recorded effects distinguish "accesses no
+                # caller-visible memory at all" from "argument memory only": the
+                # former cannot reach binding memory regardless of its arguments
+                fully_inaccessible = is_inaccessiblememonly(info.spec_effects)
             end
-            if isa(ssavaluetypes[i], Const) && has_flag(flags, IR_FLAG_EFFECT_FREE) &&
+            if isa(rt, Const) && has_flag(flags, IR_FLAG_EFFECT_FREE) &&
                has_flag(flags, IR_FLAG_NOTHROW)
                 continue # result is fixed and nothing is mutated: cannot observe us
             end
             if has_flag(flags, IR_FLAG_INACCESSIBLEMEM_OR_ARGMEM)
+                fully_inaccessible && continue
                 argtypes_ok = true
                 for k = firstarg:length(args)
                     at = spec_argtypes !== nothing && k - firstarg + 1 <= length(spec_argtypes) ?
@@ -339,6 +348,10 @@ function bif_fast_types(ci::CodeInfo, sv::OptimizationState, plan::BifurcationPl
                 info = stmt_info[i]
                 if isa(info, SpeculatedCallInfo)
                     t = info.spec_rt
+                elseif isa(info, SpeculatedGlobalAccessInfo) && isa(info.spec, Const)
+                    # a constant binding read past a world barrier: its value at the
+                    # inference world, which is the fast copy's guarded world
+                    t = info.spec
                 else
                     t = ssavaluetypes[i]
                 end
@@ -410,6 +423,8 @@ function bif_fast_rhs_type(@nospecialize(rhs), i::Int, state::Vector{Any},
     elseif isa(rhs, QuoteNode)
         return Const(rhs.value)
     elseif isa(rhs, GlobalRef)
+        info = stmt_info[i]
+        (isa(info, SpeculatedGlobalAccessInfo) && isa(info.spec, Const)) && return info.spec
         return ssavaluetypes[i] # non-plan binding read
     end
     return Const(rhs)
@@ -435,6 +450,42 @@ function bif_remap(@nospecialize(x), map::Vector{Int})
         return GotoIfNot(bif_remap(x.cond, map), x.dest) # dest patched later
     end
     return x
+end
+
+# Do any statements at-or-after `bound` use an SSAValue defined before `bound`?
+# A side exit at `bound` into the generic copy would break def-use dominance there.
+function bif_ssa_crosses(code::Vector{Any}, markers::BitSet)
+    isempty(markers) && return false
+    crossed = false
+    for j = 1:length(code)
+        bif_walk_ssa_uses(code[j]) do id
+            if !crossed && id < j
+                for m in markers
+                    if id < m <= j
+                        crossed = true
+                        break
+                    end
+                end
+            end
+        end
+        crossed && return true
+    end
+    return false
+end
+
+function bif_walk_ssa_uses(f, @nospecialize(x))
+    if isa(x, SSAValue)
+        f(x.id)
+    elseif isa(x, Expr)
+        for a in x.args
+            bif_walk_ssa_uses(f, a)
+        end
+    elseif isa(x, GotoIfNot)
+        bif_walk_ssa_uses(f, x.cond)
+    elseif isa(x, ReturnNode)
+        isdefined(x, :val) && bif_walk_ssa_uses(f, x.val)
+    end
+    return nothing
 end
 
 struct BifEmit
@@ -464,7 +515,8 @@ function bifurcate_speculated_globals!(ci::CodeInfo, sv::OptimizationState)
     # cheap scan for a candidate read before doing anything else
     cand = 0
     for i = 1:length(stmt_info)
-        if isa(stmt_info[i], SpeculatedGlobalAccessInfo)
+        info = stmt_info[i]
+        if isa(info, SpeculatedGlobalAccessInfo) && isa(info.spec, Type)
             i in sv.unreachable && continue
             cand = i
             break
@@ -491,6 +543,11 @@ function bifurcate_speculated_globals!(ci::CodeInfo, sv::OptimizationState)
         isempty(plan.reads) && bif_debug_bail(cand, "no reads matched the candidate binding")
         return nothing
     end
+    istoplevel = !isa(sv.linfo.def, Method)
+    if istoplevel && bif_ssa_crosses(ci.code, plan.markers)
+        bif_debug_bail(first(plan.markers), "SSA value live across a world marker")
+        return nothing
+    end
     BIF_DEBUG[] && println("bifurcating on ", plan.gr, " :: ", plan.spec, " (",
                            length(plan.reads), " reads, ", length(plan.stores), " stores)")
 
@@ -511,24 +568,10 @@ function bifurcate_speculated_globals!(ci::CodeInfo, sv::OptimizationState)
 
     # prefix: the one read and its guards
     grmod, grname = plan.gr.mod, plan.gr.name
-    g0 = 0
-    if !isa(sv.linfo.def, Method)
-        # In a top-level thunk the speculated facts (in particular the fast copy's
-        # invokes) are only known valid at the world this code was inferred in:
-        # unlike a method, nothing re-validates a thunk against later worlds, and
-        # execution proceeds at whatever world its (inert) prologue markers observe.
-        # Guard on the world counter still being the inference world -- any
-        # definition anywhere since then deopts to the generic copy, which subsumes
-        # invalidation for this run-once code. The check is once per thunk entry;
-        # loops contain no world markers, so the age cannot move inside them.
-        wc = bif_push!(em, Expr(:foreigncall, Expr(:tuple, QuoteNode(:jl_get_world_counter)),
-                                UInt, Core.svec(), 0, QuoteNode(:ccall)),
-                       UInt, IR_FLAG_NOTHROW | IR_FLAG_EFFECT_FREE | IR_FLAG_TERMINATES,
-                       NoCallInfo(), 0, 0)
-        weq = bif_push!(em, Expr(:call, GlobalRef(Core, :(===)), SSAValue(wc), world),
-                        Bool, BIF_FLAGS_SIMPLE, NoCallInfo(), 0, 0)
-        g0 = bif_push!(em, GotoIfNot(SSAValue(weq), 0), Any, IR_FLAG_NOTHROW, NoCallInfo(), 0, 0)
-    end
+    # A top-level thunk's execution world age equals its inference world by
+    # construction (jl_eval_thunk sets it from the same world-counter load inference
+    # uses), so facts derived at the inference world need no entry guard; only the
+    # world-age refreshes at `:latestworld` markers are guarded, below.
     defchk = bif_push!(em, Expr(:call, GlobalRef(Core, :isdefinedglobal), grmod, QuoteNode(grname)),
                        Bool, BIF_FLAGS_SIMPLE, NoCallInfo(), 0, 0)
     g1 = bif_push!(em, GotoIfNot(SSAValue(defchk), 0), Any, IR_FLAG_NOTHROW, NoCallInfo(), 0, 0)
@@ -552,6 +595,7 @@ function bifurcate_speculated_globals!(ci::CodeInfo, sv::OptimizationState)
     store_gr = plan.store_gr
     materialize() = Expr(:call, GlobalRef(Core, :setglobal!), (store_gr::GlobalRef).mod,
                          QuoteNode((store_gr::GlobalRef).name), virt)
+    marker_exits = Tuple{Int,Int}[] # (GotoIfNot stmt, original marker index)
 
     # FAST copy
     for i = 1:n
@@ -566,6 +610,25 @@ function bifurcate_speculated_globals!(ci::CodeInfo, sv::OptimizationState)
             bif_push!(em, materialize(), Any, IR_FLAG_NULL, GlobalAccessInfo(convert(Core.Binding, store_gr::GlobalRef)), i, ob)
             bif_push!(em, Expr(:leave, SSAValue(enteridx)), Nothing, IR_FLAG_NOTHROW, NoCallInfo(), i, ob)
             bif_push!(em, bif_remap(stmt, fmap), ssavaluetypes[i], ssaflags[i], NoCallInfo(), i, ob)
+            continue
+        end
+        if i in plan.markers
+            if !istoplevel
+                # the world cannot move inside a method body; the marker is a no-op
+                bif_push!(em, nothing, Nothing, BIF_FLAGS_SIMPLE, NoCallInfo(), i, ob)
+            else
+                # guard that the world counter still equals the inference world; on
+                # failure, side-exit into the generic copy at this marker, whose
+                # world-age refresh then takes full effect
+                wc = bif_push!(em, Expr(:foreigncall, Expr(:tuple, QuoteNode(:jl_get_world_counter)),
+                                        UInt, Core.svec(), 0, QuoteNode(:ccall)),
+                               UInt, IR_FLAG_NOTHROW | IR_FLAG_EFFECT_FREE | IR_FLAG_TERMINATES,
+                               NoCallInfo(), i, ob)
+                weq = bif_push!(em, Expr(:call, GlobalRef(Core, :(===)), SSAValue(wc), world),
+                                Bool, BIF_FLAGS_SIMPLE, NoCallInfo(), i, ob)
+                gpos = bif_push!(em, GotoIfNot(SSAValue(weq), 0), Any, IR_FLAG_NOTHROW, NoCallInfo(), i, ob)
+                push!(marker_exits, (gpos, i))
+            end
             continue
         end
         if i in plan.reads
@@ -612,6 +675,7 @@ function bifurcate_speculated_globals!(ci::CodeInfo, sv::OptimizationState)
     end
 
     # GENERIC copy: the verbatim deoptimization target
+    genstart = length(em.code) + 1
     for i = 1:n
         stmt = code[i]
         ob = block_for_inst(oldcfg, i)
@@ -633,7 +697,6 @@ function bifurcate_speculated_globals!(ci::CodeInfo, sv::OptimizationState)
     end
 
     # patch branch targets
-    g0 != 0 && (em.code[g0] = GotoIfNot((em.code[g0]::GotoIfNot).cond, gmap[1]))
     em.code[g1] = GotoIfNot((em.code[g1]::GotoIfNot).cond, gmap[1])
     em.code[g2] = GotoIfNot((em.code[g2]::GotoIfNot).cond, gmap[1])
     if has_stores
@@ -647,6 +710,23 @@ function bifurcate_speculated_globals!(ci::CodeInfo, sv::OptimizationState)
         else
             em.code[pos] = GotoNode(dest)
         end
+    end
+    # side-exit stubs for the world-marker guards: materialize the pending store,
+    # then continue in the generic copy at the marker (re-running its refresh)
+    stubstart = length(em.code) + 1
+    for (gpos, i) in marker_exits
+        dest = gmap[i]
+        if has_stores
+            # the side exit crosses out of the enter/rethrow wrapper's try region:
+            # materialize the pending store, pop the handler, then continue in the
+            # generic copy at the marker (whose world-age refresh then runs)
+            stub = bif_push!(em, materialize(), Any, IR_FLAG_NULL,
+                             GlobalAccessInfo(convert(Core.Binding, store_gr::GlobalRef)), 0, 0)
+            bif_push!(em, Expr(:leave, SSAValue(enteridx)), Nothing, IR_FLAG_NOTHROW, NoCallInfo(), 0, 0)
+            bif_push!(em, GotoNode(dest), Any, IR_FLAG_NOTHROW, NoCallInfo(), 0, 0)
+            dest = stub
+        end
+        em.code[gpos] = GotoIfNot((em.code[gpos]::GotoIfNot).cond, dest)
     end
 
     # install the new code and re-derive all the state `convert_to_ircode!` and
@@ -689,7 +769,7 @@ function bifurcate_speculated_globals!(ci::CodeInfo, sv::OptimizationState)
         local vartable::Vector{VarState}
         local aliases::Vector{Int}
         if ob == 0
-            if has_stores && fs >= catchstart && fs < gmap[1]
+            if (has_stores && fs >= catchstart && fs < genstart) || fs >= stubstart
                 # the catch block: any point of FAST may transfer here; the virtual
                 # slot is always assigned (the prefix dominates the enter), and its
                 # type is the join of everything the fast copy can hold in it -- a
