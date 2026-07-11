@@ -13,6 +13,8 @@ sysimg-release: $(build_private_libdir)/sys.$(SHLIB_EXT)
 sysimg-debug: $(build_private_libdir)/sys-debug.$(SHLIB_EXT)
 sysimg-JL-release: $(build_private_libdir)/sys-JL.$(SHLIB_EXT)
 sysimg-JL-debug: $(build_private_libdir)/sys-JL-debug.$(SHLIB_EXT)
+sysimg-unified-release: $(build_private_libdir)/sys-unified.$(SHLIB_EXT)
+sysimg-unified-debug: $(build_private_libdir)/sys-unified-debug.$(SHLIB_EXT)
 sysbase-release: $(build_private_libdir)/sysbase.$(SHLIB_EXT)
 sysbase-debug: $(build_private_libdir)/sysbase-debug.$(SHLIB_EXT)
 
@@ -82,7 +84,7 @@ COMPILER_SRCS := $(addprefix $(JULIAHOME)/, \
 		base/strings/lazy.jl \
 		base/traits.jl \
 		base/tuple.jl)
-COMPILER_SRCS += $(shell find $(JULIAHOME)/Compiler/src -name \*.jl -and -not -name verifytrim.jl -and -not -name show.jl)
+COMPILER_SRCS += $(shell find $(JULIAHOME)/Compiler/src -name \*.jl -and -not -name verifytrim.jl -and -not -name show.jl -and -not -path '*/unified/*')
 # UnifiedIR's compiler-needed core loads at the basecompiler stage (bootstrap
 # dialect; included from Base_compiler.jl). The debug/syntax layer
 # (tree/print/parse/interp/testdialect) is finished by Base.jl via
@@ -146,7 +148,7 @@ $$(build_private_libdir)/sysbase$1-o.a $$(build_private_libdir)/sysbase$1-bc.a :
 	fi )
 	@mv $$@.tmp $$@
 build_sysbase_$1 := $$(or $$(CROSS_BOOTSTRAP_SYSBASE),$$(build_private_libdir)/sysbase$1.$$(SHLIB_EXT))
-$$(build_private_libdir)/sys$1-o.a $$(build_private_libdir)/sys$1-bc.a : $$(build_private_libdir)/sys$1-%.a : $$(build_sysbase_$1) $$(JULIAHOME)/contrib/generate_precompile.jl
+$$(build_private_libdir)/sys$1-o.a $$(build_private_libdir)/sys$1-bc.a : $$(build_private_libdir)/sys$1-%.a : $$(build_sysbase_$1) $$(SYS_STAGE_SCRIPT)
 	@$$(call PRINT_JULIA, cd $$(JULIAHOME)/base && \
 	if ! JULIA_BINDIR=$$(call cygpath_w,$(build_bindir)) \
 		 WINEPATH="$$(call cygpath_w,$$(build_bindir));$$$$WINEPATH" \
@@ -156,7 +158,7 @@ $$(build_private_libdir)/sys$1-o.a $$(build_private_libdir)/sys$1-bc.a : $$(buil
 		 JULIA_NUM_THREADS=1 \
 			$$(call spawn, $3) $2 -C "$$(JULIA_CPU_TARGET)" $$(HEAPLIM) --output-$$* $$(call cygpath_w,$$@).tmp $$(JULIA_SYSIMG_BUILD_FLAGS) \
 			$(bootstrap_julia_flags) \
-			--startup-file=no --warn-overwrite=yes --depwarn=error --sysimage $$(call cygpath_w,$$<) $$(call cygpath_w,$$(JULIAHOME)/contrib/generate_precompile.jl) $(JULIA_PRECOMPILE); then \
+			--startup-file=no --warn-overwrite=yes --depwarn=error --sysimage $$(call cygpath_w,$$<) $$(call cygpath_w,$$(SYS_STAGE_SCRIPT)) $(JULIA_PRECOMPILE); then \
 		echo '*** This error is usually fixed by running `make clean`. If the error persists$$(COMMA) try `make cleanall`. ***'; \
 		false; \
 	fi )
@@ -166,6 +168,42 @@ $$(build_private_libdir)/sys$1-o.a $$(build_private_libdir)/sys$1-bc.a : $$(buil
 endef
 
 JULIALOWERING_SRCS := $(shell find $(build_datarootdir)/julia/JuliaLowering/src -name \*.jl)
+
+# The bootstrap experiment (unifiedir-design.md §12): the structural twin of
+# the standard `sys` stage, with the UnifiedIR-native compiler port baked
+# into the image and installed as the runtime's inference entry before the
+# generate_precompile workload runs (Compiler/src/unified/bootstrap_driver.jl).
+UNIFIED_BOOT_SRCS := $(shell find $(JULIAHOME)/Compiler/src/unified $(JULIAHOME)/UnifiedIR/src $(JULIAHOME)/UnifiedCompiler/src -name \*.jl)
+
+# UNIFIED_SYSIMAGE=1 makes the unified driver the DEFAULT `sys` stage script:
+# sys.so itself is then built with the UnifiedIR compiler port baked in and
+# installed as the runtime inference entry before (and after — the flip
+# persists into the image) the precompile workload.
+ifeq ($(UNIFIED_SYSIMAGE),1)
+SYS_STAGE_SCRIPT := $(JULIAHOME)/Compiler/src/unified/bootstrap_driver.jl
+else
+SYS_STAGE_SCRIPT := $(JULIAHOME)/contrib/generate_precompile.jl
+endif
+
+define UNIFIED_sysimg_builder
+$$(build_private_libdir)/sys-unified$1-o.a $$(build_private_libdir)/sys-unified$1-bc.a : $$(build_private_libdir)/sys-unified$1-%.a : $$(build_sysbase_$1) $$(JULIAHOME)/contrib/generate_precompile.jl $$(UNIFIED_BOOT_SRCS)
+	@$$(call PRINT_JULIA, cd $$(JULIAHOME)/base && \
+	if ! JULIA_BINDIR=$$(call cygpath_w,$(build_bindir)) \
+		 WINEPATH="$$(call cygpath_w,$$(build_bindir));$$$$WINEPATH" \
+		 JULIA_LOAD_PATH='@stdlib' \
+		 JULIA_PROJECT= \
+		 JULIA_DEPOT_PATH=':' \
+		 JULIA_NUM_THREADS=1 \
+			$$(call spawn, $3) $2 -C "$$(JULIA_CPU_TARGET)" $$(HEAPLIM) --output-$$* $$(call cygpath_w,$$@).tmp $$(JULIA_SYSIMG_BUILD_FLAGS) \
+			$(bootstrap_julia_flags) \
+			--startup-file=no --warn-overwrite=yes --depwarn=error --sysimage $$(call cygpath_w,$$<) $$(call cygpath_w,$$(JULIAHOME)/Compiler/src/unified/bootstrap_driver.jl) $(JULIA_PRECOMPILE); then \
+		echo '*** This error is usually fixed by running `make clean`. If the error persists$$(COMMA) try `make cleanall`. ***'; \
+		false; \
+	fi )
+	@mv $$@.tmp $$@
+.SECONDARY: $$(build_private_libdir)/sys-unified$1-o.a $(build_private_libdir)/sys-unified$1-bc.a # request Make to keep these files around
+endef
+
 
 define JL_sysimg_builder
 $$(build_private_libdir)/sys-JL$1-o.a $$(build_private_libdir)/sys-JL$1-bc.a : $$(build_private_libdir)/sys-JL$1-%.a : $$(build_private_libdir)/sys$1.$$(SHLIB_EXT) $$(JULIALOWERING_SRCS)
@@ -192,3 +230,5 @@ $(eval $(call sysimg_builder,,-O3,$(JULIA_EXECUTABLE_release)))
 $(eval $(call sysimg_builder,-debug,-O0,$(JULIA_EXECUTABLE_debug)))
 $(eval $(call JL_sysimg_builder,,-O3,$(JULIA_EXECUTABLE_release)))
 $(eval $(call JL_sysimg_builder,-debug,-O0,$(JULIA_EXECUTABLE_debug)))
+$(eval $(call UNIFIED_sysimg_builder,,-O3,$(JULIA_EXECUTABLE_release)))
+$(eval $(call UNIFIED_sysimg_builder,-debug,-O0,$(JULIA_EXECUTABLE_debug)))
