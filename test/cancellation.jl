@@ -1196,12 +1196,22 @@ end
     @test occursin("CancellationRequest: Safe Cancellation (CANCEL_REQUEST_SAFE)", output)
     @test p.exitcode == 1
 
-    # TODO(port): the @sync compute-spinner ^C sub-test is restored by the
-    # next commit ("Complete parked-waiter wakes when a press finds the
-    # episode acknowledged"): the per-thread episode propagation this commit
-    # introduces acknowledges the delivery from the C side, which makes the
-    # listener's acknowledged-fast-path skip the walk - leaving the parked
-    # @sync sibling asleep forever at -t1 until that commit's redelivery.
+    # ^C propagates through @sync, cancelling compute-bound and sleeping tasks
+    output, p = run_with_sigint("""
+        $(string(collatz_code))
+        try
+            @sync begin
+                @async sleep(10000)
+                @async find_collatz_counterexample()
+            end
+        catch e
+            Base.ScopedValues.with(Base.CANCEL_TOKEN => Base.sigint_new_episode!()) do
+                println(typeof(e))
+            end
+        end
+        """, [1.5])
+    @test occursin("CompositeException", output)
+    @test p.exitcode == 0
 
     # Escalation: an unresponsive process warns after 1s, and a second ^C
     # abandons the stuck task; with the interactive evaluator gone, the
