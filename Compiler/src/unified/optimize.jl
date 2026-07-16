@@ -251,6 +251,23 @@ function forward_extracts!(ir::UnifiedIR.IR)
     return n
 end
 
+"compact!, carrying the cell-name channel (meta[:cell_names], the undef-guard
+variable names) across the statement renumbering."
+function compact_carry_names!(ir::UnifiedIR.IR)
+    names = get(ir.meta, :cell_names, nothing)
+    ir, rs = UnifiedIR.compact!(ir)
+    if names isa Dict{Int32,Symbol} && !isempty(names)
+        newnames = Dict{Int32,Symbol}()
+        for (id, nm) in names
+            nid = 1 <= id <= length(rs.stmt) ? rs.stmt[id] : Int32(0)
+            nid == 0 && continue                      # cell promoted away
+            newnames[nid] = nm
+        end
+        ir.meta[:cell_names] = newnames
+    end
+    return ir
+end
+
 """
     optimize_ir!(ir, argtypes; state, inline=true, rounds=8, params) -> ir
 
@@ -312,7 +329,7 @@ function optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
             changed += inline_calls2!(ir, state; params)
             changed += union_split_calls!(ir, state; params)
         end
-        ir, _ = UnifiedIR.compact!(ir)
+        ir = compact_carry_names!(ir)
         UnifiedIR.verify_ir(ir; level = 1)
         changed == 0 && break
     end
@@ -323,7 +340,7 @@ function optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
     # entry lowering's closure-capture analysis runs.
     UnifiedIR.promote_fixpoint!(ir; stmt_value = _stmt_const_value)
     UnifiedIR.dce!(ir)
-    ir, _ = UnifiedIR.compact!(ir)
+    ir = compact_carry_names!(ir)
     infer_ir!(ir, argtypes; state)
     UnifiedIR.verify_ir(ir; level = 1)
     return ir

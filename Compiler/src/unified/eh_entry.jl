@@ -141,8 +141,13 @@ function codeinfo_to_ir_eh(ci::Core.CodeInfo; nargs::Int, name::Symbol)
         push!(b.ir.argtypes, Any)
     end
     cellmap = Dict{Int,StmtId}()          # slot -> cell
+    cellnames = Dict{Int32,Symbol}()      # cell id -> variable name (see
+                                          # codeinfo_entry: undef-guard names)
+    b.ir.meta[:cell_names] = cellnames
     for sl in (nargs+1):nslots
-        cellmap[sl] = append_stmt!(b, K"cell", Any; type = Any)
+        c = append_stmt!(b, K"cell", Any; type = Any)
+        cellmap[sl] = c
+        cellnames[c.id] = ci.slotnames[sl]
     end
     democell = Dict{Int,StmtId}()         # demoted SSA idx -> cell
     for i in 1:n

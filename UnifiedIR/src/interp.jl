@@ -342,7 +342,16 @@ function exec_plain!(ir::IR, env::Vector{Any}, s::StmtId, io::IO)
         c.defined = true
     elseif k === K"cell_get"
         c = env[payload(getop(ir, s, 1))]::CellBox
-        c.defined || throw(UndefVarError(:cell))
+        if !c.defined
+            # match the promoted guard's error shape (promote_undef_cells!):
+            # the variable name when the producer recorded one, :local scope
+            name = :cell
+            let names = get(ir.meta, :cell_names, nothing)
+                names isa Dict{Int32,Symbol} &&
+                    (name = get(names, Int32(payload(getop(ir, s, 1))), name))
+            end
+            throw(UndefVarError(name, :local))
+        end
         env[s.id] = c.value
     elseif k === K"cell_new"
         c = env[payload(getop(ir, s, 1))]::CellBox

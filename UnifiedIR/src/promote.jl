@@ -1932,6 +1932,14 @@ function promote_undef_cells!(ir::IR)
                                     vop(ir, nothing); type = Nothing)
             delete_stmt!(ir, nw)
         end
+        # the guard names the variable when the producer recorded one (the
+        # entry converters' meta[:cell_names] channel) — matching the message
+        # stock's maybe-undef slot handling raises
+        cellname = :cell
+        let names = get(ir.meta, :cell_names, nothing)
+            names isa Dict{Int32,Symbol} &&
+                (cellname = get(names, cell.id, cellname))
+        end
         for g in undom
             b = insert_before!(ir, g, K"cell_get",
                                          op_stmt(dcell); type = Bool)
@@ -1942,7 +1950,7 @@ function promote_undef_cells!(ir::IR)
                                              op_stmt(nb); type = Any)
             garm = new_region!(ir, guard, REGION_ARM)
             push_stmt!(ir, garm, K"call", vop(ir, Core.throw),
-                                 vop(ir, UndefVarError(:cell)))
+                                 vop(ir, UndefVarError(cellname, :local)))
             # the arm JOINS (the throw never returns at runtime): a diverging
             # terminator here would block constant folds of provably-defined
             # guards, and a mid-region splice of it would strand the tail

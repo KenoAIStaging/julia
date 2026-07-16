@@ -68,10 +68,16 @@ function codeinfo_to_ir(ci::Core.CodeInfo; nargs::Int, name::Symbol = :f)
         argmap[i] = append_stmt!(b, K"region_arg"; type = t isa Type ? t : Any)
         push!(b.ir.argtypes, Any)
     end
-    # cells for non-argument slots
+    # cells for non-argument slots; their variable names travel in
+    # meta[:cell_names] (optimize_ir! remaps it across compact!) so
+    # synthesized undef guards can name the variable like stock does
     cellmap = Dict{Int,StmtId}()
+    cellnames = Dict{Int32,Symbol}()
+    b.ir.meta[:cell_names] = cellnames
     for sl in (nargs+1):nslots
-        cellmap[sl] = append_stmt!(b, K"cell", Any; type = Any)
+        c = append_stmt!(b, K"cell", Any; type = Any)
+        cellmap[sl] = c
+        cellnames[c.id] = ci.slotnames[sl]
     end
 
     single = nblocks == 1 && !any(st -> st isa Core.GotoNode || st isa Core.GotoIfNot, code)
