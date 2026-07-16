@@ -307,7 +307,10 @@ function emit_stmt!(cx::ExitCtx, s::StmtId, k::UnifiedIR.Kind, loopctxs)
     elseif k === K"splatnew"
         cx.ssaof[s.id] = emitstmt!(cx, Expr(:splatnew, exit_values(cx, s, 1)...))
     elseif k === K"foreigncall"
-        vals = exit_values(cx, s, 1)
+        # structural syntax pieces (the (name, lib) tuple Expr, sparam-
+        # dependent type Exprs) must come back raw, not value-quoted
+        vals = Any[v isa QuoteNode && v.value isa Expr ? v.value : v
+                   for v in exit_values(cx, s, 1)]
         v1 = isempty(vals) ? nothing : vals[1]
         v1 isa QuoteNode && (v1 = v1.value)
         if v1 === FOREIGNGLOBAL_MARKER
@@ -317,7 +320,9 @@ function emit_stmt!(cx::ExitCtx, s::StmtId, k::UnifiedIR.Kind, loopctxs)
             cx.ssaof[s.id] = emitstmt!(cx, Expr(:foreigncall, vals...))
         end
     elseif k === K"cfunction"
-        cx.ssaof[s.id] = emitstmt!(cx, Expr(:cfunction, exit_values(cx, s, 1)...))
+        vals = Any[v isa QuoteNode && v.value isa Expr ? v.value : v
+                   for v in exit_values(cx, s, 1)]
+        cx.ssaof[s.id] = emitstmt!(cx, Expr(:cfunction, vals...))
     elseif k === K"globalref"
         cx.ssaof[s.id] = emitstmt!(cx, exit_value(cx, UnifiedIR.getop(ir, s, 1)))
     elseif k === K"isdefined_global"

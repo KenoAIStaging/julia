@@ -224,7 +224,9 @@ function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
         m.isva && continue
         Int(m.nargs) == UnifiedIR.nops(ir, s) - argofs || continue
         caller_m === m && continue                        # direct self-recursion
-        any(v -> v isa TypeVar, mi.sparam_vals) && continue
+        # unresolved TypeVars and constrained-TypeVar markers (svec(tv, flag))
+        # cannot be baked into the splice as plain sparam values
+        any(v -> v isa TypeVar || v isa Core.SimpleVector, mi.sparam_vals) && continue
         src = try
             Base.uncompressed_ir(m)
         catch

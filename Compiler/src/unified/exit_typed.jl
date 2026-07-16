@@ -463,6 +463,14 @@ function assemble_ircode(cx::TCtx, ir::UnifiedIR.IR, argmap::Dict{Int32,Int}, na
         return out
     end
 
+    # foreigncall/cfunction operands are STRUCTURAL syntax pieces (the
+    # (name, lib) tuple Expr, sparam-dependent type Exprs): emit interned
+    # Expr constants raw, not value-quoted
+    function raw_structural(@nospecialize(o))
+        o isa QuoteNode && o.value isa Expr && return o.value
+        return o
+    end
+
     function translate_stmt(s::StmtId)
         k = UnifiedIR.stmt_kind(ir, s)
         n = UnifiedIR.nops(ir, s)
@@ -471,8 +479,15 @@ function assemble_ircode(cx::TCtx, ir::UnifiedIR.IR, argmap::Dict{Int32,Int}, na
         k === K"invoke" && return Expr(:invoke, ops...)
         k === K"new" && return Expr(:new, ops...)
         k === K"splatnew" && return Expr(:splatnew, ops...)
-        k === K"foreigncall" && return Expr(:foreigncall, ops...)
-        k === K"cfunction" && return Expr(:cfunction, ops...)
+        if k === K"foreigncall" || k === K"cfunction"
+            rawops = Any[raw_structural(o) for o in ops]
+            if k === K"foreigncall" && !isempty(rawops) &&
+               rawops[1] isa QuoteNode && rawops[1].value === FOREIGNGLOBAL_MARKER
+                # marker-encoded Expr(:foreignglobal, name) — see codeinfo_entry
+                return Expr(:foreignglobal, rawops[2:end]...)
+            end
+            return Expr(k === K"cfunction" ? :cfunction : :foreigncall, rawops...)
+        end
         if k === K"extract"
             return Expr(:call, GlobalRef(Core, :getfield), ops[1],
                         Int(UnifiedIR.imm_value(UnifiedIR.getop(ir, s, 2))))
@@ -567,7 +582,7 @@ function assemble_ircode(cx::TCtx, ir::UnifiedIR.IR, argmap::Dict{Int32,Int}, na
     sptypes = CC.VarState[]
     for (i, sp) in enumerate(ir.sptypes)
         lat = splat !== nothing && i <= length(splat) ? splat[i] : CC.Const(sp)
-        push!(sptypes, CC.VarState(lat, false))
+        push!(sptypes, CC.VarState(lat, #=ssadef=#typemin(Int), #=undef=#false))
     end
     return CC.IRCode(is, cfg, di, argtypes, Expr[], sptypes)
 end
