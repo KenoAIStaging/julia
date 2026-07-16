@@ -1123,6 +1123,7 @@ function assemble_ircode(cx::TCtx, ir::UnifiedIR.IR, argmap::Dict{Int32,Int}, na
         (f & UnifiedIR.FLAG_EFFECT_FREE != 0) && (out |= CC.IR_FLAG_EFFECT_FREE)
         (f & UnifiedIR.FLAG_NOTHROW != 0) && (out |= CC.IR_FLAG_NOTHROW)
         (f & UnifiedIR.FLAG_TERMINATES != 0) && (out |= CC.IR_FLAG_TERMINATES)
+        (f & UnifiedIR.FLAG_INBOUNDS != 0) && (out |= CC.IR_FLAG_INBOUNDS)
         return out
     end
 

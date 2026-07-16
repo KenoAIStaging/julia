@@ -203,13 +203,33 @@ function resolve_inline_target(ir::UnifiedIR.IR, s::StmtId, k::UnifiedIR.Kind, s
     end
 end
 
+"""The effects-side half of stock `adjust_boundscheck!`: a callee inlined at
+an `@inbounds`-flagged site enters an elided-boundscheck context, so every
+spliced statement is marked FLAG_INBOUNDS — the post-optimization effects
+recompute then keeps their boundscheck-guarded operations `noub`-tainted
+(refine_bc_noub blocked, callee conditionals demoted at callsite_noub), and
+the context stays transitive across inlining rounds (stock achieves this
+batch-recursively through pre-inlined callee IR). The boundscheck VALUES
+stay symbolic: the emitted code keeps its checks — `@inbounds` elision is a
+separate (pure-performance) optimization this pipeline does not do yet.
+Mutates the (dense, pre-splice) callee copy."""
+function mark_inbounds_context!(callee::UnifiedIR.IR)
+    for i in 1:UnifiedIR.nstmts(callee)
+        s = StmtId(Int32(i))
+        UnifiedIR.is_tombstone(callee, s) && continue
+        UnifiedIR.add_flag!(callee, s, UnifiedIR.FLAG_INBOUNDS)
+    end
+    return callee
+end
+
 """
     inline_calls2!(ir, state; params=InlineParams()) -> Int
 
 Editable-session inlining via `splice_body!` for statically-resolved `call`
 sites and `invoke` sites. Callees are entry-converted, normalized to single
-return (multi-return supported through the loop wrapper), and admitted by the
-cost heuristic. Returns the number of sites inlined.
+return (multi-return supported through the loop wrapper), admitted by the
+cost heuristic, and marked with the site's inbounds context
+(`mark_inbounds_context!`). Returns the number of sites inlined.
 """
 function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
                         params::InlineParams = InlineParams())
@@ -259,6 +279,12 @@ function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
         if limit == params.size_limit &&
            any(i -> callee_ir.body.kind[i] === K"try", 1:UnifiedIR.nstmts(callee_ir))
             continue
+        end
+        # the site's boundscheck context (stock ir_inline_item!'s :off case):
+        # an @inbounds-flagged site puts the spliced body in an
+        # elided-checks context for the effects recompute
+        if UnifiedIR.stmt_flag(ir, s) & UnifiedIR.FLAG_INBOUNDS != 0
+            mark_inbounds_context!(callee_ir)
         end
         argmap = UnifiedIR.Operand[UnifiedIR.getop(ir, s, i)
                                    for i in (argofs + 1):UnifiedIR.nops(ir, s)]

@@ -316,6 +316,8 @@ include("late.jl")
 
 include("effects_parity.jl")
 
+include("ssaflags.jl")
+
 include("driver.jl")
 
 include("port_ssair.jl")

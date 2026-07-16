@@ -222,6 +222,19 @@ function codeinfo_to_ir_eh(ci::Core.CodeInfo; nargs::Int, name::Symbol)
         return cfgop
     end
 
+    # per-statement ssaflags carriage (see codeinfo_entry.jl carry_ssaflags):
+    # applied to everything emitted for source statement `i`, except the
+    # EnterNode branch (emit_try! recursively emits OTHER source statements)
+    ssaflags = ci.ssaflags
+    function carry_window!(i::Int, from::Int)
+        carry = i <= length(ssaflags) ? carry_ssaflags(ssaflags[i]) : zero(UInt32)
+        carry == zero(UInt32) && return
+        for j in from:Int(b.ir.body.len)
+            UnifiedIR.add_flag!(b.ir, StmtId(Int32(j)), carry)
+        end
+        return
+    end
+
     function emit_block!(bi::Int, node::Int)
         curnode[] = node
         lo = leaders[bi]
@@ -230,6 +243,7 @@ function codeinfo_to_ir_eh(ci::Core.CodeInfo; nargs::Int, name::Symbol)
         i = lo
         while i <= hi
             st = code[i]
+            stmt_from = Int(b.ir.body.len) + 1
             if st isa Core.EnterNode
                 h = 0
                 for hh in 1:H
@@ -276,6 +290,7 @@ function codeinfo_to_ir_eh(ci::Core.CodeInfo; nargs::Int, name::Symbol)
                 # bare value statement
                 record!(i, convert_value(st))
             end
+            st isa Core.EnterNode || carry_window!(i, stmt_from)
             i += 1
         end
         if !terminated

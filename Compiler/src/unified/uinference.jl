@@ -246,10 +246,9 @@ mutable struct Frame
     exc_read::Set{Int32}                  # handler regions reading their exception
                                           # value (stock's :the_exception consistency taint)
     propagate_inbounds::Bool              # src.propagate_inbounds (meta)
-    has_inbounds::Bool                    # source had @inbounds markers (meta; the
-                                          # entry converter drops them, so callee
-                                          # boundschecks may be elided by OTHER
-                                          # compilations of this body)
+    # per-statement `@inbounds`/`@assume_effects` context is entry-carried in
+    # the flag column (codeinfo_entry.jl carry_ssaflags; accessors
+    # stmt_inbounds / stmt_effects_override)
 end
 
 """May the `latestworld` statement `L` execute after the creation of closure
@@ -303,8 +302,7 @@ function Frame(ir::UnifiedIR.IR, st::UInferState, env::Vector{Any})
                Set{Int32}(), nothing,
                Dict{Int32,Vector{Any}}(), Dict{Int32,Any}(), Dict{Int32,CC.Effects}(),
                Set{Int32}(), Set{Int32}(), Set{Int32}(), Set{Int32}(), Set{Int32}(),
-               get(ir.meta, :propagate_inbounds, false) === true,
-               get(ir.meta, :has_inbounds, false) === true)
+               get(ir.meta, :propagate_inbounds, false) === true)
     # One structural scan (positions do not change during inference):
     #   - escape discipline (§5.7): a closure value that flows anywhere but
     #     the callee position of a call escapes — unknown callers, and after
@@ -623,10 +621,12 @@ function taint_nonbool_cond!(fr::Frame, @nospecialize(condl))
 end
 
 "Cyclic control (loop backedges, island back-gotos) drops `terminates` unless
-the frame's method declares `@assume_effects :terminates_locally` (the
-`handle_control_backedge!` port)."
-function taint_backedge!(fr::Frame)
+the frame's method — or the backedge statement itself, via the entry-carried
+statement override — declares `@assume_effects :terminates_locally` (the
+`handle_control_backedge!` port; `s` is the looping terminator or loop op)."
+function taint_backedge!(fr::Frame, s::StmtId)
     fr.override.terminates_locally && return nothing
+    stmt_effects_override(fr.ir, s).terminates_locally && return nothing
     fr.effects = CC.Effects(fr.effects; terminates = false)
     return nothing
 end
@@ -926,7 +926,7 @@ function infer_loop!(fr::Frame, s::StmtId)
     result = get(fr.break_vals, bodyr.id, nothing)
     fr.env[s.id] = result === nothing ? Union{} : result   # never-exiting loop: ⊥
     # §5.1 rule 5: loops drop TERMINATES (bounded-trip proofs are future work)
-    taint_backedge!(fr)
+    taint_backedge!(fr, s)
     return nothing
 end
 
@@ -1072,11 +1072,12 @@ function infer_cfg!(fr::Frame, s::StmtId)
     guard = 0
     cursrc = Ref{Int32}(0)   # region id of the block being walked
 
-    function merge_edge!(dest::RegionId, vals::Vector{Any}, ref::RefMap)
+    function merge_edge!(src_st::StmtId, dest::RegionId, vals::Vector{Any}, ref::RefMap)
         # backward edge (region ids are in creation = statement order): the
-        # island may cycle — §5.1 rule 5 drops TERMINATES. Applies to both
+        # island may cycle — §5.1 rule 5 drops TERMINATES (unless the looping
+        # terminator carries `:terminates_locally`). Applies to both
         # in-island backedges and backward cross-island gotos (catch→loop-head).
-        dest.id <= cursrc[] && taint_backedge!(fr)
+        dest.id <= cursrc[] && taint_backedge!(fr, src_st)
         if UnifiedIR.getregion(ir, dest).owner != s
             # sealed cross-island exit: mark reached; values cross scopes
             # through cells, not block args
@@ -1182,7 +1183,7 @@ function infer_cfg!(fr::Frame, s::StmtId)
                     end
                 elseif k === K"goto"
                     (dest, args_ops) = UnifiedIR.edge_bundles(ir, st)[1]
-                    merge_edge!(dest, Any[opl(fr, o) for o in args_ops], curref())
+                    merge_edge!(st, dest, Any[opl(fr, o) for o in args_ops], curref())
                 elseif k === K"br_if"
                     condl = opl(fr, UnifiedIR.getop(ir, st, 1))
                     taint_nonbool_cond!(fr, condl)
@@ -1192,7 +1193,7 @@ function infer_cfg!(fr::Frame, s::StmtId)
                     if condl isa CC.Const && condl.val isa Bool
                         # §10.3(b) inside islands: Const conditions kill edges
                         (dest, args_ops) = bundles[condl.val ? 1 : 2]
-                        merge_edge!(dest, Any[opl(fr, o) for o in args_ops], ref)
+                        merge_edge!(st, dest, Any[opl(fr, o) for o in args_ops], ref)
                     elseif condl isa UCond && (condl.thentype === Union{} ||
                                                condl.elsetype === Union{})
                         # Bottom-armed Conditional decides the edge (stock rule)
@@ -1200,23 +1201,23 @@ function infer_cfg!(fr::Frame, s::StmtId)
                         eref = copy(ref)
                         eref[condl.subject] = taken ? condl.thentype : condl.elsetype
                         (dest, args_ops) = bundles[taken ? 1 : 2]
-                        merge_edge!(dest, Any[opl(fr, o) for o in args_ops], eref)
+                        merge_edge!(st, dest, Any[opl(fr, o) for o in args_ops], eref)
                     elseif condl isa UCond
                         thenref = copy(ref); thenref[condl.subject] = condl.thentype
                         elseref = copy(ref); elseref[condl.subject] = condl.elsetype
                         (d1, a1) = bundles[1]
-                        merge_edge!(d1, Any[opl(fr, o) for o in a1], thenref)
+                        merge_edge!(st, d1, Any[opl(fr, o) for o in a1], thenref)
                         (d2, a2) = bundles[2]
-                        merge_edge!(d2, Any[opl(fr, o) for o in a2], elseref)
+                        merge_edge!(st, d2, Any[opl(fr, o) for o in a2], elseref)
                     else
                         for (dest, args_ops) in bundles
-                            merge_edge!(dest, Any[opl(fr, o) for o in args_ops], ref)
+                            merge_edge!(st, dest, Any[opl(fr, o) for o in args_ops], ref)
                         end
                     end
                 elseif k === K"switch" || k === K"await"
                     ref = curref()
                     for (dest, args_ops) in UnifiedIR.edge_bundles(ir, st)
-                        merge_edge!(dest, Any[opl(fr, o) for o in args_ops], ref)
+                        merge_edge!(st, dest, Any[opl(fr, o) for o in args_ops], ref)
                     end
                 elseif k === K"unreachable"
                 else

@@ -14,6 +14,49 @@ Base.showerror(io::IO, e::UnsupportedIR) = print(io, "UnsupportedIR: ", e.what)
 cglobal lowering, rt Ptr{Cvoid}) encoded on the K\"foreigncall\" kind."
 const FOREIGNGLOBAL_MARKER = Symbol("unified.foreignglobal")
 
+# ---------------------------------------------------------------------------
+# Statement-level ssaflags carriage (A5/E3)
+# ---------------------------------------------------------------------------
+# Lowered sources carry per-statement context in `ssaflags`: IR_FLAG_INBOUNDS
+# (`@inbounds`), IR_FLAG_INLINE/IR_FLAG_NOINLINE (callsite `@inline` etc.),
+# and — shifted above stock's NUM_IR_FLAGS — the `@assume_effects` statement
+# override payload (NUM_EFFECTS_OVERRIDES bits). The entry converters copy
+# them onto every UnifiedIR statement emitted for the source statement (one
+# lowered statement's cell reads/writes are part of its evaluation, exactly
+# the span stock's per-statement flag covers); inference reads them back
+# through the accessors below. The low FLAG_* effect bits stay the analysis
+# channel and are recomputed each pass — the publish sites preserve
+# `FLAGS_CARRIED`.
+
+"Flag-column bit position of the carried `@assume_effects` override payload."
+const STMT_OVERRIDE_SHIFT = 16
+const STMT_OVERRIDE_MASK = (UInt32(1) << Compiler.NUM_EFFECTS_OVERRIDES) - UInt32(1)
+
+"Flag-column bits owned by entry carriage (not analysis passes)."
+const FLAGS_CARRIED = UnifiedIR.FLAG_INBOUNDS | UnifiedIR.FLAG_INLINE |
+                      UnifiedIR.FLAG_NOINLINE | (STMT_OVERRIDE_MASK << STMT_OVERRIDE_SHIFT)
+
+"Project one stock `ssaflags` word onto the carried UnifiedIR flag bits."
+function carry_ssaflags(f::UInt32)
+    out = zero(UInt32)
+    (f & Compiler.IR_FLAG_INBOUNDS) != zero(UInt32) && (out |= UnifiedIR.FLAG_INBOUNDS)
+    (f & Compiler.IR_FLAG_INLINE) != zero(UInt32) && (out |= UnifiedIR.FLAG_INLINE)
+    (f & Compiler.IR_FLAG_NOINLINE) != zero(UInt32) && (out |= UnifiedIR.FLAG_NOINLINE)
+    ov = (UInt32(f >> Compiler.NUM_IR_FLAGS)) & STMT_OVERRIDE_MASK
+    return out | (ov << STMT_OVERRIDE_SHIFT)
+end
+
+"The raw carried `@assume_effects` override payload of a flag word."
+stmt_override_bits(f::UInt32) = UInt16((f >> STMT_OVERRIDE_SHIFT) & STMT_OVERRIDE_MASK)
+
+"The `@assume_effects` statement override carried on `s` (all-false when none)."
+stmt_effects_override(ir::UnifiedIR.IR, s::StmtId) =
+    Compiler.decode_effects_override(stmt_override_bits(UnifiedIR.stmt_flag(ir, s)))
+
+"Was `s` inside an `@inbounds` in the entry source (stock IR_FLAG_INBOUNDS)?"
+stmt_inbounds(ir::UnifiedIR.IR, s::StmtId) =
+    (UnifiedIR.stmt_flag(ir, s) & UnifiedIR.FLAG_INBOUNDS) != zero(UInt32)
+
 """
     codeinfo_to_ir(ci::Core.CodeInfo; nargs, name=:f) -> UnifiedIR.IR
 
@@ -118,6 +161,19 @@ function codeinfo_to_ir(ci::Core.CodeInfo; nargs::Int, name::Symbol = :f)
     end
 
     returns = 0
+    # per-statement ssaflags carriage: everything emitted for source
+    # statement `i` gets its carried flag bits (see carry_ssaflags)
+    ssaflags = ci.ssaflags
+    function convert_stmt_carry!(i::Int, st)
+        from = Int(b.ir.body.len) + 1
+        convert_stmt!(i, st)
+        carry = i <= length(ssaflags) ? carry_ssaflags(ssaflags[i]) : zero(UInt32)
+        carry == zero(UInt32) && return
+        for j in from:Int(b.ir.body.len)
+            UnifiedIR.add_flag!(b.ir, StmtId(Int32(j)), carry)
+        end
+        return
+    end
     function convert_stmt!(i::Int, st)
         if st isa Core.ReturnNode
             isdefined(st, :val) || begin
@@ -263,7 +319,7 @@ function codeinfo_to_ir(ci::Core.CodeInfo; nargs::Int, name::Symbol = :f)
 
     if single
         for (i, st) in enumerate(code)
-            convert_stmt!(i, st)
+            convert_stmt_carry!(i, st)
         end
     else
         # pre-create block regions so edges can reference them
@@ -280,7 +336,7 @@ function codeinfo_to_ir(ci::Core.CodeInfo; nargs::Int, name::Symbol = :f)
             lo = leaders[bi]
             hi = bi < nblocks ? leaders[bi + 1] - 1 : n
             for i in lo:hi
-                convert_stmt!(i, code[i])
+                convert_stmt_carry!(i, code[i])
             end
             # implicit fallthrough becomes explicit goto (§5.5)
             lastst = code[hi]

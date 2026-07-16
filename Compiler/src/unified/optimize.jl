@@ -29,6 +29,7 @@ function refine_effects!(ir::UnifiedIR.IR; interp = CC.NativeInterpreter())
             flags = UnifiedIR.FLAG_EFFECT_FREE | UnifiedIR.FLAG_NOTHROW |
                     UnifiedIR.FLAG_TERMINATES
             ismutabletype(T) || (flags |= UnifiedIR.FLAG_CONSISTENT)
+            flags |= UnifiedIR.stmt_flag(ir, s) & FLAGS_CARRIED
             if flags != UnifiedIR.stmt_flag(ir, s)
                 UnifiedIR.set_flag!(ir, s, flags)
                 n += 1
@@ -42,6 +43,7 @@ function refine_effects!(ir::UnifiedIR.IR; interp = CC.NativeInterpreter())
             g = ir.body.globals[UnifiedIR.payload(o)]
             (isconst(g.mod, g.name) && isdefined(g.mod, g.name)) || continue
             flags = UnifiedIR.FLAG_CONSISTENT | UnifiedIR.FLAG_REMOVABLE
+            flags |= UnifiedIR.stmt_flag(ir, s) & FLAGS_CARRIED
             if flags != UnifiedIR.stmt_flag(ir, s)
                 UnifiedIR.set_flag!(ir, s, flags)
                 n += 1
@@ -64,6 +66,7 @@ function refine_effects!(ir::UnifiedIR.IR; interp = CC.NativeInterpreter())
         CC.is_effect_free(effects) && (flags |= UnifiedIR.FLAG_EFFECT_FREE)
         CC.is_nothrow(effects) && (flags |= UnifiedIR.FLAG_NOTHROW)
         CC.is_terminates(effects) && (flags |= UnifiedIR.FLAG_TERMINATES)
+        flags |= UnifiedIR.stmt_flag(ir, s) & FLAGS_CARRIED
         if flags != UnifiedIR.stmt_flag(ir, s)
             UnifiedIR.set_flag!(ir, s, flags)
             n += 1

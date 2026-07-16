@@ -414,6 +414,18 @@ function transfer(fr::Frame, s::StmtId, k::UnifiedIR.Kind)
     rt = res[1]
     eff = res[2]::CC.Effects
     exct = length(res) === 3 ? res[3] : (eff.nothrow ? Union{} : Any)
+    # stock's per-statement epilogue: the statement-level `@assume_effects`
+    # override (`merge_override_effects!`; covers the statement's own
+    # effects — operand-evaluation effects merge separately in
+    # `note_effects!`, stock's N.B.). The NOUB_IF_NOINBOUNDS callsite
+    # resolution happens where interprocedural results are consumed
+    # (`callsite_noub` in the call/invoke transfers), BEFORE the frame's own
+    # boundscheck production (`refine_bc_noub`), whose conditional bit must
+    # reach the frame result undemoted.
+    ov = stmt_override_bits(UnifiedIR.stmt_flag(fr.ir, s))
+    if ov != zero(UInt16)
+        eff = CC.override_effects(eff, CC.decode_effects_override(ov))
+    end
     note_effects!(fr, s, eff, exct)
     return rt
 end
@@ -521,9 +533,9 @@ elided by an `@inbounds` inlining context — so `noub = ALWAYS_FALSE` (from the
 unprovable-inbounds argument type) refines to the conditional bit."""
 function refine_bc_noub(fr::Frame, s::StmtId, e::CC.Effects)
     e.noub === CC.ALWAYS_FALSE || return e
-    # a body with (dropped) @inbounds markers: the boundscheck value may be
-    # pinned false by other compilations — no conditional promise
-    fr.has_inbounds && return e
+    # an `@inbounds`-flagged statement (entry-carried IR_FLAG_INBOUNDS): its
+    # boundscheck value may be pinned false — no conditional promise
+    stmt_inbounds(fr.ir, s) && return e
     ir = fr.ir
     n = UnifiedIR.nops(ir, s)
     n >= 4 || return e
@@ -534,30 +546,31 @@ function refine_bc_noub(fr::Frame, s::StmtId, e::CC.Effects)
     return CC.Effects(e; noub = CC.NOUB_IF_NOINBOUNDS)
 end
 
-"""The stock callsite NOUB_IF_NOINBOUNDS resolution (abstract_eval_basic_
-statement): a callee's conditional noub refers to the callee's own
-`@boundscheck` blocks. When this frame contains `@inbounds` markers (which
-the entry converter drops, so we cannot tell WHICH callsites they cover),
-any callee's blocks may be elided by other compilations of this body —
-including the stock-compiled code that concrete evaluation executes — so
-the conditional demotes to ALWAYS_FALSE (stock's IR_FLAG_INBOUNDS branch,
-body-granular). Otherwise, when the frame does not propagate inbounds, the
-blocks are never elided through us and the promise is unconditional."""
-function callsite_noub(fr::Frame, e::CC.Effects)
+"""The stock per-statement NOUB_IF_NOINBOUNDS resolution (the main-loop
+branch after `abstract_eval_statement_expr`): a callee's conditional noub
+refers to the callee's own `@boundscheck` blocks. When THIS statement is
+`@inbounds`-flagged (entry-carried IR_FLAG_INBOUNDS), those blocks may be
+elided by compilations of this body — including the stock-compiled code
+concrete evaluation executes — so the conditional demotes to ALWAYS_FALSE.
+Otherwise, when the frame does not propagate inbounds, the blocks are never
+elided through us and the promise is unconditional."""
+function callsite_noub(fr::Frame, s::StmtId, e::CC.Effects)
     if e.noub === CC.NOUB_IF_NOINBOUNDS
-        fr.has_inbounds && return CC.Effects(e; noub = CC.ALWAYS_FALSE)
+        stmt_inbounds(fr.ir, s) && return CC.Effects(e; noub = CC.ALWAYS_FALSE)
         fr.propagate_inbounds || return CC.Effects(e; noub = CC.ALWAYS_TRUE)
     end
     return e
 end
-callsite_noub(fr::Frame, r::UResult) =
-    UResult(r.rt, callsite_noub(fr, r.effects), r.exct)
 
 function _transfer(fr::Frame, s::StmtId, k::UnifiedIR.Kind)
     ir = fr.ir
     if k === K"call"
         cl = closure_callee_transfer(fr, s)
-        cl === nothing || return cl
+        # a closure body's conditional noub resolves at the call site like
+        # any callee's (stock's per-statement rule)
+        cl === nothing || return length(cl) === 3 ?
+            (cl[1], callsite_noub(fr, s, cl[2]), cl[3]) :
+            (cl[1], callsite_noub(fr, s, cl[2]))
         cond = conditional_call(fr, s)
         cond === nothing || return (cond, CC.EFFECTS_TOTAL)
         args = Any[widenucond(a) for a in opls(fr, s, 1)]
@@ -565,13 +578,16 @@ function _transfer(fr::Frame, s::StmtId, k::UnifiedIR.Kind)
         r = apply_intercond(fr, s, 1, r)
         get(ENV, "UIR_DEBUG", "") == "1" && println("DBG call %", s.id, " args=", args, " -> ", r.rt)
         maybe_typeassert_refine!(fr, s, args, r.rt)
-        return (r.rt, refine_bc_noub(fr, s, r.effects), r.exct)
+        # order matters: resolve CALLEE conditional noub against this
+        # statement's inbounds context (stock 4188), then produce THIS
+        # frame's own-boundscheck conditional (which must survive)
+        return (r.rt, refine_bc_noub(fr, s, callsite_noub(fr, s, r.effects)), r.exct)
     elseif k === K"invoke"
         tl = opl(fr, UnifiedIR.getop(ir, s, 1))
         args = Any[widenucond(a) for a in opls(fr, s, 2)]
         r = infer_invoke_target(fr, tl, args)
         r = apply_intercond(fr, s, 2, r)
-        return (r.rt, r.effects, r.exct)
+        return (r.rt, callsite_noub(fr, s, r.effects), r.exct)
     elseif k === K"intrinsic"
         cond = conditional_call(fr, s)   # not_int Conditional inversion
         cond === nothing || return (cond, CC.EFFECTS_TOTAL)
@@ -1124,7 +1140,7 @@ function infer_call(fr::Frame, args::Vector{Any})::UResult
     for match in matches
         r = infer_method(fr, match::Core.MethodMatch, args)
         rt = ⊔(st, rt, r.rt)
-        fx = CC.merge_effects(fx, callsite_noub(fr, r.effects))
+        fx = CC.merge_effects(fx, r.effects)
         exct = exct === Any ? Any : CC.tmerge(CC.fallback_lattice, exct, r.exct)
         fully &= (match::Core.MethodMatch).fully_covers
     end
@@ -1505,7 +1521,7 @@ function infer_invoke_target(fr::Frame, @nospecialize(tl), args::Vector{Any})::U
     target = tl isa CC.Const ? tl.val : CC.singleton_type(tl)
     if target isa Core.CodeInstance
         record_ci_read!(fr.st, target)
-        return callsite_noub(fr, ci_result(target))
+        return ci_result(target)
     elseif target isa Core.MethodInstance && target.def isa Method
         match = Core.MethodMatch(target.specTypes, target.sparam_vals,
                                  target.def::Method, true)
@@ -1513,7 +1529,7 @@ function infer_invoke_target(fr::Frame, @nospecialize(tl), args::Vector{Any})::U
             col === nothing || record_invoke!(col, target.specTypes, target)
         end
         return try
-            callsite_noub(fr, infer_method(fr, match, args))
+            infer_method(fr, match, args)
         catch
             UResult(Any, CC.Effects())
         end
@@ -1540,7 +1556,7 @@ function infer_invoke(fr::Frame, args::Vector{Any})::UResult
         v = types.val
         if v isa Core.CodeInstance
             record_ci_read!(fr.st, v)
-            return callsite_noub(fr, ci_result(v))
+            return ci_result(v)
         elseif v isa Method
             argtype = Tuple{ft, argts...}
             return widen_intercond(invoke_match(fr, v, argtype, argtype, callargs))
@@ -1595,7 +1611,7 @@ function invoke_match(fr::Frame, method::Method, @nospecialize(nargtype),
             # the stock invoke-edge shape: (invokesig, callee MethodInstance)
             col === nothing || record_invoke!(col, argtype, CC.specialize_method(match))
         end
-        callsite_noub(fr, infer_method(fr, match, callargs))
+        infer_method(fr, match, callargs)
     catch
         return UResult(Any, CC.Effects())
     end
@@ -1650,21 +1666,6 @@ function sparam_statement_reads(ci::Core.CodeInfo)
     return out
 end
 
-"Does the lowered source mark any statement `@inbounds`? Lowering encodes it
-as `IR_FLAG_INBOUNDS` in `ssaflags` (legacy sources: `Expr(:inbounds)`
-markers). The entry converter drops both, so this is the (body-granular)
-stand-in for stock's per-statement flag: within such a body, callee
-`@boundscheck` blocks may be elided by other compilations of this code."
-function source_has_inbounds(ci::Core.CodeInfo)
-    for flag in ci.ssaflags
-        (flag & CC.IR_FLAG_INBOUNDS) != 0 && return true
-    end
-    for st in ci.code
-        st isa Expr && st.head === :inbounds && return true
-    end
-    return false
-end
-
 function convert_src(srcci::Core.CodeInfo, m::Method, mi::Core.MethodInstance)
     try
         ir = codeinfo_to_ir(srcci; nargs = Int(m.nargs), name = m.name)
@@ -1677,7 +1678,6 @@ function convert_src(srcci::Core.CodeInfo, m::Method, mi::Core.MethodInstance)
         end
         ir.meta[:mi] = mi     # sp_type_rewrap context for foreigncall rts
         ir.meta[:propagate_inbounds] = srcci.propagate_inbounds
-        ir.meta[:has_inbounds] = source_has_inbounds(srcci)
         return ir
     catch e
         e isa UnsupportedIR || rethrow()

@@ -243,7 +243,6 @@ function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInsta
     let reads = sparam_statement_reads(src0)
         isempty(reads) || (uir.meta[:sparam_reads] = reads)
     end
-    uir.meta[:has_inbounds] = source_has_inbounds(src0)
 
     st = UInferState(UInferConfig(; world,
         max_methods = Compiler.InferenceParams(interp).max_methods,
