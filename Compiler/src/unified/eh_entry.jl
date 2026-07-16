@@ -392,14 +392,16 @@ function codeinfo_to_ir_eh(ci::Core.CodeInfo; nargs::Int, name::Symbol)
         elseif h === :latestworld
             append_stmt!(b, K"latestworld")
             ssamap[i] = UnifiedIR.vop(b.ir, nothing)
-        elseif h === :foreigncall || h === :cfunction
+        elseif h === :foreigncall || h === :cfunction || h === :new_opaque_closure
             ops = UnifiedIR.Operand[]
             for a in st.args
                 push!(ops, a isa Union{Core.SSAValue,Core.SlotNumber,Core.Argument} ?
                       convert_value(a) : UnifiedIR.vop(b.ir, a))
             end
             record!(i, UnifiedIR.op_stmt(append_stmt!(b,
-                h === :foreigncall ? K"foreigncall" : K"cfunction", ops...; type = Any)))
+                h === :foreigncall ? K"foreigncall" :
+                h === :cfunction ? K"cfunction" : K"new_opaque_closure",
+                ops...; type = Any)))
         elseif h === :copyast
             record!(i, UnifiedIR.op_stmt(append_stmt!(b, K"copyast",
                 convert_value(st.args[1]); type = Any)))

@@ -263,6 +263,7 @@ function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInsta
     world = Compiler.get_inference_world(interp)
     def = mi.def
     def isa Method || return Fallback(:toplevel)
+    def.is_for_opaque_closure && return Fallback(:opaque_closure)
     Compiler.InferenceParams(interp).force_enable_inference && return Fallback(:trim)
     ccall(:jl_get_module_infer, Cint, (Any,), def.module) == 0 &&
         return Fallback(:inference_disabled)

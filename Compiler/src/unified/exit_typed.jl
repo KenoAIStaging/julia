@@ -1154,14 +1154,15 @@ function assemble_ircode(cx::TCtx, ir::UnifiedIR.IR, argmap::Dict{Int32,Int}, na
         k === K"invoke" && return Expr(:invoke, ops...)
         k === K"new" && return Expr(:new, ops...)
         k === K"splatnew" && return Expr(:splatnew, ops...)
-        if k === K"foreigncall" || k === K"cfunction"
+        if k === K"foreigncall" || k === K"cfunction" || k === K"new_opaque_closure"
             rawops = Any[raw_structural(o) for o in ops]
             if k === K"foreigncall" && !isempty(rawops) &&
                rawops[1] isa QuoteNode && rawops[1].value === FOREIGNGLOBAL_MARKER
                 # marker-encoded Expr(:foreignglobal, name) — see codeinfo_entry
                 return Expr(:foreignglobal, rawops[2:end]...)
             end
-            return Expr(k === K"cfunction" ? :cfunction : :foreigncall, rawops...)
+            return Expr(k === K"cfunction" ? :cfunction :
+                        k === K"foreigncall" ? :foreigncall : :new_opaque_closure, rawops...)
         end
         if k === K"extract"
             return Expr(:call, GlobalRef(Core, :getfield), ops[1],

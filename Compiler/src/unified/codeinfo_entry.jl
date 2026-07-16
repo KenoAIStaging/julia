@@ -302,6 +302,19 @@ function codeinfo_to_ir(ci::Core.CodeInfo; nargs::Int, name::Symbol = :f)
             s = append_stmt!(b, h === :cfunction ? K"cfunction" : K"foreigncall",
                              ops...; type = Any)
             ssamap[i] = UnifiedIR.op_stmt(s)
+        elseif h === :new_opaque_closure
+            # value pieces (captures, computed types) converted; structural
+            # pieces (the :opaque_closure_method Expr, literals) interned raw
+            # — the exit converter re-emits them via raw_structural. The
+            # transfer models the statement as (Any, EFFECTS_UNKNOWN); the
+            # closure BODY compiles through the runtime on first call.
+            ops = UnifiedIR.Operand[]
+            for a in st.args
+                push!(ops, a isa Union{Core.SSAValue,Core.SlotNumber,Core.Argument} ?
+                      convert_value(a) : UnifiedIR.vop(b.ir, a))
+            end
+            s = append_stmt!(b, K"new_opaque_closure", ops...; type = Any)
+            ssamap[i] = UnifiedIR.op_stmt(s)
         elseif h === :the_exception || h === :enter || h === :leave || h === :pop_exception
             throw(UnsupportedIR("exception IR ($h) — outside the v1 feature matrix"))
         elseif h === :method
