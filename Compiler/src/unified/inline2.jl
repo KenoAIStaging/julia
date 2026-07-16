@@ -26,6 +26,10 @@ InlineParams(; size_limit = 32, inline_size_limit = 128, max_union_split = 3,
              split_budget = 4) =
     InlineParams(size_limit, inline_size_limit, max_union_split, split_budget)
 
+# A "single match" is only the dispatch outcome when it also FULLY COVERS
+# the queried signature: a non-covering match means some argument tuples in
+# `sig` dispatch to a MethodError, and baking the method's body in (or
+# invoking it directly) would run it for those too.
 function resolve_single_match(@nospecialize(sig), world::UInt)
     matches = try
         Base._methods_by_ftype(sig, 1, world)
@@ -33,7 +37,9 @@ function resolve_single_match(@nospecialize(sig), world::UInt)
         nothing
     end
     (matches === nothing || matches === false || length(matches) != 1) && return nothing
-    return matches[1]::Core.MethodMatch
+    match = matches[1]::Core.MethodMatch
+    match.fully_covers || return nothing
+    return match
 end
 
 # State-threaded variant: inlining bakes callee bodies into the caller, so
@@ -50,7 +56,9 @@ function resolve_single_match(st::UInferState, @nospecialize(sig))
     result === nothing && return nothing        # >1 methods or failed query
     record_call!(col, sig, result)
     length(result.matches) == 1 || return nothing
-    return result.matches[1]::Core.MethodMatch
+    match = result.matches[1]::Core.MethodMatch
+    match.fully_covers || return nothing
+    return match
 end
 
 # ---------------------------------------------------------------------------
