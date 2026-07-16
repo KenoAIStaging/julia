@@ -21,6 +21,9 @@ fact(n) = n <= 1 ? 1 : n * fact(n - 1)
 compute(x) = begin a = 2 + 3; b = a * x; t = (b, a); t[1] + t[2] end
 double(x) = x + x
 work(n) = begin s = 0; for i in 1:n; s += double(i); end; s end
+# only ever called through the native with_unified_compiler path (a plain
+# call would stock-compile it into the global cache first)
+worknative(n) = begin s = 0; for i in 1:n; s += double(i); end; s end
 
 @testset "converter differential (CodeInfo → UIR → CodeInfo → execute)" begin
     for (f, args, inputs) in [
@@ -166,11 +169,18 @@ end
 end
 
 @testset "activation via CompilerPlugins (ordinary replacement mechanism)" begin
-    @test with_unified_compiler(work, 10) == work(10)
+    # the plugin-scoped mode with the UnifiedIR round-trip shadow
+    @test with_unified_compiler(work, 10; native = false) == work(10)
     s = UnifiedCompiler.shadow_stats()
     @test s.seen > 0
     @test s.errors == 0
     @test s.verified == s.converted
+end
+
+@testset "with_unified_compiler: native pipeline default" begin
+    UnifiedCompiler.reset_pipeline_stats!()
+    @test with_unified_compiler(worknative, 10) == 110
+    @test UnifiedCompiler.pipeline_stats().unified >= 1
 end
 
 # --- inference: InterConditional, SCC caching, LimitedAccuracy, concrete eval

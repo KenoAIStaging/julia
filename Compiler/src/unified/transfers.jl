@@ -1456,7 +1456,7 @@ function infer_method(fr::Frame, match::Core.MethodMatch, args::Vector{Any})::UR
         end
     end
     if length(st.active) >= st.cfg.max_depth ||
-       st.stats.frames - st.budget_mark >= FRAME_BUDGET
+       st.stats.frames - st.budget_mark >= st.cfg.frame_budget
         # resource cutoff: the result is CONTEXT-dependent — callers must not
         # memoize anything computed on top of it (see `tainted` below)
         st.limited += 1

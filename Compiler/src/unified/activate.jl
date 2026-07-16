@@ -163,17 +163,30 @@ function Compiler.transform_result_for_cache(interp::UnifiedInterp,
 end
 
 """
-    with_unified_compiler(f, args...) -> result
+    with_unified_compiler(f, args...; native=true) -> result
 
-Run `f(args...)` compiled by the unified compiler stack, activated through
-the ordinary `CompilerPlugins.typeinf` plugin mechanism (no bootstrap
-change). The whole reachable call graph is compiled in this world; every
-inferred body is round-tripped through the UnifiedIR converters (see
-[`shadow_stats`](@ref)).
+Run `f(args...)` compiled by the unified compiler stack. With
+`native = true` (default) the entry body goes through the REAL pipeline —
+[`unified_typeinf`](@ref) into the global cache, stock per-body fallback —
+and executes via its CodeInstance (callees compile lazily under whatever
+the runtime's inference entry currently is; see [`activate!`](@ref) for
+whole-graph routing). With `native = false` this is the previous
+plugin-scoped mode: stock inference under `CompilerPlugins.typeinf` with
+the UnifiedIR round-trip shadow (see [`shadow_stats`](@ref)).
 """
-with_unified_compiler(f, args...; owner::UnifiedCacheOwner = GLOBAL_OWNER) =
-    with_unified_compiler(f, owner, args...)
+function with_unified_compiler(f, args...; owner::UnifiedCacheOwner = GLOBAL_OWNER,
+                               native::Bool = true)
+    isa(f, Core.Builtin) && return f(args...)
+    native || return with_unified_compiler(f, owner, args...)
+    mi = lookup_method_instance(f, args...)
+    interp = Compiler.NativeInterpreter(Base.tls_world_age())
+    ci = unified_typeinf(interp, mi, Compiler.SOURCE_MODE_ABI)
+    ci === nothing && (ci = Compiler.typeinf_ext_toplevel(interp, mi, Compiler.SOURCE_MODE_ABI))
+    return invoke(f, ci, args...)
+end
 
+# plugin-scoped trampoline (also the callee the shadow's call-graph rewriting
+# inserts): always the CompilerPlugins route
 function with_unified_compiler(f, owner::UnifiedCacheOwner, args...)
     isa(f, Core.Builtin) && return f(args...)
     mi = lookup_method_instance(f, args...)
@@ -186,8 +199,8 @@ shadow_stats() = (; seen = SHADOW.seen, converted = SHADOW.converted,
                   verified = SHADOW.verified, outside_matrix = SHADOW.outside_matrix,
                   errors = SHADOW.errors, last_error = SHADOW.last_error)
 
-# global-activation typeinf entry: the signature the runtime invokes through
-# jl_typeinf_func (mi, world, source_mode, trim_mode)
+# global-activation typeinf entry of the SHADOW mode: the signature the
+# runtime invokes through jl_typeinf_func (mi, world, source_mode, trim_mode)
 function unified_typeinf_ext_toplevel(mi::Core.MethodInstance, world::UInt,
                                       source_mode::UInt8, trim_mode::UInt8)
     # native cache owner: precompiled sysimage results stay hot; only fresh
@@ -197,33 +210,70 @@ function unified_typeinf_ext_toplevel(mi::Core.MethodInstance, world::UInt,
     return Compiler.typeinf_ext_toplevel(interp, mi, source_mode)
 end
 
+# warmup body for the native driver: a loop, a branch, a call — compiles the
+# driver's whole hot path under the current (pre-flip) runtime compiler
+_driver_warmup(n) = begin s = 0; i = 1; while i <= n; s += i > 2 ? i : -i; i += 1; end; s end
+
 """
-    activate!(; shadow=true)
+    activate!(; mode::Symbol = :native)
 
 Route ALL runtime type inference through the unified compiler stack — the
 global form of the ordinary compiler-replacement mechanism
 (`jl_set_typeinf_func`, exactly what hot-loading the Compiler stdlib does).
-Every body inferred from now on round-trips the UnifiedIR converters when
-`shadow` is enabled. Restore with [`deactivate!`](@ref).
+
+- `mode = :native` (default): the REAL pipeline. Installs the driver behind
+  `Compiler.UNIFIED_HOOKS` ([`enable_pipeline!`](@ref)) and points the
+  runtime at the stdlib Compiler's `typeinf_ext_toplevel`, so every
+  inference request tries the unified pipeline first and falls back to
+  stock per body ([`pipeline_stats`](@ref) is the ledger).
+- `mode = :shadow`: the previous differential mode — stock inference through
+  `UnifiedInterp` with the UnifiedIR round-trip shadow
+  ([`shadow_stats`](@ref)).
+
+Restore with [`deactivate!`](@ref).
 """
-function activate!(; shadow::Bool = true)
-    # warm up: compile the whole hook + shadow path under the STOCK compiler
-    # first, so nothing the hook executes needs compiling through the hook
-    SHADOW_ENABLED[] = shadow
-    let mi = lookup_method_instance(+, 1, 2)
-        unified_typeinf_ext_toplevel(mi, Base.get_world_counter(), Compiler.SOURCE_MODE_ABI, 0x00)
-        wf = (x) -> begin s = 0; for i in 1:x; s += try; i > 2 ? i : error(); catch; 0; end; end; s end
-        ci = Base.code_lowered(wf, Tuple{Int})[1]
-        shadow_roundtrip!(ci, 2, :warmup)
+function activate!(; mode::Symbol = :native)
+    if mode === :shadow
+        # warm up: compile the whole hook + shadow path under the STOCK
+        # compiler first, so nothing the hook executes needs compiling
+        # through the hook
+        SHADOW_ENABLED[] = true
+        let mi = lookup_method_instance(+, 1, 2)
+            unified_typeinf_ext_toplevel(mi, Base.get_world_counter(), Compiler.SOURCE_MODE_ABI, 0x00)
+            wf = (x) -> begin s = 0; for i in 1:x; s += try; i > 2 ? i : error(); catch; 0; end; end; s end
+            ci = Base.code_lowered(wf, Tuple{Int})[1]
+            shadow_roundtrip!(ci, 2, :warmup)
+        end
+        GLOBAL_MODE[] = true
+        ccall(:jl_set_typeinf_func, Cvoid, (Any,), unified_typeinf_ext_toplevel)
+        return nothing
+    end
+    mode === :native || error("activate!: unknown mode $mode (supported: :native, :shadow)")
+    SHADOW_ENABLED[] = false
+    # 1. the established stdlib-Compiler codegen activation, hooks OFF:
+    #    bootstrap! precompiles the stock inference/optimizer entries (the
+    #    per-body fallback executor — without this sweep, post-flip requests
+    #    interpret the compiler while compiling it, minutes of churn), then
+    #    activate_codegen! points jl_typeinf_func at the stdlib
+    #    typeinf_ext_toplevel — whose entry consults UNIFIED_HOOKS
+    Compiler.activate!(; reflection = false, codegen = true)
+    # 2. install the driver and warm its own path (its internal compile
+    #    requests reenter the flipped entry, see DRIVER_ACTIVE decline to
+    #    the just-warmed stock path)
+    enable_pipeline!()
+    let interp = Compiler.NativeInterpreter(Base.get_world_counter())
+        unified_typeinf(interp, lookup_method_instance(_driver_warmup, 5),
+                        Compiler.SOURCE_MODE_ABI)
     end
     GLOBAL_MODE[] = true
-    ccall(:jl_set_typeinf_func, Cvoid, (Any,), unified_typeinf_ext_toplevel)
     return nothing
 end
 
-"Restore the stock compiler as the runtime's inference entry."
+"Restore the stock compiler as the runtime's inference entry (and remove
+the driver from the entry-point hooks)."
 function deactivate!()
     GLOBAL_MODE[] = false
+    disable_pipeline!()
     ccall(:jl_set_typeinf_func, Cvoid, (Any,), Core.Compiler.typeinf_ext_toplevel)
     return nothing
 end

@@ -27,7 +27,9 @@ export codeinfo_to_ir, ir_to_codeinfo, UnsupportedIR,
     infer_ir!, UInferConfig, optimize_ir!,
     infer_return, typed_ir, effects_of, InferenceConfig,
     typed_region_ir!,
-    with_unified_compiler, UnifiedCacheOwner, @code_unified
+    with_unified_compiler, UnifiedCacheOwner, @code_unified,
+    unified_typeinf, enable_pipeline!, disable_pipeline!,
+    pipeline_stats, reset_pipeline_stats!
 
 include("codeinfo_entry.jl")
 include("eh_entry.jl")
@@ -44,6 +46,7 @@ include("optimize.jl")
 include("completeness.jl")
 include("queries.jl")
 include("late.jl")
+include("driver.jl")
 include("activate.jl")
 
 end # module Unified

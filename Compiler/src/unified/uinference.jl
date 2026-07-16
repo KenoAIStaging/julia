@@ -21,13 +21,17 @@ struct UInferConfig
     max_loop_iter::Int
     native_fallback::Bool   # delegate callees outside the entry-converter
                             # feature matrix to stock inference (documented seam)
+    frame_budget::Int       # frames per top-level query (cutoffs resolve
+                            # through native_fallback); default = the
+                            # historical FRAME_BUDGET constant
     interp::CC.NativeInterpreter
 end
 function UInferConfig(; world::UInt = Base.get_world_counter(),
                       max_methods::Int = 3, max_depth::Int = 128,
-                      max_loop_iter::Int = 8, native_fallback::Bool = true)
+                      max_loop_iter::Int = 8, native_fallback::Bool = true,
+                      frame_budget::Int = FRAME_BUDGET)
     UInferConfig(world, max_methods, max_depth, max_loop_iter, native_fallback,
-                 CC.NativeInterpreter(world))
+                 frame_budget, CC.NativeInterpreter(world))
 end
 
 mutable struct UInferStats
