@@ -185,11 +185,17 @@ function refine_post_opt(base::Compiler.Effects, post::Compiler.Effects)
 end
 
 "Encode the collector's records as a stock-format CodeInstance edges vector:
-Binding edges, then per-lookup MethodMatchInfo encodings (mi_edge=true, so
-backedges land on MethodInstances — the unified pipeline creates no callee
-CodeInstances), then invoke edges."
-function build_edges(col::UEdges)
+`user_edges` (a staged expansion's generator-declared edges, already in
+stock encoding) first, then binding edges, per-lookup MethodMatchInfo
+encodings (mi_edge=true, so match backedges land on MethodInstances), and
+invoke edges (incl. the devirtualizer's CodeInstance targets)."
+function build_edges(col::UEdges, @nospecialize(user_edges = nothing))
     edges = Any[]
+    if user_edges !== nothing
+        for e in user_edges
+            push!(edges, e)
+        end
+    end
     for b in col.bindings
         push!(edges, b)
     end
@@ -250,7 +256,6 @@ function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInsta
     world = Compiler.get_inference_world(interp)
     def = mi.def
     def isa Method || return Fallback(:toplevel)
-    isdefined(def, :generator) && return Fallback(:generated)
     Compiler.InferenceParams(interp).force_enable_inference && return Fallback(:trim)
     ccall(:jl_get_module_infer, Cint, (Any,), def.module) == 0 &&
         return Fallback(:inference_disabled)
@@ -259,13 +264,27 @@ function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInsta
     col = UEdges(world)
     world <= start_counter || return Fallback(:world_unprovable)
 
+    # Generated functions: `retrieve_code_info` expands the staged body
+    # (jl_code_for_staged) — the expansion's validity window arrives as
+    # `src.min_world/max_world` (clamped below, exactly stock InferenceState's
+    # rule) and any generator-declared edges as `src.edges` (appended raw to
+    # the CodeInstance edges, stock compute_edges!' user_edges rule; the
+    # runtime registers them on the cached uninferred expansion as well).
+    # The generator itself is ordinary user code: any compilation it needs
+    # reenters the driver (bounded recursion) or stock. Its errors surface
+    # as a per-body decline — the stock path reproduces stock's call-time
+    # generator-error semantics.
+    staged = isdefined(def, :generator)
     src0 = try
         Compiler.retrieve_code_info(mi, world)
     catch err
-        return Fallback(:no_source, err)
+        return Fallback(staged ? :staged_source : :no_source, err)
     end
-    src0 isa Core.CodeInfo || return Fallback(:no_source)
+    src0 isa Core.CodeInfo || return Fallback(staged ? :staged_source : :no_source)
     clamp_world!(col, src0.min_world, src0.max_world)
+    user_edges = src0.edges
+    user_edges isa Core.SimpleVector && isempty(user_edges) && (user_edges = nothing)
+    user_edges isa Vector{Any} && isempty(user_edges) && (user_edges = nothing)
 
     local uir
     try
@@ -357,7 +376,7 @@ function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInsta
     (col.valid_worlds.min_world <= world <= col.valid_worlds.max_world) ||
         return Fallback(:world_unprovable)
     edges = try
-        build_edges(col)
+        build_edges(col, user_edges)
     catch err
         return Fallback(:internal_error, err)
     end
