@@ -144,6 +144,13 @@ const DEVIRTUALIZE = Base.RefValue(true)
 # Cross-body memoization with per-result edge replay is the A6 upgrade path.
 const DRIVER_MAX_DEPTH = Base.RefValue(16)
 const DRIVER_FRAME_BUDGET = Base.RefValue(3_000)
+# Reentrant passes (nested driver work: the runtime compiling the driver's
+# own code mid-pass, and devirtualization targets) run with narrower budgets:
+# the same soundness protocol at lower callee-type precision, so the
+# self-hosting burn-in costs a fraction of a root pass. Cutoffs stay sound
+# (return_type oracle + recorded edges); A6's memoization removes the need.
+const DRIVER_REENTRANT_MAX_DEPTH = Base.RefValue(4)
+const DRIVER_REENTRANT_FRAME_BUDGET = Base.RefValue(400)
 
 # ---------------------------------------------------------------------------
 # One pipeline pass over one body
@@ -259,7 +266,9 @@ CodeInfo exit — for effects/exct queries, which need no code. `src` is
 `nothing` in both reduced modes.
 """
 function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInstance;
-                      optimize::Bool = true, emit_code::Bool = true)
+                      optimize::Bool = true, emit_code::Bool = true,
+                      max_depth::Int = DRIVER_MAX_DEPTH[],
+                      frame_budget::Int = DRIVER_FRAME_BUDGET[])
     world = Compiler.get_inference_world(interp)
     def = mi.def
     def isa Method || return Fallback(:toplevel)
@@ -316,8 +325,7 @@ function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInsta
 
     st = UInferState(UInferConfig(; world,
         max_methods = Compiler.InferenceParams(interp).max_methods,
-        max_depth = DRIVER_MAX_DEPTH[],
-        frame_budget = DRIVER_FRAME_BUDGET[]))
+        max_depth, frame_budget))
     st.edges = col
     argl = method_arglattice(def, mi, Any[])
     argl === nothing && return Fallback(:arglattice)
@@ -595,15 +603,20 @@ function _unified_typeinf(interp::Compiler.AbstractInterpreter, mi::Core.MethodI
         end
     end
     local result
+    # nested passes (depth > 1: reentrant driver-code compiles and
+    # devirtualization targets) run with the narrower budgets
+    nested = driver_task_state().depth > 1
+    max_depth = nested ? DRIVER_REENTRANT_MAX_DEPTH[] : DRIVER_MAX_DEPTH[]
+    frame_budget = nested ? DRIVER_REENTRANT_FRAME_BUDGET[] : DRIVER_FRAME_BUDGET[]
     try
-        result = driver_infer(interp, mi)
+        result = driver_infer(interp, mi; max_depth, frame_budget)
         if result isa DriverResult && result.valid_worlds.max_world == result.start_counter &&
            Base.get_world_counter() > result.start_counter
             # the counter moved but no consulted fact was bounded below the
             # pass start: lazy binding/partition materialization (one bump
             # per binding per process). The bindings exist now — one retry
             # settles it.
-            result = driver_infer(interp, mi)
+            result = driver_infer(interp, mi; max_depth, frame_budget)
         end
         if result isa Fallback
             Compiler.engine_reject(interp, ci)
