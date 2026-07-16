@@ -4,12 +4,13 @@
 #   ./usr/bin/julia --startup-file=no Compiler/bench/unified_driver_demo.jl
 #
 # Protocol: the capture-zoo workload (UnifiedIR/demo/capture_zoo.jl's
-# definitions) plus sum/sort/string ops run twice — once compiled by the
-# STOCK compiler (before activation; the expected values), once as fresh
-# methods compiled under `Unified.activate!()` (jl_typeinf_func routed
-# through the unified driver, per-body stock fallback). Every outcome must
-# match; the pipeline ledger (bodies through unified vs fallbacks by
-# reason) prints at the end. Exits nonzero on any mismatch.
+# definitions) plus sum/sort/string ops run compiled by the STOCK compiler
+# (before activation; the expected values), then TWICE as fresh methods
+# compiled under `Unified.activate!()` (jl_typeinf_func routed through the
+# unified driver, per-body stock fallback), with a per-pass ledger. Pass 1
+# includes the driver compiling its own code (reentrant recursion burn-in);
+# by pass 2 that code is cached, so its ledger must be reentrant-quiet.
+# Every outcome must match; exits nonzero on any mismatch.
 
 pushfirst!(LOAD_PATH, joinpath(Sys.BINDIR, Base.DATAROOTDIR, "julia"))
 import Compiler
@@ -132,45 +133,64 @@ expected = Any[outcome(() -> run(StockZoo)) for (_, run) in CASES]
 t0 = time()
 U.activate!()
 println("activate!(:native): ", round(time() - t0; digits = 1), "s")
-U.reset_pipeline_stats!()
 
-# fresh methods, compiled under the flipped runtime
-module UnifiedZoo end
-t0 = time()
-Base.include_string(UnifiedZoo, ZOO, "zoo.jl")
-got = Any[outcome(() -> run(UnifiedZoo)) for (_, run) in CASES]
-println("workload under unified runtime: ", round(time() - t0; digits = 1), "s")
+function print_ledger(stats)
+    total = stats.unified + sum(values(stats.fallbacks); init = 0)
+    println("unified: ", stats.unified, " / ", total, " inference requests")
+    for (reason, n) in sort!(collect(stats.fallbacks); by = last, rev = true)
+        println("  fallback ", rpad(String(reason), 24), " ", n)
+    end
+    if stats.last_error !== nothing
+        reason, mi, err = stats.last_error
+        println("  last error-class fallback: ", reason, " at ", mi)
+        println("    ", sprint(showerror, err)[1:min(end, 200)])
+    end
+end
 
-stats = U.pipeline_stats()
+# fresh methods, compiled under the flipped runtime — twice: pass 1 pays the
+# driver's self-compilation (reentrant recursion), pass 2 must not
+function run_pass(n)
+    U.reset_pipeline_stats!()
+    mod = Module(Symbol(:UnifiedZoo, n))
+    t0 = time()
+    Base.include_string(mod, ZOO, "zoo.jl")
+    got = Any[outcome(() -> run(mod)) for (_, run) in CASES]
+    println("workload pass ", n, " under unified runtime: ",
+            round(time() - t0; digits = 1), "s")
+    return got, U.pipeline_stats()
+end
+got1, stats1 = run_pass(1)
+got2, stats2 = run_pass(2)
 U.deactivate!()
 
-# 3. the differential + the ledger
-println("\n== execution differential (stock-compiled vs unified-compiled) ==")
+# 3. the differential + the per-pass ledgers
 ndiff = 0
-for (i, (label, _)) in enumerate(CASES)
-    ok = isequal(expected[i], got[i])
-    ok || (global ndiff += 1)
-    println(rpad(label, 16), ok ? "MATCH  " : "DIFF   ", repr(got[i]),
-            ok ? "" : "   expected: " * repr(expected[i]))
+for (passno, got) in ((1, got1), (2, got2))
+    println("\n== execution differential, pass ", passno,
+            " (stock-compiled vs unified-compiled) ==")
+    for (i, (label, _)) in enumerate(CASES)
+        ok = isequal(expected[i], got[i])
+        ok || (global ndiff += 1)
+        println(rpad(label, 16), ok ? "MATCH  " : "DIFF   ", repr(got[i]),
+                ok ? "" : "   expected: " * repr(expected[i]))
+    end
 end
 
-println("\n== pipeline ledger (bodies through unified vs fallbacks) ==")
-total = stats.unified + sum(values(stats.fallbacks); init = 0)
-println("unified: ", stats.unified, " / ", total, " inference requests")
-for (reason, n) in sort!(collect(stats.fallbacks); by = last, rev = true)
-    println("  fallback ", rpad(String(reason), 24), " ", n)
-end
-if stats.last_error !== nothing
-    reason, mi, err = stats.last_error
-    println("  last error-class fallback: ", reason, " at ", mi)
-    println("    ", sprint(showerror, err)[1:min(end, 200)])
-end
+println("\n== pipeline ledger, pass 1 (includes driver self-compilation) ==")
+print_ledger(stats1)
+println("\n== pipeline ledger, pass 2 (driver code already compiled) ==")
+print_ledger(stats2)
 
-if ndiff == 0 && stats.unified >= 1
-    println("\nOK: all ", length(CASES), " outcomes match; ",
-            stats.unified, " bodies compiled by the unified pipeline")
+reentrant2 = get(stats2.fallbacks, :reentrant_self, 0) +
+             get(stats2.fallbacks, :reentrant_depth, 0)
+println("\nreentrant declines: pass 2 = ", reentrant2)
+
+if ndiff == 0 && stats1.unified >= 1 && stats2.unified >= 1
+    println("\nOK: all ", length(CASES), " outcomes match on both passes; unified ",
+            stats1.unified, " (pass 1) / ", stats2.unified, " (pass 2)")
     exit(0)
 else
-    println("\nFAIL: ", ndiff, " mismatches (unified bodies: ", stats.unified, ")")
+    println("\nFAIL: ", ndiff, " mismatches (unified pass1=", stats1.unified,
+            " pass2=", stats2.unified, ")")
     exit(1)
 end

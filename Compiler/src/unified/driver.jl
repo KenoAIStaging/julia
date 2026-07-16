@@ -7,13 +7,26 @@
 # is the ratchet). Installed via `enable_pipeline!` (Compiler.UNIFIED_HOOKS);
 # `activate!` additionally flips the runtime's jl_typeinf_func.
 #
-# Concurrency (v0, documented choice): one driver pass at a time. Reentrant
-# requests (the driver's own code compiling through the global hook) and
-# concurrent requests from other tasks decline immediately to stock —
-# `trylock` rather than `lock`, because blocking here while stock inference
-# holds engine reservations on another thread could deadlock. The unified
-# inference state is fresh per pass, so this also keeps every method-table/
-# binding fact a pass consumes inside one collector.
+# Concurrency and reentrancy (A5): every request runs with a FRESH
+# `UInferState`/`UEdges` pair, so there is no shared inference state between
+# passes — each collector sees exactly the facts its own pass consumed. The
+# per-mi serialization is the engine's (`engine_reserve`, whose C side
+# resolves same-thread and cross-thread reservation cycles without
+# deadlocking; a same-thread re-reservation returns a non-owning placeholder
+# CodeInstance and `jl_engine_fulfill` ignores non-reservations). What the
+# driver adds is a small per-TASK discipline:
+#   - an `inflight` set declines requests for a MethodInstance this task is
+#     already driving (`:reentrant_self`) — recursing on the same body can
+#     only redo the same work against the engine placeholder;
+#   - a depth counter bounds nested driver passes (`:reentrant_depth`).
+#     Reentrant requests below the bound — the runtime compiling something
+#     the driver's own execution needs, and the devirtualizer's callee
+#     CodeInstance production — run the unified pipeline recursively; at the
+#     bound they decline precisely and stock compiles the body (cached, so
+#     each such body is compiled at most once per session). The runtime
+#     itself additionally caps `jl_typeinf_func` reentrancy per task (gf.c
+#     reentrant_timing), so runtime-initiated recursion is shallow by
+#     construction; the driver bound mainly governs its own recursion.
 #
 # Soundness protocol (mirrors stock finish!/finish_nocycle):
 #   - the collector starts at WorldRange(1, world_counter) and intersects the
@@ -40,13 +53,19 @@ mutable struct PipelineLedger
     last_error::Any               # (reason, mi, exception) of the last error-class fallback
 end
 const PIPELINE_STATS = PipelineLedger(0, Dict{Symbol,Int}(), nothing)
+# requests run concurrently (no global driver lock): ledger writes take this
+const STATS_LOCK = Base.Threads.SpinLock()
 
 function count_fallback!(reason::Symbol, @nospecialize(mi = nothing), @nospecialize(err = nothing))
-    d = PIPELINE_STATS.fallbacks
-    d[reason] = get(d, reason, 0) + 1
-    err === nothing || (PIPELINE_STATS.last_error = (reason, mi, err))
+    Base.@lock STATS_LOCK begin
+        d = PIPELINE_STATS.fallbacks
+        d[reason] = get(d, reason, 0) + 1
+        err === nothing || (PIPELINE_STATS.last_error = (reason, mi, err))
+    end
     return nothing
 end
+
+note_unified!() = (Base.@lock STATS_LOCK PIPELINE_STATS.unified += 1; nothing)
 
 """
     pipeline_stats() -> NamedTuple
@@ -56,14 +75,16 @@ unified pipeline, `fallbacks` maps fallback reason to count (those bodies
 were handled by the stock compiler), `last_error` retains the most recent
 `(reason, mi, exception)` for error-class fallbacks.
 """
-pipeline_stats() = (; unified = PIPELINE_STATS.unified,
+pipeline_stats() = Base.@lock STATS_LOCK (; unified = PIPELINE_STATS.unified,
                     fallbacks = copy(PIPELINE_STATS.fallbacks),
                     last_error = PIPELINE_STATS.last_error)
 
 function reset_pipeline_stats!()
-    PIPELINE_STATS.unified = 0
-    empty!(PIPELINE_STATS.fallbacks)
-    PIPELINE_STATS.last_error = nothing
+    Base.@lock STATS_LOCK begin
+        PIPELINE_STATS.unified = 0
+        empty!(PIPELINE_STATS.fallbacks)
+        PIPELINE_STATS.last_error = nothing
+    end
     return nothing
 end
 
@@ -79,11 +100,33 @@ function print_pipeline_stats(io::IO = Base.stdout)
 end
 
 # ---------------------------------------------------------------------------
-# Reentrancy / concurrency guard
+# Reentrancy / concurrency guard (see the header comment)
 # ---------------------------------------------------------------------------
 
-const DRIVER_LOCK = Base.ReentrantLock()
-const DRIVER_ACTIVE = Base.RefValue(false)
+"Per-task driver state: nesting depth + the MethodInstances this task is
+currently driving (each holds an engine reservation up-stack)."
+mutable struct DriverTaskState
+    depth::Int
+    const inflight::Base.IdSet{Core.MethodInstance}
+end
+
+const DRIVER_TLS_KEY = :unified_compiler_driver_state
+
+function driver_task_state()::DriverTaskState
+    tls = Base.task_local_storage()
+    v = get(tls, DRIVER_TLS_KEY, nothing)
+    v isa DriverTaskState && return v
+    st = DriverTaskState(0, Base.IdSet{Core.MethodInstance}())
+    tls[DRIVER_TLS_KEY] = st
+    return st
+end
+
+"Nested driver passes this task admits before declining (`:reentrant_depth`).
+Native recursion: each level stacks a full pipeline pass (which itself
+recurses per DRIVER_MAX_DEPTH), so the bound stays small — declined bodies
+are stock-compiled once and cached, and devirtualization targets degrade to
+MethodInstance invokes whose CodeInstances materialize on first call."
+const DRIVER_REENTRY_LIMIT = Base.RefValue(8)
 
 # Per-body inference budgets (v0): the driver re-infers each body's callee
 # tree with a fresh state — the edge collector's soundness requires every
@@ -379,7 +422,7 @@ function finish_unified!(interp::Compiler.AbstractInterpreter, mi::Core.MethodIn
         codegen === nothing || (codegen[ci] = src)
     end
     ccall(:jl_promote_ci_to_current, Cvoid, (Any, UInt), ci, validation_world)
-    PIPELINE_STATS.unified += 1
+    note_unified!()
     return ci
 end
 
@@ -439,21 +482,25 @@ this body falls back (counted in `pipeline_stats()`); the caller —
 """
 function unified_typeinf(interp::Compiler.AbstractInterpreter, mi::Core.MethodInstance,
                          source_mode::UInt8)
-    if DRIVER_ACTIVE[]
-        count_fallback!(:reentrant)
+    dts = driver_task_state()
+    if mi in dts.inflight
+        # this task is already driving this exact body up-stack: recursing
+        # can only redo the same pass against the engine placeholder
+        count_fallback!(:reentrant_self)
         return nothing
     end
-    if !Base.trylock(DRIVER_LOCK)
-        count_fallback!(:concurrent)
+    if dts.depth >= DRIVER_REENTRY_LIMIT[]
+        count_fallback!(:reentrant_depth)
         return nothing
     end
     local ci
+    dts.depth += 1
+    push!(dts.inflight, mi)
     try
-        DRIVER_ACTIVE[] = true
         ci = _unified_typeinf(interp, mi, source_mode)
     finally
-        DRIVER_ACTIVE[] = false
-        Base.unlock(DRIVER_LOCK)
+        dts.depth -= 1
+        delete!(dts.inflight, mi)
     end
     ci isa Core.CodeInstance || return nothing
     # stock typeinf_ext_toplevel's JIT closure (needs no unified state; may
@@ -465,27 +512,25 @@ end
 # Reflection bridges (typeinf_code / _infer_effects / _infer_exception_type)
 # ---------------------------------------------------------------------------
 
-# run `f(...)` under the driver guard, declining (nothing) on reentrance,
-# concurrency, or any escaped unified-path error (the fallback discipline:
-# the hook caller must always be able to continue on stock)
+# run `f(...)` under the driver's per-task depth accounting, declining
+# (nothing) at the reentrancy bound or on any escaped unified-path error
+# (the fallback discipline: the hook caller must always be able to continue
+# on stock). Nested driver work stays bounded and every pass still builds
+# its own fresh state.
 function with_driver_guard(f)
-    if DRIVER_ACTIVE[]
-        count_fallback!(:reentrant)
+    dts = driver_task_state()
+    if dts.depth >= DRIVER_REENTRY_LIMIT[]
+        count_fallback!(:reentrant_depth)
         return nothing
     end
-    if !Base.trylock(DRIVER_LOCK)
-        count_fallback!(:concurrent)
-        return nothing
-    end
+    dts.depth += 1
     try
-        DRIVER_ACTIVE[] = true
         return f()
     catch err
         count_fallback!(:internal_error, nothing, err)
         return nothing
     finally
-        DRIVER_ACTIVE[] = false
-        Base.unlock(DRIVER_LOCK)
+        dts.depth -= 1
     end
 end
 
@@ -506,7 +551,7 @@ function unified_typeinf_code(interp::Compiler.AbstractInterpreter, mi::Core.Met
             count_fallback!(result.reason, mi, result.err)
             return nothing
         end
-        PIPELINE_STATS.unified += 1
+        note_unified!()
         if result.const_flags == 0x03 && Compiler.may_discard_trees(interp)
             return Compiler.codeinfo_for_const(interp, mi, result.valid_worlds,
                                                result.edges, result.rettype_const)
@@ -541,7 +586,7 @@ function unified_infer_effects(interp::Compiler.AbstractInterpreter, @nospeciali
                 count_fallback!(result.reason, nothing, result.err)
                 return nothing
             end
-            PIPELINE_STATS.unified += 1
+            note_unified!()
             effects = Compiler.merge_effects(effects, result.effects)
         end
         return effects
@@ -572,7 +617,7 @@ function unified_infer_exception_type(interp::Compiler.AbstractInterpreter, @nos
                 count_fallback!(result.reason, nothing, result.err)
                 return nothing
             end
-            PIPELINE_STATS.unified += 1
+            note_unified!()
             exct = CC.tmerge(CC.fallback_lattice, exct, result.exct)
         end
         return CC.widenconst(exct)

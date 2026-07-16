@@ -257,9 +257,10 @@ function activate!(; mode::Symbol = :native)
     #    activate_codegen! points jl_typeinf_func at the stdlib
     #    typeinf_ext_toplevel — whose entry consults UNIFIED_HOOKS
     Compiler.activate!(; reflection = false, codegen = true)
-    # 2. install the driver and warm its own path (its internal compile
-    #    requests reenter the flipped entry, see DRIVER_ACTIVE decline to
-    #    the just-warmed stock path)
+    # 2. install the driver and warm its own path under the pre-flip runtime
+    #    (post-flip, requests for the driver's own code reenter the flipped
+    #    entry and run unified recursively up to the per-task depth bound —
+    #    the warmup keeps that first cascade short)
     enable_pipeline!()
     let interp = Compiler.NativeInterpreter(Base.get_world_counter())
         unified_typeinf(interp, lookup_method_instance(_driver_warmup, 5),
