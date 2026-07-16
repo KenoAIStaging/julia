@@ -36,6 +36,79 @@ mutable struct UInferStats
     cycles::Int
 end
 
+"""
+    UEdges
+
+Edge and world-bound collector for cache-grade inference (the driver,
+driver.jl). When attached to a `UInferState`, every fact the inference reads
+from mutable global state — method-table queries, `invoke` target
+resolutions, global-binding reads, staged-source expansions — is recorded
+together with the world range it is valid for; `valid_worlds` is the running
+intersection. The driver encodes the records into the stock CodeInstance
+`edges` format (so `store_backedges`/invalidation work unchanged) and uses
+the intersection as the CodeInstance's world bounds. `ok = false` means some
+consulted fact could not be bounded (or the ranges became disjoint): the
+result is NOT cacheable and the driver must fall back to stock.
+
+Without a collector (`state.edges === nothing`, all pre-driver users), every
+gated site keeps its historical behavior byte-for-byte.
+"""
+mutable struct UEdges
+    world::UInt
+    valid_worlds::CC.WorldRange
+    ok::Bool
+    calls::Vector{Any}                    # (atype, CC.MethodLookupResult) in discovery order
+    callindex::Dict{Any,Int}              # atype -> index into calls (dedup)
+    invokes::Vector{Any}                  # (invokesig, MethodInstance|CodeInstance)
+    bindings::Vector{Core.Binding}        # order-preserving, dedup'd
+    bindingset::Base.IdSet{Core.Binding}
+    globmemo::Dict{Tuple{Module,Symbol},Any}  # partition-read lattice memo (one
+                                              # pass reads each global many times;
+                                              # sound: a partition change bumps the
+                                              # world counter, which the driver's
+                                              # finish protocol detects)
+end
+UEdges(world::UInt) =
+    UEdges(world, CC.WorldRange(UInt(1), Base.get_world_counter()), true,
+           Any[], Dict{Any,Int}(), Any[], Core.Binding[], Base.IdSet{Core.Binding}(),
+           Dict{Tuple{Module,Symbol},Any}())
+
+"Intersect the collector's valid range with `[minw, maxw]`; a disjoint range
+or one that no longer covers the inference world marks the collector unsound."
+function clamp_world!(col::UEdges, minw::UInt, maxw::UInt)
+    lo = max(col.valid_worlds.min_world, minw)
+    hi = min(col.valid_worlds.max_world, maxw)
+    if lo > hi || !(lo <= col.world <= hi)
+        col.ok = false
+        return false
+    end
+    col.valid_worlds = CC.WorldRange(lo, hi)
+    return true
+end
+clamp_world!(col::UEdges, wr) = clamp_world!(col, wr.min_world, wr.max_world)
+
+function record_call!(col::UEdges, @nospecialize(atype), result)
+    clamp_world!(col, result.valid_worlds)
+    if !haskey(col.callindex, atype)
+        push!(col.calls, (atype, result))
+        col.callindex[atype] = length(col.calls)
+    end
+    return nothing
+end
+
+function record_invoke!(col::UEdges, @nospecialize(invokesig), @nospecialize(target))
+    push!(col.invokes, (invokesig, target))
+    return nothing
+end
+
+function record_binding!(col::UEdges, b::Core.Binding)
+    if !(b in col.bindingset)
+        push!(col.bindingset, b)
+        push!(col.bindings, b)
+    end
+    return nothing
+end
+
 mutable struct UInferState
     cfg::UInferConfig
     cache::Dict{Core.MethodInstance,Any}        # mi -> UResult (rettype + effects)
@@ -63,11 +136,13 @@ mutable struct UInferState
     nonconverged::Int                           # non-converged fixpoint exits
     resolutions::Int                            # resolved-cycle epoch (Bottom
                                                 # scratch entries expire on bump)
+    edges::Union{Nothing,UEdges}                # driver-mode edge/world collector
 end
 UInferState(cfg::UInferConfig = UInferConfig()) =
     UInferState(cfg, Dict{Core.MethodInstance,Any}(), Dict{Core.MethodInstance,Int}(),
                 Set{Core.MethodInstance}(), UInferStats(0, 0, 0), Dict{Any,Any}(), 0, 0,
-                Dict{Any,Any}(), Dict{Any,Any}(), Dict{Any,Any}(), typemax(Int), 0, 0, 0, 0)
+                Dict{Any,Any}(), Dict{Any,Any}(), Dict{Any,Any}(), typemax(Int), 0, 0, 0, 0,
+                nothing)
 
 ⊔(st::UInferState, @nospecialize(a), @nospecialize(b)) =
     a === nothing ? b :
@@ -457,6 +532,10 @@ function opl(fr::Frame, o::UnifiedIR.Operand)
         return CC.Const(ir.body.constants[UnifiedIR.payload(o)])
     elseif t == UnifiedIR.TAG_GLOBAL
         g = ir.body.globals[UnifiedIR.payload(o)]
+        col = fr.st.edges
+        # driver mode: partition-based read (world-pinned, binding edge
+        # recorded); otherwise the historical ambient read
+        col === nothing || return global_partition_lattice(col, g.mod, g.name)
         if isconst(g.mod, g.name) && isdefined(g.mod, g.name)
             return CC.Const(getglobal(g.mod, g.name))
         end

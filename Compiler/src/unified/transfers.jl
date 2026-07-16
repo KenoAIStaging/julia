@@ -50,6 +50,42 @@ function builtin_effects_mask(@nospecialize(f), argl::Vector{Any}, @nospecialize
     end
 end
 
+"""The abstract_eval_globalref port for cache-grade inference: resolve the
+binding partition at the collector's world, record the binding edge and the
+partition chain's world bounds, and return the partition-derived lattice
+element (`Const` for defined-const partitions, the declared type for typed
+globals, `Any` for guards/declared). Unlike the ambient `isconst`/`getglobal`
+fold this is sound under redefinition: the recorded worlds and the binding
+backedge bound the answer's validity."""
+function global_partition_lattice(col::UEdges, mod::Module, name::Symbol)
+    key = (mod, name)
+    memo = get(col.globmemo, key, nothing)
+    memo === nothing || return memo
+    local rt
+    try
+        b = convert(Core.Binding, GlobalRef(mod, name))
+        partition = CC.lookup_binding_partition(col.world, b)
+        clamp_world!(col, partition.min_world, partition.max_world)
+        valid_worlds, (leaf_b, leaf_partition) = CC.walk_binding_partition(b, partition, col.world)
+        clamp_world!(col, valid_worlds)
+        record_binding!(col, b)
+        rt = CC.abstract_eval_partition_load(nothing, leaf_b, leaf_partition).rt
+    catch
+        col.ok = false
+        return Any
+    end
+    col.globmemo[key] = rt
+    return rt
+end
+
+"const-and-defined test for a global: partition-based (world-pinned, edge
+recorded) with a collector attached, ambient otherwise."
+function global_is_const_defined(st::UInferState, mod::Module, name::Symbol)
+    col = st.edges
+    col === nothing || return global_partition_lattice(col, mod, name) isa CC.Const
+    return isconst(mod, name) && isdefined(mod, name)
+end
+
 "Effects of evaluating a statement's own operands (non-const global reads)."
 function operand_effects_mask(fr::Frame, s::StmtId)
     ir = fr.ir
@@ -58,7 +94,7 @@ function operand_effects_mask(fr::Frame, s::StmtId)
         o = UnifiedIR.getop(ir, s, i)
         if UnifiedIR.optag(o) == UnifiedIR.TAG_GLOBAL
             g = ir.body.globals[UnifiedIR.payload(o)]
-            (isconst(g.mod, g.name) && isdefined(g.mod, g.name)) ||
+            global_is_const_defined(fr.st, g.mod, g.name) ||
                 (m &= UnifiedIR.FLAG_EFFECT_FREE | UnifiedIR.FLAG_TERMINATES)
         end
     end
@@ -586,6 +622,32 @@ const CONSTPROP_SRC_LIMIT = 250     # const_prop_entry_heuristic analog
 # resolve through native_fallback (or Any when the fallback is off).
 const FRAME_BUDGET = 60_000
 
+"""Method-table query for a call signature: with a collector attached
+(driver mode), the lookup goes through `CC.findall`, which reports the world
+range the answer is valid for — recorded, with the match set, so the driver
+can emit stock-encoded method edges. Without a collector this is the
+historical `_methods_by_ftype` path. Returns a `MethodMatch` vector, or
+`nothing` when the query fails or exceeds `max_methods` (the no-information
+answer, sound at every world without an edge)."""
+function lookup_call_matches(st::UInferState, @nospecialize(sig))
+    col = st.edges
+    if col === nothing
+        return try
+            Base._methods_by_ftype(sig, st.cfg.max_methods, st.cfg.world)
+        catch
+            nothing
+        end
+    end
+    result = try
+        CC.findall(sig, CC.InternalMethodTable(st.cfg.world); limit = st.cfg.max_methods)
+    catch
+        nothing
+    end
+    result === nothing && return nothing
+    record_call!(col, sig, result)
+    return result.matches
+end
+
 function infer_call(fr::Frame, args::Vector{Any})::UResult
     st = fr.st
     ftl = args[1]
@@ -607,6 +669,13 @@ function infer_call(fr::Frame, args::Vector{Any})::UResult
             ml = args[2]; sl = args[3]
             if ml isa CC.Const && ml.val isa Module && sl isa CC.Const && sl.val isa Symbol
                 M = ml.val; nm = sl.val
+                col = st.edges
+                if col !== nothing
+                    # driver mode: partition read, world-clamped + binding edge
+                    rt = global_partition_lattice(col, M, nm)
+                    return UResult(rt, rt isa CC.Const ? EFFECTS_ALL :
+                                   UnifiedIR.FLAG_EFFECT_FREE | UnifiedIR.FLAG_TERMINATES)
+                end
                 if isconst(M, nm) && isdefined(M, nm)
                     return UResult(CC.Const(getglobal(M, nm)), EFFECTS_ALL)
                 end
@@ -660,11 +729,7 @@ function infer_call(fr::Frame, args::Vector{Any})::UResult
     catch
         return UResult(Any, EFFECTS_NONE)
     end
-    matches = try
-        Base._methods_by_ftype(sig, st.cfg.max_methods, st.cfg.world)
-    catch
-        nothing
-    end
+    matches = lookup_call_matches(st, sig)
     matches === nothing && return UResult(Any, EFFECTS_NONE)
     isempty(matches) && return UResult(Union{}, EFFECTS_THROWS)  # guaranteed MethodError
     rt = nothing
@@ -778,8 +843,23 @@ function infer_return_type_call(fr::Frame, args::Vector{Any})
     else
         sig = ttv
     end
+    st = fr.st
+    let col = st.edges
+        if col !== nothing
+            # the folded answer bakes the method set for `sig` into a Const:
+            # record it (world-clamped) so redefinitions invalidate the body
+            result = try
+                CC.findall(sig, CC.InternalMethodTable(st.cfg.world); limit = -1)
+            catch
+                nothing
+            end
+            result === nothing && return nothing   # unboundable: skip the fold
+            record_call!(col, sig, result)
+        end
+    end
     rt = try
-        Core.Compiler.return_type(sig)
+        st.edges === nothing ? Core.Compiler.return_type(sig) :
+                               Core.Compiler.return_type(sig, st.cfg.world)
     catch
         return nothing
     end
@@ -987,15 +1067,29 @@ end
 # invoke (the abstract_invoke port)
 # ---------------------------------------------------------------------------
 
+"Driver-mode record of a result read straight off a CodeInstance: the CI
+edge plus its own world bounds (the stock InvokeCICallInfo shape)."
+function record_ci_read!(st::UInferState, ci::Core.CodeInstance)
+    col = st.edges
+    col === nothing && return nothing
+    clamp_world!(col, ci.min_world, ci.max_world)
+    record_invoke!(col, nothing, ci)
+    return nothing
+end
+
 "K\"invoke\": the first operand is a CONST CodeInstance/MethodInstance."
 function infer_invoke_target(fr::Frame, @nospecialize(tl), args::Vector{Any})::UResult
     target = tl isa CC.Const ? tl.val : CC.singleton_type(tl)
     if target isa Core.CodeInstance
+        record_ci_read!(fr.st, target)
         return UResult(target.rettype,
                        effects_mask(CC.decode_effects(target.ipo_purity_bits)))
     elseif target isa Core.MethodInstance && target.def isa Method
         match = Core.MethodMatch(target.specTypes, target.sparam_vals,
                                  target.def::Method, true)
+        let col = fr.st.edges
+            col === nothing || record_invoke!(col, target.specTypes, target)
+        end
         return try
             infer_method(fr, match, args)
         catch
@@ -1023,6 +1117,7 @@ function infer_invoke(fr::Frame, args::Vector{Any})::UResult
     if types isa CC.Const
         v = types.val
         if v isa Core.CodeInstance
+            record_ci_read!(fr.st, v)
             return UResult(v.rettype,
                            effects_mask(CC.decode_effects(v.ipo_purity_bits)))
         elseif v isa Method
@@ -1050,12 +1145,15 @@ function infer_invoke(fr::Frame, args::Vector{Any})::UResult
     catch
         return UResult(Any, EFFECTS_NONE)
     end
-    matched, _ = try
+    matched, sup_worlds = try
         CC.findsup(lookupsig, CC.InternalMethodTable(fr.st.cfg.world))
     catch
         (nothing, nothing)
     end
     matched === nothing && return UResult(Any, EFFECTS_NONE)
+    let col = fr.st.edges
+        col === nothing || clamp_world!(col, sup_worlds)
+    end
     return widen_intercond(invoke_match(fr, matched.method,
                                         Tuple{ft, nargtype.parameters...},
                                         Tuple{ft, argts...}, callargs))
@@ -1072,6 +1170,10 @@ function invoke_match(fr::Frame, method::Method, @nospecialize(nargtype),
         ti = tienv[1]
         env = tienv[2]::Core.SimpleVector
         match = Core.MethodMatch(ti, env, method, argtype <: method.sig)
+        let col = fr.st.edges
+            # the stock invoke-edge shape: (invokesig, callee MethodInstance)
+            col === nothing || record_invoke!(col, argtype, CC.specialize_method(match))
+        end
         infer_method(fr, match, callargs)
     catch
         return UResult(Any, EFFECTS_NONE)
@@ -1091,14 +1193,21 @@ end
 # Method frames: memoization, const-seeding, generated expansion
 # ---------------------------------------------------------------------------
 
-"Uncompressed or generator-expanded source for a method instance."
-function method_src(m::Method, mi::Core.MethodInstance, world::UInt)
+"Uncompressed or generator-expanded source for a method instance. With a
+collector attached, staged expansions clamp the collector to the expansion's
+world bounds (a generator's output is only valid for the worlds it reports)."
+function method_src(m::Method, mi::Core.MethodInstance, world::UInt,
+                    col::Union{Nothing,UEdges} = nothing)
     if isdefined(m, :generator)
-        return try
+        src = try
             CC.get_staged(mi, world)     # nothing when expansion fails
         catch
             nothing
         end
+        if src !== nothing && col !== nothing
+            clamp_world!(col, src.min_world, src.max_world)
+        end
+        return src
     end
     return try
         Base.uncompressed_ir(m)
@@ -1325,7 +1434,7 @@ function infer_method(fr::Frame, match::Core.MethodMatch, args::Vector{Any})::UR
         st.limited += 1
         return native_result(fr, match)
     end
-    srcci = method_src(m, mi, st.cfg.world)
+    srcci = method_src(m, mi, st.cfg.world, st.edges)
     srcci === nothing && return native_result(fr, match)
     # a frame is tainted when its subtree (a) hit a resource cutoff, or
     # (b) depends on the stale approximation of a frame STILL active above us
@@ -1565,6 +1674,16 @@ function native_rt(fr::Frame, match::Core.MethodMatch)
     fr.st.cfg.native_fallback || return Any
     fr.st.stats.native_fallbacks += 1
     try
+        if fr.st.edges !== nothing
+            # driver mode: the ambient world (jl_typeinf_world under global
+            # activation) may lag the inference world — ask the stock oracle
+            # at the collector's world explicitly. Edges: the caller's match
+            # lookup is already recorded, and the oracle caches its own
+            # CodeInstance chain in the global cache, so invalidation of
+            # anything the answer depends on reaches us through the
+            # match-edge backedge (mi-level invalidation is transitive).
+            return Core.Compiler.return_type(match.spec_types, fr.st.cfg.world)
+        end
         return Core.Compiler.return_type(match.spec_types)
     catch
         return Any

@@ -36,6 +36,23 @@ function resolve_single_match(@nospecialize(sig), world::UInt)
     return matches[1]::Core.MethodMatch
 end
 
+# State-threaded variant: inlining bakes callee bodies into the caller, so
+# in driver mode (edge collector attached) the resolving lookup must be
+# recorded and world-clamped like any inference lookup.
+function resolve_single_match(st::UInferState, @nospecialize(sig))
+    col = st.edges
+    col === nothing && return resolve_single_match(sig, st.cfg.world)
+    result = try
+        CC.findall(sig, CC.InternalMethodTable(st.cfg.world); limit = 1)
+    catch
+        nothing
+    end
+    result === nothing && return nothing        # >1 methods or failed query
+    record_call!(col, sig, result)
+    length(result.matches) == 1 || return nothing
+    return result.matches[1]::Core.MethodMatch
+end
+
 # ---------------------------------------------------------------------------
 # Multi-return normalization (deliverable 2a)
 # ---------------------------------------------------------------------------
@@ -155,7 +172,7 @@ end
 
 # Resolve an inlinable (method, method-instance) for a call/invoke statement,
 # or nothing. Applies the dispatch-level legality checks only.
-function resolve_inline_target(ir::UnifiedIR.IR, s::StmtId, k::UnifiedIR.Kind, world::UInt)
+function resolve_inline_target(ir::UnifiedIR.IR, s::StmtId, k::UnifiedIR.Kind, st::UInferState)
     if k === K"call"
         nop = UnifiedIR.nops(ir, s)
         args = Any[stmt_lattice(ir, UnifiedIR.getop(ir, s, i)) for i in 1:nop]
@@ -165,7 +182,7 @@ function resolve_inline_target(ir::UnifiedIR.IR, s::StmtId, k::UnifiedIR.Kind, w
         argts = Any[CC.widenconst(a) for a in args[2:end]]
         any(t -> t === Union{}, argts) && return nothing
         sig = Tuple{f isa Type ? Type{f} : typeof(f), argts...}
-        match = resolve_single_match(sig, world)
+        match = resolve_single_match(st, sig)
         match === nothing && return nothing
         return (match.method, CC.specialize_method(match))
     else  # K"invoke"
@@ -197,9 +214,12 @@ function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
         k = UnifiedIR.stmt_kind(ir, s)
         (k === K"call" || k === K"invoke") || continue
         UnifiedIR.stmt_flag(ir, s) & UnifiedIR.FLAG_NOINLINE != 0 && continue
-        target = resolve_inline_target(ir, s, k, state.cfg.world)
+        target = resolve_inline_target(ir, s, k, state)
         target === nothing && continue
         m, mi = target
+        # a staged method's runnable body is the generator's EXPANSION;
+        # `uncompressed_ir(m)` below is not it — never inline those
+        isdefined(m, :generator) && continue
         argofs = k === K"invoke" ? 1 : 0
         m.isva && continue
         Int(m.nargs) == UnifiedIR.nops(ir, s) - argofs || continue
@@ -277,7 +297,7 @@ function union_split_calls!(ir::UnifiedIR.IR, state::UInferState;
         argts = Any[CC.widenconst(a) for a in args[2:end]]
         any(t -> t === Union{}, argts) && continue
         # already statically resolvable: plain inlining handles it
-        resolve_single_match(Tuple{ft, argts...}, state.cfg.world) !== nothing && continue
+        resolve_single_match(state, Tuple{ft, argts...}) !== nothing && continue
         # find a splittable argument: SSA (non-cell_get) Union with one
         # applicable method per component
         j = 0
@@ -290,8 +310,8 @@ function union_split_calls!(ir::UnifiedIR.IR, state::UInferState;
             UnifiedIR.stmt_kind(ir, UnifiedIR.asstmt(o)) === K"cell_get" && continue
             cs = Base.uniontypes(t)
             2 <= length(cs) <= params.max_union_split || continue
-            all(c -> resolve_single_match(Tuple{ft, argts[1:i-2]..., c, argts[i:end]...},
-                                          state.cfg.world) !== nothing, cs) || continue
+            all(c -> resolve_single_match(state, Tuple{ft, argts[1:i-2]..., c,
+                                                       argts[i:end]...}) !== nothing, cs) || continue
             j = i
             comps = cs
             break
