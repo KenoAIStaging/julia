@@ -254,6 +254,16 @@ end
     oc = Core.OpaqueClosure(irc)
     glow = UnifiedCompiler.define_ir_method!(B3AIDef, gensym(:p3low), 1, ir)
     glowmin = UnifiedCompiler.define_ir_method!(B3AIMin, gensym(:p3low), 1, ir)
+    # the original asserts `isempty(current_exceptions())` after the handler
+    # paths — the :pop_exception restore. Asserted here as a depth delta so
+    # the check is self-contained: earlier suite tests execute unified-
+    # compiled catch handlers that LEAK the exception stack (exit_lowered's
+    # break/continue emission runs :leave for crossed trys but never
+    # :pop_exception for crossed handler scopes — its return path does both;
+    # runtests.jl's inlined-usetrydiv handler exits its multi-return loop
+    # wrapper via such a break), so the absolute stack is not necessarily
+    # empty when this testset runs. See the B3a port map, finding F7.
+    depth0 = length(Base.current_exceptions())
     for (flag, want) in ((true, :a), (false, :b))
         b3a_setflag!(flag)
         @test UnifiedIR.interpret(ir, nothing) === want
@@ -261,7 +271,7 @@ end
         @test Base.invokelatest(glow) === want         # compiled slot form
         @test Base.invokelatest(glowmin) === want      # AST-interpreted EH
     end
-    @test isempty(Base.current_exceptions())
+    @test length(Base.current_exceptions()) == depth0
     # NOTE (engine contract, documented for Stage D): the typed exit places
     # the initial Upsilon of each handler-crossing cell BEFORE the
     # EnterNode — stock slot2ssa's own convention — but the runtime AST
