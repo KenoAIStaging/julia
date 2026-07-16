@@ -119,18 +119,6 @@ struct DriverResult
     const_flags::UInt8              # stock encoding: 0x2 rettype_const set, 0x3 const ABI
 end
 
-"UnifiedIR frame effect mask -> Compiler.Effects (conservative on every axis
-the unified flags do not model)."
-function effects_from_mask(mask::UInt32)
-    return Compiler.Effects(Compiler.EFFECTS_UNKNOWN;
-        consistent = (mask & UnifiedIR.FLAG_CONSISTENT) != 0 ?
-            Compiler.ALWAYS_TRUE : Compiler.ALWAYS_FALSE,
-        effect_free = (mask & UnifiedIR.FLAG_EFFECT_FREE) != 0 ?
-            Compiler.ALWAYS_TRUE : Compiler.ALWAYS_FALSE,
-        nothrow = (mask & UnifiedIR.FLAG_NOTHROW) != 0,
-        terminates = (mask & UnifiedIR.FLAG_TERMINATES) != 0)
-end
-
 "Encode the collector's records as a stock-format CodeInstance edges vector:
 Binding edges, then per-lookup MethodMatchInfo encodings (mi_edge=true, so
 backedges land on MethodInstances — the unified pipeline creates no callee
@@ -180,16 +168,20 @@ function driver_inlining_cost(interp::Compiler.AbstractInterpreter, mi::Core.Met
 end
 
 """
-    driver_infer(interp, mi; optimize=true) -> Union{DriverResult,Fallback}
+    driver_infer(interp, mi; optimize=true, emit_code=true)
+        -> Union{DriverResult,Fallback}
 
 One unified-pipeline pass over `mi`'s body. Pure with respect to the global
 caches: nothing is cached or reserved here — the callers decide (the cache
 entry wraps this with engine semantics; the reflection bridges use the
-result directly). `optimize = false` stops after inference (effects/exct
-queries; `src` is `nothing` then).
+result directly). `optimize = false` stops after inference; `emit_code =
+false` runs the optimizer (so rt/effects/exct see post-optimization
+refinement, stock's `ipo_dataflow_analysis!` analog) but skips the
+CodeInfo exit — for effects/exct queries, which need no code. `src` is
+`nothing` in both reduced modes.
 """
 function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInstance;
-                      optimize::Bool = true)
+                      optimize::Bool = true, emit_code::Bool = true)
     world = Compiler.get_inference_world(interp)
     def = mi.def
     def isa Method || return Fallback(:toplevel)
@@ -220,6 +212,7 @@ function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInsta
     uir.meta[:method_instance] = mi
     uir.meta[:mi] = mi
     uir.meta[:slotnames] = src0.slotnames
+    uir.meta[:propagate_inbounds] = src0.propagate_inbounds
     uir.sptypes = Any[t for t in mi.sparam_vals]
     uir.meta[:sptypes_lat] = sptypes_lattice(mi)
 
@@ -242,12 +235,16 @@ function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInsta
     end
     rt = sanitize_intercond(def, rt)
     rt isa UInterCond && (rt = Bool)
-    mask = apply_effects_override(def, get(uir.meta, :effects, EFFECTS_NONE)::UInt32)
-    effects = effects_from_mask(mask)
-    exct = Compiler.is_nothrow(effects) ? Union{} : Any
+    # frame effects: `infer_ir!` published the full `Compiler.Effects` (rt-based
+    # adjustments applied; when `optimize` ran, the meta reflects the OPTIMIZED
+    # body — branch folding/DCE refinement, stock's post-opt analysis analog);
+    # the method-level `@assume_effects` override goes on top, stock's order
+    effects = apply_effects_override(def, frame_effects_meta(uir))
+    exct = get(uir.meta, :exct, Any)
+    Compiler.is_nothrow(effects) && (exct = Union{})
 
     src = nothing
-    if optimize
+    if optimize && emit_code
         local ircode
         try
             ircode = ir_to_ircode(uir)
@@ -487,7 +484,9 @@ end
     unified_infer_effects(interp, tt, optimize) -> Union{Nothing,Effects}
 
 The `_infer_effects` bridge (`Base.infer_effects`): per-match driver
-inference merged with stock's MethodError accounting. Declines whole-query
+inference merged with stock's MethodError accounting. `optimize` mirrors
+stock's `typeinf_frame(...; run_optimizer)` semantics — the optimizer runs
+(post-opt effects refinement) but no code is emitted. Declines whole-query
 on any per-match fallback.
 """
 function unified_infer_effects(interp::Compiler.AbstractInterpreter, @nospecialize(tt),
@@ -502,7 +501,7 @@ function unified_infer_effects(interp::Compiler.AbstractInterpreter, @nospeciali
         for match in matches.matches
             match = match::Core.MethodMatch
             result = driver_infer(interp, Compiler.specialize_method(match);
-                                  optimize = false)
+                                  optimize, emit_code = false)
             if result isa Fallback
                 count_fallback!(result.reason, nothing, result.err)
                 return nothing
@@ -517,8 +516,9 @@ end
 """
     unified_infer_exception_type(interp, tt, optimize) -> Union{Nothing,Type}
 
-The `_infer_exception_type` bridge: v0 honesty — `Union{}` for bodies the
-pipeline proves nothrow, `Any` otherwise, plus stock's MethodError account.
+The `_infer_exception_type` bridge: the per-match frame exception-type
+bestguess (the thrown-escape join tracked by inference, `Union{}` for
+proven-nothrow bodies), plus stock's MethodError account.
 """
 function unified_infer_exception_type(interp::Compiler.AbstractInterpreter, @nospecialize(tt),
                                       optimize::Bool)
@@ -532,7 +532,7 @@ function unified_infer_exception_type(interp::Compiler.AbstractInterpreter, @nos
         for match in matches.matches
             match = match::Core.MethodMatch
             result = driver_infer(interp, Compiler.specialize_method(match);
-                                  optimize = false)
+                                  optimize, emit_code = false)
             if result isa Fallback
                 count_fallback!(result.reason, nothing, result.err)
                 return nothing

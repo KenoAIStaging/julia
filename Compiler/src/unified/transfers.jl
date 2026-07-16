@@ -2,30 +2,36 @@
 # inference port. The frame/state walker lives in uinference.jl.
 
 # ---------------------------------------------------------------------------
-# Effects masks (§8.2 vocabulary; composition per §3.3/§5.1 rule 5)
+# Effects (§8.2 vocabulary; composition per §3.3/§5.1 rule 5)
+#
+# The currency is the full stock `Compiler.Effects` (all 9 axes, conditional
+# bits included): per-statement effects merge into the frame accumulator via
+# `CC.merge_effects`, interprocedural results carry them in `UResult`, and
+# frame finish resolves the conditional bits (`finish_frame_effects`). The
+# UInt32 `FLAG_*` column is a *projection* (`effects_mask`) kept for the IR
+# passes (DCE removability, `materialize_consts!`) — stock's IR_FLAG split.
 # ---------------------------------------------------------------------------
-
-const EFFECTS_ALL = UnifiedIR.FLAG_CONSISTENT | UnifiedIR.FLAG_EFFECT_FREE |
-                    UnifiedIR.FLAG_NOTHROW | UnifiedIR.FLAG_TERMINATES
-const EFFECTS_NONE = UInt32(0)
-# a guaranteed-throw op keeps everything except NOTHROW (stock EFFECTS_THROWS)
-const EFFECTS_THROWS = EFFECTS_ALL & ~UnifiedIR.FLAG_NOTHROW
 
 """
     UResult
 
-Interprocedural result: rettype lattice element + effects mask (the four
-`UnifiedIR.FLAG_*` bits of `EFFECTS_ALL`). This is the `st.cache` value.
+Interprocedural result: rettype lattice element + `Compiler.Effects` +
+exception-type bestguess. This is the `st.cache` value.
 """
 struct UResult
     rt::Any
-    effects::UInt32
-    UResult(@nospecialize(rt), effects::UInt32) = new(rt, effects)
+    effects::CC.Effects
+    exct::Any
+    # invariant: nothrow ⟹ exct === Union{}
+    UResult(@nospecialize(rt), effects::CC.Effects, @nospecialize(exct)) =
+        new(rt, effects, effects.nothrow ? Union{} : exct)
 end
+UResult(@nospecialize(rt), effects::CC.Effects) =
+    UResult(rt, effects, effects.nothrow ? Union{} : Any)
 
-"CC.Effects -> UnifiedIR flag mask."
+"CC.Effects -> UnifiedIR flag-column projection (the unconditional bits)."
 function effects_mask(e::CC.Effects)
-    m = EFFECTS_NONE
+    m = UInt32(0)
     CC.is_consistent(e)  && (m |= UnifiedIR.FLAG_CONSISTENT)
     CC.is_effect_free(e) && (m |= UnifiedIR.FLAG_EFFECT_FREE)
     CC.is_nothrow(e)     && (m |= UnifiedIR.FLAG_NOTHROW)
@@ -33,35 +39,54 @@ function effects_mask(e::CC.Effects)
     return m
 end
 
-function builtin_effects_mask(@nospecialize(f), argl::Vector{Any}, @nospecialize(rt))
-    f isa Core.Builtin || return EFFECTS_NONE
+"`CC.builtin_effects`/`CC.intrinsic_effects`, full-width, defensively.
+`rt` must be the LATTICE element (Const-ness drives e.g. apply_type nothrow)."
+function builtin_call_effects(@nospecialize(f), argl::Vector{Any}, @nospecialize(rt))
+    f isa Core.Builtin || return CC.Effects()
     if f isa Core.IntrinsicFunction
         return try
-            effects_mask(CC.intrinsic_effects(f, argl))
+            CC.intrinsic_effects(f, argl)
         catch
-            EFFECTS_NONE
+            CC.Effects()
         end
     end
     return try
-        effects_mask(CC.builtin_effects(CC.fallback_lattice, f, argl,
-                                        CC.widenconst(rt)))
+        CC.builtin_effects(CC.fallback_lattice, f, argl, rt)
     catch
-        EFFECTS_NONE
+        CC.Effects()
+    end
+end
+
+"`CC.builtin_exct`/`CC.intrinsic_exct` for a builtin call, defensively."
+function builtin_call_exct(@nospecialize(f), argl::Vector{Any}, @nospecialize(rt))
+    f isa Core.Builtin || return Any
+    if f isa Core.IntrinsicFunction
+        return try
+            CC.intrinsic_exct(CC.fallback_lattice, f, argl)
+        catch
+            Any
+        end
+    end
+    return try
+        CC.builtin_exct(CC.fallback_lattice, f, argl, rt)
+    catch
+        Any
     end
 end
 
 """The abstract_eval_globalref port for cache-grade inference: resolve the
 binding partition at the collector's world, record the binding edge and the
-partition chain's world bounds, and return the partition-derived lattice
-element (`Const` for defined-const partitions, the declared type for typed
-globals, `Any` for guards/declared). Unlike the ambient `isconst`/`getglobal`
-fold this is sound under redefinition: the recorded worlds and the binding
-backedge bound the answer's validity."""
-function global_partition_lattice(col::UEdges, mod::Module, name::Symbol)
+partition chain's world bounds, and return the partition-derived `RTEffects`
+(`Const` rt for defined-const partitions, the declared type for typed
+globals, `Any` for guards/declared — with stock's partition-load effects and
+exception type). Unlike the ambient `isconst`/`getglobal` fold this is sound
+under redefinition: the recorded worlds and the binding backedge bound the
+answer's validity."""
+function global_partition_rte(col::UEdges, mod::Module, name::Symbol)
     key = (mod, name)
     memo = get(col.globmemo, key, nothing)
-    memo === nothing || return memo
-    local rt
+    memo === nothing || return memo::CC.RTEffects
+    local rte
     try
         b = convert(Core.Binding, GlobalRef(mod, name))
         partition = CC.lookup_binding_partition(col.world, b)
@@ -69,43 +94,66 @@ function global_partition_lattice(col::UEdges, mod::Module, name::Symbol)
         valid_worlds, (leaf_b, leaf_partition) = CC.walk_binding_partition(b, partition, col.world)
         clamp_world!(col, valid_worlds)
         record_binding!(col, b)
-        rt = CC.abstract_eval_partition_load(nothing, leaf_b, leaf_partition).rt
+        rte = CC.abstract_eval_partition_load(nothing, leaf_b, leaf_partition)
     catch
         col.ok = false
-        return Any
+        return CC.RTEffects(Any, Any, CC.Effects())
     end
-    col.globmemo[key] = rt
-    return rt
+    col.globmemo[key] = rte
+    return rte
+end
+
+"""Global-read model (rt + effects + exct): partition-based (world-pinned,
+edge recorded) with a collector attached; the ambient equivalent of stock's
+partition-load shapes otherwise (defined-const → total with mutation-free
+imo; anything else → `generic_getglobal_effects`)."""
+function global_rte(st::UInferState, mod::Module, name::Symbol)
+    col = st.edges
+    col === nothing || return global_partition_rte(col, mod, name)
+    if isconst(mod, name) && isdefined(mod, name)
+        rt = CC.Const(getglobal(mod, name))
+        return CC.RTEffects(rt, Union{}, CC.Effects(CC.EFFECTS_TOTAL;
+            inaccessiblememonly = CC.is_mutation_free_argtype(rt) ?
+                CC.ALWAYS_TRUE : CC.ALWAYS_FALSE))
+    end
+    bt = try
+        Core.get_binding_type(mod, name)
+    catch
+        Any
+    end
+    return CC.RTEffects(bt isa Type ? bt : Any, UndefVarError,
+                        CC.Effects(CC.generic_getglobal_effects;
+                                   effect_free = CC.ALWAYS_TRUE))
 end
 
 "const-and-defined test for a global: partition-based (world-pinned, edge
 recorded) with a collector attached, ambient otherwise."
 function global_is_const_defined(st::UInferState, mod::Module, name::Symbol)
     col = st.edges
-    col === nothing || return global_partition_lattice(col, mod, name) isa CC.Const
+    col === nothing || return global_partition_rte(col, mod, name).rt isa CC.Const
     return isconst(mod, name) && isdefined(mod, name)
 end
 
-"Effects of evaluating a statement's own operands (non-const global reads)."
-function operand_effects_mask(fr::Frame, s::StmtId)
+"""Record statement effects (and its raisable exception type) and fold them
+into the frame accumulators: non-const global reads among the statement's own
+operands merge their partition-load effects first; the flag column gets the
+UInt32 projection; the exception joins the innermost thrown collector."""
+function note_effects!(fr::Frame, s::StmtId, e::CC.Effects, @nospecialize(exct))
     ir = fr.ir
-    m = EFFECTS_ALL
     for i in 1:UnifiedIR.nops(ir, s)
         o = UnifiedIR.getop(ir, s, i)
         if UnifiedIR.optag(o) == UnifiedIR.TAG_GLOBAL
             g = ir.body.globals[UnifiedIR.payload(o)]
-            global_is_const_defined(fr.st, g.mod, g.name) ||
-                (m &= UnifiedIR.FLAG_EFFECT_FREE | UnifiedIR.FLAG_TERMINATES)
+            rte = global_rte(fr.st, g.mod, g.name)
+            e = CC.merge_effects(e, rte.effects)
+            exct = exct === Any ? Any : CC.tmerge(CC.fallback_lattice, exct, rte.exct)
         end
     end
-    return m
-end
-
-"Record statement effects and fold them into the frame accumulator."
-function note_effects!(fr::Frame, s::StmtId, mask::UInt32)
-    mask &= operand_effects_mask(fr, s)
-    fr.stmt_effects[s.id] = mask
-    fr.effects &= mask
+    # a nothrow statement raises nothing; a throwing one raises at least *something*
+    e.nothrow ? (exct = Union{}) : (exct === Union{} && (exct = Any))
+    fr.stmt_effects[s.id] = effects_mask(e)
+    fr.effects = CC.merge_effects(fr.effects, e)
+    exct === Union{} || note_thrown!(fr, exct)
     return nothing
 end
 
@@ -132,8 +180,11 @@ function cond_subject(fr::Frame, o::UnifiedIR.Operand)
 end
 
 function transfer(fr::Frame, s::StmtId, k::UnifiedIR.Kind)
-    rt, eff = _transfer(fr, s, k)
-    note_effects!(fr, s, eff)
+    res = _transfer(fr, s, k)
+    rt = res[1]
+    eff = res[2]::CC.Effects
+    exct = length(res) === 3 ? res[3] : (eff.nothrow ? Union{} : Any)
+    note_effects!(fr, s, eff, exct)
     return rt
 end
 
@@ -161,13 +212,13 @@ function apply_intercond(fr::Frame, s::StmtId, firstargop::Int, r::UResult)
     ir = fr.ir
     opidx = firstargop + rt.slot - 1
     (firstargop <= opidx && opidx <= UnifiedIR.nops(ir, s)) ||
-        return UResult(Bool, r.effects)
+        return UResult(Bool, r.effects, r.exct)
     o = UnifiedIR.getop(ir, s, opidx)
     subj = cond_subject(fr, o)
-    subj === nothing && return UResult(Bool, r.effects)
+    subj === nothing && return UResult(Bool, r.effects, r.exct)
     argt = widenucond(opl(fr, o))
     return UResult(UCond(subj, meet_cond(argt, rt.thentype),
-                         meet_cond(argt, rt.elsetype)), r.effects)
+                         meet_cond(argt, rt.elsetype)), r.effects, r.exct)
 end
 
 """Call-site result refinement for visible closures (§5.7 piece 3): when the
@@ -202,7 +253,7 @@ function closure_callee_transfer(fr::Frame, s::StmtId)
     end
     nargs = UnifiedIR.nops(ir, s) - 1
     if !(isva ? nargs >= np - 1 : nargs == np)
-        return (Union{}, EFFECTS_THROWS)   # arity mismatch: guaranteed throw
+        return (Union{}, CC.EFFECTS_THROWS, Any)   # arity mismatch: guaranteed throw
     end
     if !(cs.id in fr.closure_escaped)
         args = Any[widenucond(opl(fr, UnifiedIR.getop(ir, s, 1 + i))) for i in 1:nargs]
@@ -229,9 +280,42 @@ function closure_callee_transfer(fr::Frame, s::StmtId)
     # convergence (a skipped def implies dead uses); missing entries are
     # unreadable, ⊥/no-guarantees only as a defensive default
     rt = get(fr.closure_rets, cs.id, Union{})
-    eff = get(fr.closure_effs, cs.id, EFFECTS_NONE)
+    eff = get(fr.closure_effs, cs.id, CC.Effects())
     return (rt, eff)
 end
+
+"""The stock NOUB_IF_NOINBOUNDS production rule, at inference over structured
+IR: a boundscheck-taking memory builtin whose boundscheck argument is THIS
+frame's own `K"boundscheck"` executes its bounds check unless that check is
+elided by an `@inbounds` inlining context — so `noub = ALWAYS_FALSE` (from the
+unprovable-inbounds argument type) refines to the conditional bit."""
+function refine_bc_noub(fr::Frame, s::StmtId, e::CC.Effects)
+    e.noub === CC.ALWAYS_FALSE || return e
+    ir = fr.ir
+    n = UnifiedIR.nops(ir, s)
+    n >= 4 || return e
+    is_boundscheck_callee(static_operand_value(ir, UnifiedIR.getop(ir, s, 1))) || return e
+    o = UnifiedIR.getop(ir, s, n)
+    UnifiedIR.optag(o) == UnifiedIR.TAG_STMT || return e
+    UnifiedIR.stmt_kind(ir, UnifiedIR.asstmt(o)) === K"boundscheck" || return e
+    return CC.Effects(e; noub = CC.NOUB_IF_NOINBOUNDS)
+end
+
+"""The stock callsite NOUB_IF_NOINBOUNDS resolution (abstract_eval_basic_
+statement): a callee's conditional noub refers to the callee's own
+`@boundscheck` blocks — when this frame does not propagate inbounds, those
+blocks are never elided through us, so the callee promise is unconditional
+here. (The `IR_FLAG_INBOUNDS` demotion half is inapplicable: the unified
+entry converter drops `@inbounds` markers, i.e. the unified pipeline never
+elides boundschecks — @inbounds is permission, not mandate.)"""
+function callsite_noub(fr::Frame, e::CC.Effects)
+    if e.noub === CC.NOUB_IF_NOINBOUNDS && !fr.propagate_inbounds
+        return CC.Effects(e; noub = CC.ALWAYS_TRUE)
+    end
+    return e
+end
+callsite_noub(fr::Frame, r::UResult) =
+    UResult(r.rt, callsite_noub(fr, r.effects), r.exct)
 
 function _transfer(fr::Frame, s::StmtId, k::UnifiedIR.Kind)
     ir = fr.ir
@@ -239,48 +323,56 @@ function _transfer(fr::Frame, s::StmtId, k::UnifiedIR.Kind)
         cl = closure_callee_transfer(fr, s)
         cl === nothing || return cl
         cond = conditional_call(fr, s)
-        cond === nothing || return (cond, EFFECTS_ALL)
+        cond === nothing || return (cond, CC.EFFECTS_TOTAL)
         args = Any[widenucond(a) for a in opls(fr, s, 1)]
         r = infer_call(fr, args)
         r = apply_intercond(fr, s, 1, r)
         get(ENV, "UIR_DEBUG", "") == "1" && println("DBG call %", s.id, " args=", args, " -> ", r.rt)
         maybe_typeassert_refine!(fr, s, args, r.rt)
-        return (r.rt, r.effects)
+        return (r.rt, refine_bc_noub(fr, s, r.effects), r.exct)
     elseif k === K"invoke"
         tl = opl(fr, UnifiedIR.getop(ir, s, 1))
         args = Any[widenucond(a) for a in opls(fr, s, 2)]
         r = infer_invoke_target(fr, tl, args)
         r = apply_intercond(fr, s, 2, r)
-        return (r.rt, r.effects)
+        return (r.rt, r.effects, r.exct)
     elseif k === K"intrinsic"
+        cond = conditional_call(fr, s)   # not_int Conditional inversion
+        cond === nothing || return (cond, CC.EFFECTS_TOTAL)
         args = opls(fr, s, 1)
         f = CC.singleton_type(args[1])
         f === nothing && args[1] isa CC.Const && (f = (args[1]::CC.Const).val)
-        f === nothing && return (Any, EFFECTS_NONE)
+        f === nothing && return (Any, CC.Effects())
         argl = Any[widenucond(a) for a in args[2:end]]
         rt = try
             CC.builtin_tfunction(fr.st.cfg.interp, f, argl, nothing)
         catch
             Any
         end
-        return (rt, builtin_effects_mask(f, argl, rt))
+        eff = builtin_call_effects(f, argl, rt)
+        return (rt, eff, eff.nothrow ? Union{} : builtin_call_exct(f, argl, rt))
     elseif k === K"extract"
         vl = widenucond(opl(fr, UnifiedIR.getop(ir, s, 1)))
         idx = Int(UnifiedIR.imm_value(UnifiedIR.getop(ir, s, 2))::Int64)
         argl = Any[vl, CC.Const(idx)]
         rt = CC.builtin_tfunction(fr.st.cfg.interp, Core.getfield, argl, nothing)
-        return (rt, builtin_effects_mask(Core.getfield, argl, rt))
+        eff = builtin_call_effects(Core.getfield, argl, rt)
+        return (rt, eff, eff.nothrow ? Union{} :
+                builtin_call_exct(Core.getfield, argl, rt))
     elseif k === K"select"
         c = opl(fr, UnifiedIR.getop(ir, s, 1))
         a = opl(fr, UnifiedIR.getop(ir, s, 2))
         b = opl(fr, UnifiedIR.getop(ir, s, 3))
-        c isa CC.Const && c.val === true && return (a, EFFECTS_ALL)
-        c isa CC.Const && c.val === false && return (b, EFFECTS_ALL)
-        return (CC.tmerge(CC.fallback_lattice, widenucond(a), widenucond(b)), EFFECTS_ALL)
+        cw = CC.widenconst(widenucond(c))
+        eff = (cw isa Type && cw <: Bool) ? CC.EFFECTS_TOTAL :
+              CC.Effects(CC.EFFECTS_TOTAL; nothrow = false)   # TypeError on non-Bool
+        c isa CC.Const && c.val === true && return (a, eff, TypeError)
+        c isa CC.Const && c.val === false && return (b, eff, TypeError)
+        return (CC.tmerge(CC.fallback_lattice, widenucond(a), widenucond(b)), eff, TypeError)
     elseif k === K"refine" || k === K"value"
-        return (opl(fr, UnifiedIR.getop(ir, s, 1)), EFFECTS_ALL)
+        return (opl(fr, UnifiedIR.getop(ir, s, 1)), CC.EFFECTS_TOTAL)
     elseif k === K"globalref"
-        return (opl(fr, UnifiedIR.getop(ir, s, 1)), EFFECTS_ALL)  # operand mask covers it
+        return (opl(fr, UnifiedIR.getop(ir, s, 1)), CC.EFFECTS_TOTAL)  # operand effects cover it
     elseif k === K"new"
         return transfer_new(fr, s)
     elseif k === K"splatnew"
@@ -291,10 +383,10 @@ function _transfer(fr::Frame, s::StmtId, k::UnifiedIR.Kind)
             if m1 isa CC.Const && m1.val === FOREIGNGLOBAL_MARKER
                 # Expr(:foreignglobal, name): the cglobal lowering (stock's
                 # abstract_eval_foreignglobal — always Ptr{Cvoid})
-                return (Ptr{Cvoid}, EFFECTS_NONE)
+                return (Ptr{Cvoid}, CC.EFFECTS_UNKNOWN)
             end
         end
-        UnifiedIR.nops(ir, s) >= 2 || return (Any, EFFECTS_NONE)
+        UnifiedIR.nops(ir, s) >= 2 || return (Any, CC.EFFECTS_UNKNOWN)
         rtl = opl(fr, UnifiedIR.getop(ir, s, 2))
         T = rtl isa CC.Const ? rtl.val : nothing
         mi = get(ir.meta, :mi, nothing)
@@ -306,31 +398,36 @@ function _transfer(fr::Frame, s::StmtId, k::UnifiedIR.Kind)
             catch
                 nothing
             end
-            rt === nothing || return (rt, EFFECTS_NONE)
+            rt === nothing || return (rt, CC.EFFECTS_UNKNOWN)
         end
-        return (foreigncall_rt(T), EFFECTS_NONE)
+        return (foreigncall_rt(T), CC.EFFECTS_UNKNOWN)
     elseif k === K"isdefined_global"
-        # a binding can become defined later: not consistent
-        return (Bool, UnifiedIR.FLAG_EFFECT_FREE | UnifiedIR.FLAG_NOTHROW |
-                      UnifiedIR.FLAG_TERMINATES)
+        # a binding can become defined later: not consistent; reads the
+        # binding table: not inaccessiblememonly
+        return (Bool, CC.Effects(CC.EFFECTS_TOTAL; consistent = CC.ALWAYS_FALSE,
+                                 inaccessiblememonly = CC.ALWAYS_FALSE))
     elseif k === K"cell_isdefined"
-        return (Bool, EFFECTS_ALL)
+        return (Bool, CC.EFFECTS_TOTAL)
     elseif k === K"boundscheck"
-        # value depends on the inlining context: not consistent
-        return (Bool, UnifiedIR.FLAG_EFFECT_FREE | UnifiedIR.FLAG_NOTHROW |
-                      UnifiedIR.FLAG_TERMINATES)
+        # value depends on the inlining context: not consistent — unless its
+        # every use is the boundscheck argument of a memory builtin, where the
+        # value cannot reach the frame's result (the noub machinery models
+        # that dependence instead; stock's post-opt boundscheck rule)
+        s.id in fr.bc_guarded && return (Bool, CC.EFFECTS_TOTAL)
+        return (Bool, CC.Effects(CC.EFFECTS_TOTAL; consistent = CC.ALWAYS_FALSE))
     elseif k === K"cell" || k === K"cell_shared"
-        return (Any, EFFECTS_ALL)      # the cell token
+        return (Any, CC.EFFECTS_TOTAL)      # the cell token
     elseif k === K"cell_get"
         cellid = UnifiedIR.asstmt(UnifiedIR.getop(ir, s, 1)).id
-        eff = cellid in fr.newed_cells ? EFFECTS_ALL & ~UnifiedIR.FLAG_NOTHROW :
-              EFFECTS_ALL              # maybe-undef read can throw UndefVarError
+        # maybe-undef read can throw UndefVarError
+        eff = cellid in fr.newed_cells ?
+              CC.Effects(CC.EFFECTS_TOTAL; nothrow = false) : CC.EFFECTS_TOTAL
         # escape/world discipline (§5.7): reads of a poisoned shared cell
         # (some capturing closure escapes or is world-shifted, or the cell
         # itself escapes as a value) are Any — the join is still accumulated
         # for diagnostics, but never used for refinement
-        cellid in fr.poisoned_cells && return (Any, eff)
-        return (cell_lattice(fr, cellid), eff)
+        cellid in fr.poisoned_cells && return (Any, eff, UndefVarError)
+        return (cell_lattice(fr, cellid), eff, UndefVarError)
     elseif k === K"cell_set"
         cellop = UnifiedIR.asstmt(UnifiedIR.getop(ir, s, 1))
         cellid = cellop.id
@@ -357,30 +454,38 @@ function _transfer(fr::Frame, s::StmtId, k::UnifiedIR.Kind)
         # on reassignment. Shared cells are excluded (closures may write).
         shared = UnifiedIR.stmt_kind(ir, cellop) === K"cell_shared"
         shared || (fr.pending_refine = (:cell, cellid) => vl)
-        # writes to closure-shared cells are observable mutations
-        eff = shared ? UnifiedIR.FLAG_NOTHROW | UnifiedIR.FLAG_TERMINATES : EFFECTS_ALL
+        # writes to closure-shared cells are observable mutations (the
+        # materialized closure's untyped field): setfield!-shaped effects
+        eff = shared ? CC.Effects(CC.EFFECTS_TOTAL; consistent = CC.ALWAYS_FALSE,
+                                  effect_free = CC.EFFECT_FREE_IF_INACCESSIBLEMEMONLY,
+                                  inaccessiblememonly = CC.ALWAYS_FALSE) :
+                       CC.EFFECTS_TOTAL
         return (nothing, eff)
     elseif k === K"cell_new"
-        return (nothing, EFFECTS_ALL)
+        return (nothing, CC.EFFECTS_TOTAL)
     elseif k === K"throw_undef_if_not"
         condl = opl(fr, UnifiedIR.getop(ir, s, 1))
-        condl isa CC.Const && condl.val === true && return (nothing, EFFECTS_ALL)
+        condl isa CC.Const && condl.val === true && return (nothing, CC.EFFECTS_TOTAL)
         # guaranteed throw poisons the tail (walker's dead-tail rule)
-        condl isa CC.Const && condl.val === false && return (Union{}, EFFECTS_THROWS)
-        return (nothing, EFFECTS_THROWS)
-    elseif k === K"gc_preserve_end" || k === K"latestworld" || k === K"coverage_effect"
+        condl isa CC.Const && condl.val === false &&
+            return (Union{}, CC.EFFECTS_THROWS, UndefVarError)
+        return (nothing, CC.EFFECTS_THROWS, UndefVarError)
+    elseif k === K"latestworld" || k === K"coverage_effect"
         # not independently removable, but no observable effect of their own
-        return (nothing, UnifiedIR.FLAG_NOTHROW | UnifiedIR.FLAG_TERMINATES)
+        return (nothing, CC.Effects(CC.EFFECTS_TOTAL; consistent = CC.ALWAYS_FALSE,
+                                    effect_free = CC.EFFECT_FREE_GLOBALLY,
+                                    inaccessiblememonly = CC.ALWAYS_FALSE))
+    elseif k === K"gc_preserve_end"
+        return (nothing, CC.Effects(CC.EFFECTS_TOTAL; effect_free = CC.EFFECT_FREE_GLOBALLY))
     elseif k === K"gc_preserve_begin"
-        return (Any, UnifiedIR.FLAG_NOTHROW | UnifiedIR.FLAG_TERMINATES)
+        return (Any, CC.Effects(CC.EFFECTS_TOTAL; effect_free = CC.EFFECT_FREE_GLOBALLY))
     elseif k === K"copyast"
         # fresh mutable copy each evaluation: not consistent
-        return (Any, UnifiedIR.FLAG_EFFECT_FREE | UnifiedIR.FLAG_NOTHROW |
-                     UnifiedIR.FLAG_TERMINATES)
+        return (Any, CC.Effects(CC.EFFECTS_TOTAL; consistent = CC.ALWAYS_FALSE))
     elseif k === K"method_def" || k === K"cfunction" || k === K"new_opaque_closure"
-        return (Any, EFFECTS_NONE)
+        return (Any, CC.EFFECTS_UNKNOWN)
     else
-        return (Any, EFFECTS_NONE)     # unknown/external kind: opacity contract §8.2
+        return (Any, CC.EFFECTS_UNKNOWN)   # unknown/external kind: opacity contract §8.2
     end
 end
 
@@ -472,7 +577,9 @@ function conditional_call(fr::Frame, s::StmtId)
             return UCond(subj, thent, elset)
         end
         return rt
-    elseif f === (!) && n == 2
+    elseif (f === (!) || f === Core.Intrinsics.not_int) && n == 2
+        # stock's Conditional inversion for `!`/`not_int` (loop lowerings
+        # negate the `=== nothing` exit test through not_int)
         cl = opl(fr, UnifiedIR.getop(ir, s, 2))
         cl isa UCond && return UCond(cl.subject, cl.elsetype, cl.thentype)
         return nothing
@@ -490,6 +597,23 @@ end
 # new / splatnew (the abstract_eval_new port)
 # ---------------------------------------------------------------------------
 
+"The stock `:new` consistency model (abstract_eval_new): any (pointer-carrying)
+uninitialized field → never consistent; mutable → CONSISTENT_IF_NOTRETURNED
+(frame finish may resolve it against the return type); immutable → consistent."
+function new_consistency(ut::DataType, fcount::Union{Nothing,Int}, nargs::Int)
+    has_any_uninitialized = fcount === nothing || (fcount > nargs &&
+        Base.any(i -> CC.is_field_pointerfree(ut, i), (nargs + 1):fcount))
+    if has_any_uninitialized
+        return CC.ALWAYS_FALSE
+    elseif ismutabletype(ut)
+        return CC.CONSISTENT_IF_NOTRETURNED
+    else
+        return CC.ALWAYS_TRUE
+    end
+end
+
+const NEW_EXCT = Union{ErrorException,TypeError}
+
 function transfer_new(fr::Frame, s::StmtId)
     ir = fr.ir
     lat = CC.fallback_lattice
@@ -498,19 +622,19 @@ function transfer_new(fr::Frame, s::StmtId)
     try
         rt, isexact = CC.instanceof_tfunc(tl, true)
     catch
-        return (Any, EFFECTS_NONE)
+        return (Any, CC.EFFECTS_UNKNOWN, NEW_EXCT)
     end
-    rt === Union{} && return (Union{}, EFFECTS_THROWS)
+    rt === Union{} && return (Union{}, CC.EFFECTS_THROWS, NEW_EXCT)
     nargs = UnifiedIR.nops(ir, s) - 1
     ut = Base.unwrap_unionall(rt)
-    (ut isa DataType && !isabstracttype(ut)) || return (rt isa Type ? rt : Any, EFFECTS_NONE)
+    (ut isa DataType && !isabstracttype(ut)) ||
+        return (rt isa Type ? rt : Any, CC.EFFECTS_UNKNOWN, NEW_EXCT)
     try
         ismut = ismutabletype(ut)
         fcount = CC.datatype_fieldcount(ut)
-        (fcount === nothing || nargs > fcount) && return (rt, EFFECTS_NONE)
-        # allocation with any undefined field is never consistent; mutable
-        # allocation is not consistent (skip the NOTRETURNED refinement)
-        consistent = fcount == nargs && !ismut
+        consistent = new_consistency(ut, fcount, nargs)
+        (fcount === nothing || nargs > fcount) &&
+            return (rt, CC.Effects(CC.EFFECTS_UNKNOWN; consistent), NEW_EXCT)
         nothrow = CC.isconcretedispatch(rt)
         ats = Vector{Any}(undef, nargs)
         anyrefine = false
@@ -520,7 +644,7 @@ function transfer_new(fr::Frame, s::StmtId)
             ft = fieldtype(rt, i)
             nothrow && (nothrow = CC.:⊑(lat, at, ft))
             at = CC.tmeet(lat, at, ft)
-            at === Union{} && return (Union{}, EFFECTS_THROWS)   # guaranteed TypeError
+            at === Union{} && return (Union{}, CC.EFFECTS_THROWS, TypeError)   # guaranteed TypeError
             if ismut && !isconst(rt, i)
                 ats[i] = ft            # field may be mutated later
                 allconst = false
@@ -533,10 +657,8 @@ function transfer_new(fr::Frame, s::StmtId)
             end
             ats[i] = at
         end
-        mask = UnifiedIR.FLAG_EFFECT_FREE | UnifiedIR.FLAG_TERMINATES
-        consistent && (mask |= UnifiedIR.FLAG_CONSISTENT)
-        nothrow && (mask |= UnifiedIR.FLAG_NOTHROW)
-        if allconst && fcount == nargs && consistent
+        eff = CC.Effects(CC.EFFECTS_TOTAL; consistent, nothrow)
+        if allconst && fcount == nargs && consistent === CC.ALWAYS_TRUE
             argvals = Vector{Any}(undef, nargs)
             for j in 1:nargs
                 argvals[j] = (ats[j]::CC.Const).val
@@ -547,7 +669,7 @@ function transfer_new(fr::Frame, s::StmtId)
             catch
                 nothing
             end
-            v === nothing || return (v, mask)
+            v === nothing || return (v, eff, NEW_EXCT)
         end
         if anyrefine || nargs > CC.datatype_min_ninitialized(rt)
             undefs = Union{Nothing,Bool}[false for _ in 1:nargs]
@@ -560,11 +682,11 @@ function transfer_new(fr::Frame, s::StmtId)
                            false : nothing))
                 end
             end
-            return (CC.PartialStruct(lat, rt, undefs, ats), mask)
+            return (CC.PartialStruct(lat, rt, undefs, ats), eff, NEW_EXCT)
         end
-        return (rt, mask)
+        return (rt, eff, NEW_EXCT)
     catch
-        return (rt isa Type ? rt : Any, EFFECTS_NONE)
+        return (rt isa Type ? rt : Any, CC.EFFECTS_UNKNOWN, NEW_EXCT)
     end
 end
 
@@ -576,9 +698,9 @@ function transfer_splatnew(fr::Frame, s::StmtId)
     try
         rt, isexact = CC.instanceof_tfunc(tl, true)
     catch
-        return (Any, EFFECTS_NONE)
+        return (Any, CC.EFFECTS_UNKNOWN, NEW_EXCT)
     end
-    rt === Union{} && return (Union{}, EFFECTS_THROWS)
+    rt === Union{} && return (Union{}, CC.EFFECTS_THROWS, NEW_EXCT)
     res = rt isa Type ? rt : Any
     try
         nothrow = false
@@ -597,15 +719,17 @@ function transfer_splatnew(fr::Frame, s::StmtId)
                                        Any[f for f in at.fields])
             end
         end
-        mask = UnifiedIR.FLAG_EFFECT_FREE | UnifiedIR.FLAG_TERMINATES
+        local consistent::UInt8
         u = Base.unwrap_unionall(rt)
-        if u isa DataType && !ismutabletype(u)
-            mask |= UnifiedIR.FLAG_CONSISTENT   # immutable allocation is consistent
+        if u isa DataType && !isabstracttype(u)
+            consistent = new_consistency(u, CC.datatype_fieldcount(u),
+                                         typemax(Int) #= all fields supplied =#)
+        else
+            consistent = CC.ALWAYS_FALSE
         end
-        nothrow && (mask |= UnifiedIR.FLAG_NOTHROW)
-        return (res, mask)
+        return (res, CC.Effects(CC.EFFECTS_TOTAL; consistent, nothrow), NEW_EXCT)
     catch
-        return (res, EFFECTS_NONE)
+        return (res, CC.EFFECTS_UNKNOWN, NEW_EXCT)
     end
 end
 
@@ -622,30 +746,23 @@ const CONSTPROP_SRC_LIMIT = 250     # const_prop_entry_heuristic analog
 # resolve through native_fallback (or Any when the fallback is off).
 const FRAME_BUDGET = 60_000
 
-"""Method-table query for a call signature: with a collector attached
-(driver mode), the lookup goes through `CC.findall`, which reports the world
-range the answer is valid for — recorded, with the match set, so the driver
-can emit stock-encoded method edges. Without a collector this is the
-historical `_methods_by_ftype` path. Returns a `MethodMatch` vector, or
-`nothing` when the query fails or exceeds `max_methods` (the no-information
-answer, sound at every world without an edge)."""
+"""Method-table query for a call signature through `CC.findall` (which
+reports the world range the answer is valid for and whether the match set is
+ambiguous). With a collector attached (driver mode) the result is recorded so
+the driver can emit stock-encoded method edges. Returns the
+`MethodLookupResult`, or `nothing` when the query fails or exceeds
+`max_methods` (the no-information answer, sound at every world without an
+edge)."""
 function lookup_call_matches(st::UInferState, @nospecialize(sig))
-    col = st.edges
-    if col === nothing
-        return try
-            Base._methods_by_ftype(sig, st.cfg.max_methods, st.cfg.world)
-        catch
-            nothing
-        end
-    end
     result = try
         CC.findall(sig, CC.InternalMethodTable(st.cfg.world); limit = st.cfg.max_methods)
     catch
         nothing
     end
     result === nothing && return nothing
-    record_call!(col, sig, result)
-    return result.matches
+    col = st.edges
+    col === nothing || record_call!(col, sig, result)
+    return result
 end
 
 function infer_call(fr::Frame, args::Vector{Any})::UResult
@@ -660,32 +777,20 @@ function infer_call(fr::Frame, args::Vector{Any})::UResult
             return infer_apply(fr, args)
         elseif f === Core.invoke
             return infer_invoke(fr, args)
-        elseif f === Core.throw || f === Core.throw_methoderror
-            return UResult(Union{}, EFFECTS_THROWS)
+        elseif f === Core.throw
+            # the raised value is the exception: its type is the exct
+            exct = length(args) == 2 ? CC.widenconst(widenucond(args[2])) : Any
+            return UResult(Union{}, CC.EFFECTS_THROWS, exct)
+        elseif f === Core.throw_methoderror
+            return UResult(Union{}, CC.EFFECTS_THROWS, MethodError)
         end
         # module-global reads: builtin_tfunction(sv=nothing) cannot consult
         # bindings; fold here (the abstract_eval_globalref port)
         if (f === getglobal || f === getfield) && 3 <= length(args) <= 5
             ml = args[2]; sl = args[3]
             if ml isa CC.Const && ml.val isa Module && sl isa CC.Const && sl.val isa Symbol
-                M = ml.val; nm = sl.val
-                col = st.edges
-                if col !== nothing
-                    # driver mode: partition read, world-clamped + binding edge
-                    rt = global_partition_lattice(col, M, nm)
-                    return UResult(rt, rt isa CC.Const ? EFFECTS_ALL :
-                                   UnifiedIR.FLAG_EFFECT_FREE | UnifiedIR.FLAG_TERMINATES)
-                end
-                if isconst(M, nm) && isdefined(M, nm)
-                    return UResult(CC.Const(getglobal(M, nm)), EFFECTS_ALL)
-                end
-                bt = try
-                    Core.get_binding_type(M, nm)
-                catch
-                    Any
-                end
-                return UResult(bt isa Type ? bt : Any,
-                               UnifiedIR.FLAG_EFFECT_FREE | UnifiedIR.FLAG_TERMINATES)
+                rte = global_rte(st, ml.val, sl.val)
+                return UResult(rte.rt, rte.effects, rte.exct)
             end
         end
         argl = args[2:end]
@@ -694,13 +799,16 @@ function infer_call(fr::Frame, args::Vector{Any})::UResult
         catch
             Any
         end
-        return UResult(rt, builtin_effects_mask(f, argl, rt))
+        eff = builtin_call_effects(f, argl, rt)
+        return UResult(rt, eff, eff.nothrow ? Union{} : builtin_call_exct(f, argl, rt))
     end
     if f !== nothing && is_return_type_f(f)
         r = infer_return_type_call(fr, args)
         r === nothing || return r
-        # stock's UNKNOWN: never descend into return_type's reflection body
-        return UResult(Type, EFFECTS_NONE)
+        # stock's model: never descend into return_type's reflection body;
+        # `nortcall=false` keeps callers out of concrete evaluation (a fold
+        # there would re-enter inference — the RT_CALL_EFFECTS rule)
+        return UResult(Type, CC.Effects(CC.EFFECTS_THROWS; nortcall = false))
     end
     # union splitting (the abstract_call_gf_by_type port): small unions in
     # argument position dispatch per element and join — `<(::Union{Int32,
@@ -710,39 +818,46 @@ function infer_call(fr::Frame, args::Vector{Any})::UResult
     end
     # type callees (constructors) dispatch through Type{T}, not DataType
     ft = f === nothing ? CC.widenconst(ftl) : (f isa Type ? Type{f} : typeof(f))
-    ft === Any && return UResult(Any, EFFECTS_NONE)
-    ft === Union{} && return UResult(Union{}, EFFECTS_THROWS)
+    ft === Any && return UResult(Any, CC.Effects())
+    ft === Union{} && return UResult(Union{}, CC.EFFECTS_THROWS)
     argts = Vector{Any}(undef, length(args) - 1)
     for i in 2:length(args)
         a = args[i]
         if CC.isvarargtype(a)
-            i == length(args) || return UResult(Any, EFFECTS_NONE)  # malformed
+            i == length(args) || return UResult(Any, CC.Effects())  # malformed
             argts[i - 1] = a
         else
             t = CC.widenconst(a)
-            t === Union{} && return UResult(Union{}, EFFECTS_THROWS)  # unreachable call
+            t === Union{} && return UResult(Union{}, CC.EFFECTS_THROWS)  # unreachable call
             argts[i - 1] = t
         end
     end
     sig = try
         Tuple{ft, argts...}
     catch
-        return UResult(Any, EFFECTS_NONE)
+        return UResult(Any, CC.Effects())
     end
-    matches = lookup_call_matches(st, sig)
-    matches === nothing && return UResult(Any, EFFECTS_NONE)
-    isempty(matches) && return UResult(Union{}, EFFECTS_THROWS)  # guaranteed MethodError
+    result = lookup_call_matches(st, sig)
+    result === nothing && return UResult(Any, CC.Effects())
+    matches = result.matches
+    isempty(matches) && return UResult(Union{}, CC.EFFECTS_THROWS, MethodError)
     rt = nothing
-    fx = EFFECTS_ALL
+    fx = CC.EFFECTS_TOTAL
+    exct = Union{}
     fully = true
     for match in matches
         r = infer_method(fr, match::Core.MethodMatch, args)
         rt = ⊔(st, rt, r.rt)
-        fx &= r.effects
+        fx = CC.merge_effects(fx, callsite_noub(fr, r.effects))
+        exct = exct === Any ? Any : CC.tmerge(CC.fallback_lattice, exct, r.exct)
         fully &= (match::Core.MethodMatch).fully_covers
     end
-    fully || (fx &= ~UnifiedIR.FLAG_NOTHROW)    # possible MethodError remains
-    return UResult(rt === nothing ? Union{} : rt, fx)
+    if !fully || result.ambig
+        # a MethodError with a non-covered or ambiguous signature remains
+        fx = CC.Effects(fx; nothrow = false)
+        exct = exct === Any ? Any : CC.tmerge(CC.fallback_lattice, exct, MethodError)
+    end
+    return UResult(rt === nothing ? Union{} : rt, fx, exct)
 end
 
 """Split top-level Union argument types (bounded by max_union_splitting
@@ -762,17 +877,19 @@ function maybe_union_split(fr::Frame, args::Vector{Any})
     total > CC.InferenceParams().max_union_splitting && return nothing
     st = fr.st
     rt = nothing
-    fx = EFFECTS_ALL
+    fx = CC.EFFECTS_TOTAL
+    exct = Union{}
     for elt in CC.uniontypes(args[splitat])
         sub = copy(args)
         sub[splitat] = elt
         r = infer_call(fr, sub)   # recurses to split any further union args
-        fx &= r.effects
+        fx = CC.merge_effects(fx, r.effects)
+        exct = exct === Any ? Any : CC.tmerge(CC.fallback_lattice, exct, r.exct)
         r.rt === Union{} && continue   # per-element guaranteed throw
         rt = ⊔(st, rt, r.rt)
     end
-    rt === nothing && return UResult(Union{}, EFFECTS_THROWS)
-    return UResult(rt, fx)
+    rt === nothing && return UResult(Union{}, CC.Effects(fx; nothrow = false), exct)
+    return UResult(rt, fx, exct)
 end
 
 # ---------------------------------------------------------------------------
@@ -863,7 +980,11 @@ function infer_return_type_call(fr::Frame, args::Vector{Any})
     catch
         return nothing
     end
-    return UResult(CC.Const(rt), EFFECTS_ALL)
+    # `nortcall = false`: a `return_type` call must never become concrete-eval
+    # eligible in its callers (that would re-enter inference at runtime); the
+    # fold itself already happened, so everything else is total (stock's
+    # RT_CALL_EFFECTS)
+    return UResult(CC.Const(rt), CC.Effects(CC.EFFECTS_TOTAL; nortcall = false), Union{})
 end
 
 # ---------------------------------------------------------------------------
@@ -1017,9 +1138,9 @@ end
 
 "Core._apply_iterate(iterate, f, iters...): flatten precisely when possible."
 function infer_apply(fr::Frame, args::Vector{Any})::UResult
-    length(args) >= 3 || return UResult(Any, EFFECTS_NONE)
+    length(args) >= 3 || return UResult(Any, CC.Effects())
     fl = args[3]
-    fl === Union{} && return UResult(Union{}, EFFECTS_THROWS)
+    fl === Union{} && return UResult(Union{}, CC.EFFECTS_THROWS)
     flat = Any[fl]
     exact = true
     precise = true
@@ -1058,9 +1179,9 @@ function infer_apply(fr::Frame, args::Vector{Any})::UResult
     end
     r = infer_call(fr, flat)
     # flattened positions do not map to caller operands: widen InterConditionals
-    r.rt isa UInterCond && (r = UResult(Bool, r.effects))
+    r.rt isa UInterCond && (r = UResult(Bool, r.effects, r.exct))
     # non-tuple containers run user iterate methods with unknown effects
-    return exact ? r : UResult(r.rt, EFFECTS_NONE)
+    return exact ? r : UResult(r.rt, CC.Effects())
 end
 
 # ---------------------------------------------------------------------------
@@ -1077,13 +1198,17 @@ function record_ci_read!(st::UInferState, ci::Core.CodeInstance)
     return nothing
 end
 
+"Full-width effects off a CodeInstance's stock-encoded ipo purity bits."
+ci_result(ci::Core.CodeInstance) =
+    UResult(ci.rettype, CC.decode_effects(ci.ipo_purity_bits),
+            isdefined(ci, :exctype) ? ci.exctype : Any)
+
 "K\"invoke\": the first operand is a CONST CodeInstance/MethodInstance."
 function infer_invoke_target(fr::Frame, @nospecialize(tl), args::Vector{Any})::UResult
     target = tl isa CC.Const ? tl.val : CC.singleton_type(tl)
     if target isa Core.CodeInstance
         record_ci_read!(fr.st, target)
-        return UResult(target.rettype,
-                       effects_mask(CC.decode_effects(target.ipo_purity_bits)))
+        return callsite_noub(fr, ci_result(target))
     elseif target isa Core.MethodInstance && target.def isa Method
         match = Core.MethodMatch(target.specTypes, target.sparam_vals,
                                  target.def::Method, true)
@@ -1091,25 +1216,25 @@ function infer_invoke_target(fr::Frame, @nospecialize(tl), args::Vector{Any})::U
             col === nothing || record_invoke!(col, target.specTypes, target)
         end
         return try
-            infer_method(fr, match, args)
+            callsite_noub(fr, infer_method(fr, match, args))
         catch
-            UResult(Any, EFFECTS_NONE)
+            UResult(Any, CC.Effects())
         end
     end
-    isempty(args) && return UResult(Any, EFFECTS_NONE)
+    isempty(args) && return UResult(Any, CC.Effects())
     return infer_call(fr, args)
 end
 
-widen_intercond(r::UResult) = r.rt isa UInterCond ? UResult(Bool, r.effects) : r
+widen_intercond(r::UResult) = r.rt isa UInterCond ? UResult(Bool, r.effects, r.exct) : r
 
 "`Core.invoke(f, types_or_method_or_ci, args...)` as a call (argument
 positions shift under the builtin: InterConditionals widen)."
 function infer_invoke(fr::Frame, args::Vector{Any})::UResult
-    length(args) >= 3 || return UResult(Union{}, EFFECTS_THROWS)
-    any(a -> CC.isvarargtype(a), args) && return UResult(Any, EFFECTS_NONE)
+    length(args) >= 3 || return UResult(Union{}, CC.EFFECTS_THROWS)
+    any(a -> CC.isvarargtype(a), args) && return UResult(Any, CC.Effects())
     ftl = args[2]
     ft = CC.widenconst(ftl)
-    ft === Union{} && return UResult(Union{}, EFFECTS_THROWS)
+    ft === Union{} && return UResult(Union{}, CC.EFFECTS_THROWS)
     types = args[3]
     callargs = Any[ftl]
     append!(callargs, args[4:end])
@@ -1118,8 +1243,7 @@ function infer_invoke(fr::Frame, args::Vector{Any})::UResult
         v = types.val
         if v isa Core.CodeInstance
             record_ci_read!(fr.st, v)
-            return UResult(v.rettype,
-                           effects_mask(CC.decode_effects(v.ipo_purity_bits)))
+            return callsite_noub(fr, ci_result(v))
         elseif v isa Method
             argtype = Tuple{ft, argts...}
             return widen_intercond(invoke_match(fr, v, argtype, argtype, callargs))
@@ -1130,27 +1254,27 @@ function infer_invoke(fr::Frame, args::Vector{Any})::UResult
     catch
         (Any, false)
     end
-    isexact || return UResult(Any, EFFECTS_NONE)
-    T === Union{} && return UResult(Union{}, EFFECTS_THROWS)
+    isexact || return UResult(Any, CC.Effects())
+    T === Union{} && return UResult(Union{}, CC.EFFECTS_THROWS)
     unwrapped = Base.unwrap_unionall(T)
     (unwrapped isa DataType && unwrapped.name === Tuple.name) ||
-        return UResult(Union{}, EFFECTS_THROWS)          # TypeError
-    Base.isdispatchelem(ft) || return UResult(Any, EFFECTS_NONE)
+        return UResult(Union{}, CC.EFFECTS_THROWS, TypeError)   # TypeError
+    Base.isdispatchelem(ft) || return UResult(Any, CC.Effects())
     argtype0 = Tuple{argts...}
     nargtype = typeintersect(T, argtype0)
-    nargtype === Union{} && return UResult(Union{}, EFFECTS_THROWS)
-    nargtype isa DataType || return UResult(Any, EFFECTS_NONE)
+    nargtype === Union{} && return UResult(Union{}, CC.EFFECTS_THROWS, TypeError)
+    nargtype isa DataType || return UResult(Any, CC.Effects())
     lookupsig = try
         Base.rewrap_unionall(Tuple{ft, unwrapped.parameters...}, T)
     catch
-        return UResult(Any, EFFECTS_NONE)
+        return UResult(Any, CC.Effects())
     end
     matched, sup_worlds = try
         CC.findsup(lookupsig, CC.InternalMethodTable(fr.st.cfg.world))
     catch
         (nothing, nothing)
     end
-    matched === nothing && return UResult(Any, EFFECTS_NONE)
+    matched === nothing && return UResult(Any, CC.Effects())
     let col = fr.st.edges
         col === nothing || clamp_world!(col, sup_worlds)
     end
@@ -1164,7 +1288,7 @@ function invoke_match(fr::Frame, method::Method, @nospecialize(nargtype),
     local nt
     r = try
         nt = typeintersect(nargtype, method.sig)
-        nt === Union{} && return UResult(Union{}, EFFECTS_THROWS)
+        nt === Union{} && return UResult(Union{}, CC.EFFECTS_THROWS, TypeError)
         tienv = ccall(:jl_type_intersection_with_env, Any, (Any, Any),
                       nt, method.sig)::Core.SimpleVector
         ti = tienv[1]
@@ -1174,19 +1298,19 @@ function invoke_match(fr::Frame, method::Method, @nospecialize(nargtype),
             # the stock invoke-edge shape: (invokesig, callee MethodInstance)
             col === nothing || record_invoke!(col, argtype, CC.specialize_method(match))
         end
-        infer_method(fr, match, callargs)
+        callsite_noub(fr, infer_method(fr, match, callargs))
     catch
-        return UResult(Any, EFFECTS_NONE)
+        return UResult(Any, CC.Effects())
     end
     # the runtime checks args against `types`: not provably passing → may throw
-    fx = r.effects
     passes = try
         argtype <: nt
     catch
         false
     end
-    passes || (fx &= ~UnifiedIR.FLAG_NOTHROW)
-    return UResult(r.rt, fx)
+    passes && return r
+    exct = r.exct === Any ? Any : CC.tmerge(CC.fallback_lattice, r.exct, TypeError)
+    return UResult(r.rt, CC.Effects(r.effects; nothrow = false), exct)
 end
 
 # ---------------------------------------------------------------------------
@@ -1222,6 +1346,7 @@ function convert_src(srcci::Core.CodeInfo, m::Method, mi::Core.MethodInstance)
         ir.sptypes = Any[t for t in mi.sparam_vals]
         ir.meta[:sptypes_lat] = sptypes_lattice(mi)
         ir.meta[:mi] = mi     # sp_type_rewrap context for foreigncall rts
+        ir.meta[:propagate_inbounds] = srcci.propagate_inbounds
         return ir
     catch e
         e isa UnsupportedIR || rethrow()
@@ -1249,21 +1374,25 @@ sanitize_intercond(m::Method, @nospecialize(rt)) =
     (rt isa UInterCond &&
      (m.isva ? rt.slot >= Int(m.nargs) : rt.slot > Int(m.nargs))) ? Bool : rt
 
-"""Apply a method's declared `@assume_effects` overrides (the stock
-`adjust_effects` port): `Base.@_total_meta`-style annotations must upgrade the
-inferred mask — e.g. `==(::Type, ::Type)` is a total-declared foreigncall,
-and concrete evaluation keys off the resulting EFFECTS_ALL."""
-function apply_effects_override(m::Method, fx::UInt32)
-    ovr = try
+"A method's `@assume_effects` bits (all-false when undecodable)."
+function effect_override(m::Method)
+    return try
         CC.decode_effects_override(m.purity)
     catch
-        return fx
+        Base.EffectsOverride()
     end
-    ovr.consistent && (fx |= UnifiedIR.FLAG_CONSISTENT)
-    ovr.effect_free && (fx |= UnifiedIR.FLAG_EFFECT_FREE)
-    ovr.nothrow && (fx |= UnifiedIR.FLAG_NOTHROW)
-    ovr.terminates_globally && (fx |= UnifiedIR.FLAG_TERMINATES)
-    return fx
+end
+
+"""Apply a method's declared `@assume_effects` overrides — the stock
+`adjust_effects(effects, def::Method)`, all 11 bits: e.g. `==(::Type, ::Type)`
+is a total-declared foreigncall, and concrete evaluation keys off the
+resulting effects."""
+function apply_effects_override(m::Method, fx::CC.Effects)
+    return try
+        CC.adjust_effects(fx, m)
+    catch
+        fx
+    end
 end
 
 """Key-encode one argument lattice element for the const memo, or nothing
@@ -1319,10 +1448,18 @@ egal_stable(@nospecialize(v)) =
                                  Core.MethodInstance, Core.CodeInstance}
 
 """The concrete_eval_call port: when every argument is an egal-stable Const
-and the callee's own (widened, context-free) inferred effects are total
-(CONSISTENT|EFFECT_FREE|NOTHROW|TERMINATES), evaluate the call for real and
+and the callee's own (widened, context-free) inferred effects satisfy stock's
+`_concrete_eval_eligible` criteria — `is_foldable(effects, check_rtcall=true)`,
+plus nothrow under `--check-bounds=no` — evaluate the call for real and
 return Const of the result — both a precision and a speed lever (the abstract
-const frame never runs). Returns nothing when ineligible."""
+const frame never runs). `nothrow` is NOT required in general: a foldable
+callee that throws proves the call sites' rt is Bottom (stock's
+ConcreteResult semantics). Returns nothing when ineligible.
+
+Overlay accounting: the unified pipeline only ever consults the internal
+method table (`lookup_call_matches`/`findsup` — no overlay tables), which is
+stock's `is_nonoverlayed(interp)` fast-path condition, so the per-effects
+nonoverlayed/consistent_overlay checks are not required here."""
 function concrete_eval(fr::Frame, match::Core.MethodMatch, args::Vector{Any},
                        @nospecialize(ck))
     st = fr.st
@@ -1338,16 +1475,27 @@ function concrete_eval(fr::Frame, match::Core.MethodMatch, args::Vector{Any},
         argvals[i - 1] = v
     end
     # the callee's effects come from its widened frame (memoized; computed
-    # once per mi). EFFECTS_ALL implies a clean, converged, cutoff-free frame:
-    # stale reads and resource cutoffs always pessimize the mask.
+    # once per mi). Foldable implies a clean, converged, cutoff-free frame:
+    # stale reads and resource cutoffs always pessimize the effects.
     wr = infer_method(fr, match, Any[])
-    wr.effects == EFFECTS_ALL || return nothing
-    v = try
-        Core._call_in_world_total(st.cfg.world, f, argvals...)
-    catch
-        return nothing      # effects promised nothrow; be defensive anyway
+    CC.is_foldable(wr.effects, #=check_rtcall=#true) || return nothing
+    if CC.inbounds_option() === :off && !CC.is_nothrow(wr.effects)
+        # under --check-bounds=no the callee may be compiled without the
+        # bounds checks its :consistent-cy assumed: require nothrow
+        return nothing
     end
-    r = UResult(CC.Const(v), EFFECTS_ALL)
+    local v
+    try
+        v = Core._call_in_world_total(st.cfg.world, f, argvals...)
+    catch
+        # the evaluation threw: by :consistent-cy this happens at runtime too.
+        # Stock keeps the ABSTRACT result's exception type here (:consistent-cy
+        # does not mandate the exception type, so the concrete throw only
+        # proves rt = Bottom — which the abstract const frame derives anyway):
+        # decline, and let the const-seeded frame run.
+        return nothing
+    end
+    r = UResult(CC.Const(v), CC.EFFECTS_TOTAL, Union{})
     ck === nothing || (st.constcache[ck] = r)
     return r
 end
@@ -1383,9 +1531,10 @@ function scc_update!(st::UInferState, escalate::Bool)
         old = old::UResult
         merged = umerge(old.rt, r.rt)
         escalate && (merged = CC.widenconst(widenucond(merged)))
-        fx = old.effects & r.effects
-        if !ulat_eq(merged, old.rt) || fx != old.effects
-            st.scc_prev[k] = UResult(merged, fx)
+        fx = CC.merge_effects(old.effects, r.effects)
+        exct = old.exct === Any ? Any : CC.tmerge(CC.fallback_lattice, old.exct, r.exct)
+        if !ulat_eq(merged, old.rt) || fx != old.effects || !lat_eq(exct, old.exct)
+            st.scc_prev[k] = UResult(merged, fx, exct)
             changed = true
         end
     end
@@ -1403,11 +1552,25 @@ function infer_method(fr::Frame, match::Core.MethodMatch, args::Vector{Any})::UR
         # the target are cycle-tainted until the target completes
         st.stale_depth = min(st.stale_depth, st.active[mi])
         st.stale_events += 1
-        # cycle: current rt approximation; effects pessimized (recursion may
-        # not terminate, and the stale mask would be unsound to trust)
+        # cycle: the target's current (optimistic, descending) approximation
+        # with `terminates` tainted — landing here IS genuine MethodInstance
+        # recursion, exactly stock's `is_edge_recursed` criterion (abstract
+        # recursion over shrinking signatures creates distinct mi's and never
+        # hits the active stack, #48983). The taint is suppressed when the
+        # caller frame or the callee method declares :terminates_globally
+        # (stock's MethodCallResult override order); the SCC joint fixpoint
+        # makes the stale effects consistent at convergence.
         r = get(st.cache, mi, nothing)
-        return r === nothing ? UResult(Union{}, EFFECTS_NONE) :
-                               UResult((r::UResult).rt, EFFECTS_NONE)
+        base = r === nothing ? UResult(Union{}, CC.EFFECTS_TOTAL, Union{}) : r::UResult
+        eff = base.effects
+        if fr.override.terminates_globally
+            eff = CC.Effects(eff; terminates = true)
+        elseif effect_override(m).terminates_globally
+            eff = CC.Effects(eff; terminates = true)
+        else
+            eff = CC.Effects(eff; terminates = false)
+        end
+        return UResult(base.rt, eff, base.exct)
     end
     # const-seeded frames (interprocedural constant propagation) use their own
     # memo cache keyed by the const-extended signature. Vararg methods qualify
@@ -1519,8 +1682,9 @@ function infer_method(fr::Frame, match::Core.MethodMatch, args::Vector{Any})::UR
             src_ir === nothing && return native_result(fr, match)
             delete!(st.cycle_hit, mi)
             rt_const = sanitize_intercond(m, infer_ir!(src_ir, copy(argl); state = st))
-            rc = UResult(rt_const, apply_effects_override(m,
-                get(src_ir.meta, :effects, EFFECTS_NONE)::UInt32))
+            rc = UResult(rt_const,
+                         apply_effects_override(m, frame_effects_meta(src_ir)),
+                         get(src_ir.meta, :exct, Any))
             hit_cycle = mi in st.cycle_hit
         finally
             delete!(st.active, mi)
@@ -1560,7 +1724,7 @@ function infer_method(fr::Frame, match::Core.MethodMatch, args::Vector{Any})::UR
     # joint Gauss-Seidel iteration ascends instead of restarting at ⊥ — a ⊥
     # restart both loses the self-edge contribution and can never converge)
     prevapprox = get(st.scc_prev, mi, nothing)
-    st.cache[mi] = prevapprox === nothing ? UResult(Union{}, EFFECTS_ALL) :
+    st.cache[mi] = prevapprox === nothing ? UResult(Union{}, CC.EFFECTS_TOTAL, Union{}) :
                                             prevapprox::UResult
     ok = false
     converged = false
@@ -1585,13 +1749,15 @@ function infer_method(fr::Frame, match::Core.MethodMatch, args::Vector{Any})::UR
                 break
             end
             rt = sanitize_intercond(m, infer_ir!(src_ir, copy(argl); state = st))
-            fx = apply_effects_override(m,
-                get(src_ir.meta, :effects, EFFECTS_NONE)::UInt32)
+            fx = apply_effects_override(m, frame_effects_meta(src_ir))
+            exct = get(src_ir.meta, :exct, Any)
             old = st.cache[mi]::UResult
             widened = umerge(old.rt, rt)
             it >= 6 && (widened = CC.widenconst(widenucond(widened)))  # ascent escalation
-            fx &= old.effects                                # monotone descent
-            st.cache[mi] = UResult(widened, fx)
+            fx = CC.merge_effects(old.effects, fx)           # monotone descent
+            exct = old.exct === Any ? Any :
+                   CC.tmerge(CC.fallback_lattice, old.exct, exct)
+            st.cache[mi] = UResult(widened, fx, exct)
             if !(mi in st.cycle_hit)
                 converged = true
                 break
@@ -1605,7 +1771,8 @@ function infer_method(fr::Frame, match::Core.MethodMatch, args::Vector{Any})::UR
                 break
             end
             # outermost root: joint convergence over the whole SCC
-            changed = !ulat_eq(widened, old.rt) || fx != old.effects
+            changed = !ulat_eq(widened, old.rt) || fx != old.effects ||
+                      !lat_eq(exct, old.exct)
             changed |= scc_update!(st, it >= 6)
             if !changed
                 converged = true
@@ -1617,7 +1784,7 @@ function infer_method(fr::Frame, match::Core.MethodMatch, args::Vector{Any})::UR
             # (recursive reads returned the Union{} seed, whose dead-tail kills
             # then suppressed every real path). A self-supporting Bottom cannot
             # be trusted: settle at the sound over-approximation.
-            st.cache[mi] = UResult(Any, EFFECTS_NONE)
+            st.cache[mi] = UResult(Any, CC.Effects(), Any)
             converged = true
         end
         ok = true
@@ -1695,8 +1862,14 @@ function method_arglattice(m::Method, mi::Core.MethodInstance, args::Vector{Any}
     return argl
 end
 
+"Frame-effects meta published by `infer_ir!` (all-false when missing)."
+function frame_effects_meta(ir::UnifiedIR.IR)
+    e = get(ir.meta, :effects, nothing)
+    return e isa CC.Effects ? e : CC.Effects()
+end
+
 native_result(fr::Frame, match::Core.MethodMatch) =
-    UResult(native_rt(fr, match), EFFECTS_NONE)
+    UResult(native_rt(fr, match), CC.Effects(), Any)
 
 function native_rt(fr::Frame, match::Core.MethodMatch)
     fr.st.cfg.native_fallback || return Any

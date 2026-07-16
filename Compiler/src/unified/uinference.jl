@@ -219,8 +219,14 @@ mutable struct Frame
     break_vals::Dict{Int32,Any}       # loop body region -> joined result lattice
     reached::Set{Int32}               # blocks reached via cross-island gotos (§5.5)
     refinements::Vector{RefMap}       # active Conditional refinement scopes
-    effects::UInt32                   # frame effects accumulator (§5.1 rule 5)
-    stmt_effects::Vector{UInt32}      # per-stmt effect masks (sentinel = untouched)
+    effects::CC.Effects               # frame ipo-effects accumulator (§5.1 rule 5,
+                                      # merged via CC.merge_effects — the full stock currency)
+    stmt_effects::Vector{UInt32}      # per-stmt effect masks (sentinel = untouched;
+                                      # the 4 FLAG_* bits, the IR-pass/DCE channel)
+    thrown::Vector{Any}               # exception-type collectors: [1] is the frame's
+                                      # escape join; try bodies push/pop scopes so
+                                      # caught exceptions type handler args instead
+    override::Base.EffectsOverride    # the frame method's @assume_effects bits
     newed_cells::Set{Int32}           # cells with a cell_new (maybe-undef reads)
     pending_refine::Any               # (subject => lattice) from a typeassert, or nothing
     # §5.7 descent state (the late pipeline): monotone per-closure maps driven
@@ -228,10 +234,16 @@ mutable struct Frame
     # escalator as `celltypes` — one fixpoint, no second lattice
     closure_args::Dict{Int32,Vector{Any}} # closure stmt -> param joins over visible calls
     closure_rets::Dict{Int32,Any}         # closure stmt -> body return-type join
-    closure_effs::Dict{Int32,UInt32}      # closure stmt -> body effects mask
+    closure_effs::Dict{Int32,CC.Effects}  # closure stmt -> body effects
     closure_escaped::Set{Int32}           # closures with a use besides call-callee
     closure_shifted::Set{Int32}           # closures with a world barrier before a call
     poisoned_cells::Set{Int32}            # shared cells whose reads must stay Any
+    bc_guarded::Set{Int32}                # boundscheck stmts whose every use is the
+                                          # boundscheck argument of a memory builtin
+                                          # (their value cannot reach the result:
+                                          # no frame consistency taint — the stock
+                                          # post-opt boundscheck rule, at inference)
+    propagate_inbounds::Bool              # src.propagate_inbounds (meta)
 end
 
 """May the `latestworld` statement `L` execute after the creation of closure
@@ -256,13 +268,36 @@ function world_hazard(ir::UnifiedIR.IR, L::StmtId, C::StmtId)
     return UnifiedIR.comes_before(ir, C, L) && UnifiedIR._may_reach(ir, C, L)
 end
 
+"The frame method's `@assume_effects` override bits (all-false when unknown)."
+function frame_override(ir::UnifiedIR.IR)
+    mi = get(ir.meta, :mi, nothing)
+    if mi isa Core.MethodInstance && mi.def isa Method
+        return try
+            CC.decode_effects_override((mi.def::Method).purity)
+        catch
+            Base.EffectsOverride()
+        end
+    end
+    return Base.EffectsOverride()
+end
+
+"Builtins that take a trailing boundscheck argument (`getfield_boundscheck`/
+`memoryop_noub` subjects)."
+function is_boundscheck_callee(@nospecialize(f))
+    return f === Core.getfield || f === Core.memoryrefnew || f === Core.memoryrefget ||
+           f === Core.memoryrefset! || f === Core.memoryrefunset! ||
+           f === Core.memoryref_isassigned
+end
+
 "Frame constructor with empty analysis state (transfers.jl defines the masks)."
 function Frame(ir::UnifiedIR.IR, st::UInferState, env::Vector{Any})
     fr = Frame(ir, st, env, Dict{Int32,Any}(), false, nothing, Dict{Int32,Any}(),
-               Dict{Int32,Any}(), Set{Int32}(), RefMap[], ~UInt32(0),
-               fill(~UInt32(0), length(env)), Set{Int32}(), nothing,
-               Dict{Int32,Vector{Any}}(), Dict{Int32,Any}(), Dict{Int32,UInt32}(),
-               Set{Int32}(), Set{Int32}(), Set{Int32}())
+               Dict{Int32,Any}(), Set{Int32}(), RefMap[], CC.EFFECTS_TOTAL,
+               fill(~UInt32(0), length(env)), Any[Union{}], frame_override(ir),
+               Set{Int32}(), nothing,
+               Dict{Int32,Vector{Any}}(), Dict{Int32,Any}(), Dict{Int32,CC.Effects}(),
+               Set{Int32}(), Set{Int32}(), Set{Int32}(), Set{Int32}(),
+               get(ir.meta, :propagate_inbounds, false) === true)
     # One structural scan (positions do not change during inference):
     #   - escape discipline (§5.7): a closure value that flows anywhere but
     #     the callee position of a call escapes — unknown callers, and after
@@ -274,6 +309,8 @@ function Frame(ir::UnifiedIR.IR, st::UInferState, env::Vector{Any})
     lws = StmtId[]
     closures = StmtId[]
     cellcaps = Dict{Int32,Set{Int32}}()   # shared cell -> capturing closure ids
+    bcs = Set{Int32}()                    # K"boundscheck" stmt ids
+    bcdirty = Set{Int32}()                # ...with a use outside bc-arg position
     for s in UnifiedIR.each_stmt(ir)
         k = UnifiedIR.stmt_kind(ir, s)
         if k === K"cell_new"
@@ -282,6 +319,8 @@ function Frame(ir::UnifiedIR.IR, st::UInferState, env::Vector{Any})
             push!(lws, s)
         elseif k === K"closure"
             push!(closures, s)
+        elseif k === K"boundscheck"
+            push!(bcs, s.id)
         end
         iscellop = k === K"cell_get" || k === K"cell_set" ||
                    k === K"cell_new" || k === K"cell_isdefined"
@@ -290,6 +329,14 @@ function Frame(ir::UnifiedIR.IR, st::UInferState, env::Vector{Any})
             UnifiedIR.optag(o) == UnifiedIR.TAG_STMT || continue
             d = UnifiedIR.asstmt(o)
             dk = UnifiedIR.stmt_kind(ir, d)
+            if dk === K"boundscheck"
+                # a use is clean when it is the trailing boundscheck argument
+                # of a boundscheck-taking memory builtin; anything else lets
+                # the inlining-context-dependent value flow
+                (k === K"call" && j == UnifiedIR.nops(ir, s) && j >= 4 &&
+                 is_boundscheck_callee(static_operand_value(ir, UnifiedIR.getop(ir, s, 1)))) ||
+                    push!(bcdirty, d.id)
+            end
             if dk === K"closure"
                 (k === K"call" && j == 1) || push!(fr.closure_escaped, d.id)
             elseif dk === K"cell_shared"
@@ -328,6 +375,14 @@ function Frame(ir::UnifiedIR.IR, st::UInferState, env::Vector{Any})
         if any(x -> x in fr.closure_escaped || x in fr.closure_shifted, caps)
             push!(fr.poisoned_cells, cid)
         end
+    end
+    # a boundscheck used as a region guard condition steers control: dirty
+    for reg in ir.regions
+        (UnifiedIR.is_guard(reg) && !UnifiedIR.isnull(reg.cond)) || continue
+        UnifiedIR.stmt_kind(ir, reg.cond) === K"boundscheck" && push!(bcdirty, reg.cond.id)
+    end
+    for id in bcs
+        id in bcdirty || push!(fr.bc_guarded, id)
     end
     return fr
 end
@@ -368,7 +423,8 @@ function infer_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
         iter += 1
         fr.cells_changed = false
         fr.rettype = nothing
-        fr.effects = effmask
+        fr.effects = CC.EFFECTS_TOTAL
+        fr.thrown = Any[Union{}]
         fill!(fr.stmt_effects, ~UInt32(0))
         infer_region!(fr, UnifiedIR.root_region(ir))
         fr.cells_changed || break
@@ -425,7 +481,10 @@ function infer_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
         rt = idx == 0 ? widenucond(rt) : UInterCond(idx, rt.thentype, rt.elsetype)
     end
     ir.meta[:rettype] = widenucond(rt)
-    ir.meta[:effects] = fr.effects & effmask
+    eff, exct = finish_frame_effects(fr, rt, argtypes)
+    ir.meta[:effects] = eff
+    ir.meta[:exct] = exct
+    ir.meta[:effects_mask] = effects_mask(eff)
     # late-pipeline channels (late.jl's query surfaces them): shared-cell
     # content joins, per-closure body result joins, and the refinement
     # classification (escape/world/poison discipline)
@@ -435,6 +494,68 @@ function infer_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
     ir.meta[:closure_shifted] = copy(fr.closure_shifted)
     ir.meta[:poisoned_cells] = copy(fr.poisoned_cells)
     return rt
+end
+
+"""Frame-finish effects adjustment (the stock `adjust_effects(sv)` port,
+typeinfer.jl — minus the method-level override, which callers apply via
+`apply_effects_override`): Bottom-rt consistency, exception-join nothrow
+refinement, ARGMEM resolution over the root argument lattices, and the
+conditional-bit resolutions (CONSISTENT_IF_NOTRETURNED against the return
+type, *_IF_INACCESSIBLEMEMONLY against the final imo state). Returns
+`(effects, exct)`."""
+function finish_frame_effects(fr::Frame, @nospecialize(rt), argtypes::Vector{Any})
+    eff = fr.effects
+    exct = CC.widenconst(widenucond(fr.thrown[1]))
+    if rt === Union{}
+        # always throwing or never returning both count as consistent
+        eff = CC.Effects(eff; consistent = CC.ALWAYS_TRUE)
+    end
+    if exct === Union{}
+        # every raisable exception is caught (and no handler rethrows):
+        # the per-statement nothrow taints do not escape this frame
+        eff = CC.Effects(eff; nothrow = true)
+    end
+    CC.is_nothrow(eff) && (exct = Union{})
+    if CC.is_inaccessiblemem_or_argmemonly(eff) &&
+       Base.all(i -> CC.is_mutation_free_argtype(widenucond(argtypes[i])),
+                1:length(argtypes))
+        eff = CC.Effects(eff; inaccessiblememonly = CC.ALWAYS_TRUE)
+    end
+    if CC.is_consistent_if_notreturned(eff) &&
+       CC.is_identity_free_argtype(widenucond(rt))
+        # consistency tainted only by mutable allocations that provably do
+        # not escape through the return value
+        eff = CC.Effects(eff; consistent = eff.consistent & ~CC.CONSISTENT_IF_NOTRETURNED)
+    end
+    if CC.is_consistent_if_inaccessiblememonly(eff)
+        if CC.is_inaccessiblememonly(eff)
+            eff = CC.Effects(eff; consistent = eff.consistent & ~CC.CONSISTENT_IF_INACCESSIBLEMEMONLY)
+        elseif CC.is_inaccessiblemem_or_argmemonly(eff)
+        else # imo already tainted: no chance to refine later
+            eff = CC.Effects(eff; consistent = CC.ALWAYS_FALSE)
+        end
+    end
+    if CC.is_effect_free_if_inaccessiblememonly(eff)
+        if CC.is_inaccessiblememonly(eff)
+            eff = CC.Effects(eff; effect_free = eff.effect_free & ~CC.EFFECT_FREE_IF_INACCESSIBLEMEMONLY)
+        elseif CC.is_inaccessiblemem_or_argmemonly(eff)
+        else
+            eff = CC.Effects(eff; effect_free = CC.ALWAYS_FALSE)
+        end
+    end
+    return eff, exct
+end
+
+"Join a raisable exception type into the innermost active collector (a try
+body's scope, or the frame's escape join)."
+function note_thrown!(fr::Frame, @nospecialize(t))
+    t === Union{} && return nothing
+    t = CC.widenconst(widenucond(t))
+    get(ENV, "UIR_DEBUG", "") == "2" && println("DBG thrown ", t, " in ",
+        get(fr.ir.meta, :mi, fr.ir.meta))
+    i = length(fr.thrown)
+    fr.thrown[i] = CC.tmerge(CC.fallback_lattice, fr.thrown[i], t)
+    return nothing
 end
 
 "Record a `return`: a single-operand UCond return stays conditional (the
@@ -458,6 +579,27 @@ function note_return!(fr::Frame, s::StmtId)
         end
     end
     fr.rettype = ⊔(fr.st, fr.rettype, joinvals(fr, opls(fr, s, 1)))
+    return nothing
+end
+
+"A branch/continue condition that is not provably Bool throws a TypeError at
+runtime (the stock GotoIfNot rule: merge EFFECTS_THROWS)."
+function taint_nonbool_cond!(fr::Frame, @nospecialize(condl))
+    condl isa UCond && return nothing
+    t = CC.widenconst(widenucond(condl))
+    if !(t isa Type && t <: Bool)
+        fr.effects = CC.merge_effects(fr.effects, CC.EFFECTS_THROWS)
+        note_thrown!(fr, TypeError)
+    end
+    return nothing
+end
+
+"Cyclic control (loop backedges, island back-gotos) drops `terminates` unless
+the frame's method declares `@assume_effects :terminates_locally` (the
+`handle_control_backedge!` port)."
+function taint_backedge!(fr::Frame)
+    fr.override.terminates_locally && return nothing
+    fr.effects = CC.Effects(fr.effects; terminates = false)
     return nothing
 end
 
@@ -539,7 +681,7 @@ function opl(fr::Frame, o::UnifiedIR.Operand)
         col = fr.st.edges
         # driver mode: partition-based read (world-pinned, binding edge
         # recorded); otherwise the historical ambient read
-        col === nothing || return global_partition_lattice(col, g.mod, g.name)
+        col === nothing || return global_partition_rte(col, g.mod, g.name).rt
         if isconst(g.mod, g.name) && isdefined(g.mod, g.name)
             return CC.Const(getglobal(g.mod, g.name))
         end
@@ -585,6 +727,7 @@ function infer_region!(fr::Frame, r::RegionId)
         elseif k === K"continue"
             tgt = UnifiedIR.asregion(UnifiedIR.getop(ir, s, 1))
             condl = opl(fr, UnifiedIR.getop(ir, s, 2))
+            taint_nonbool_cond!(fr, condl)
             vals = opls(fr, s, 3)
             prev = get(fr.continue_vals, tgt.id, nothing)
             joined = prev === nothing ? vals :
@@ -652,6 +795,7 @@ end
 function infer_if!(fr::Frame, s::StmtId)::Union{Nothing,RefMap}
     ir = fr.ir
     condl = opl(fr, UnifiedIR.getop(ir, s, 1))
+    taint_nonbool_cond!(fr, condl)
     rs = UnifiedIR.live_owned_regions(ir, s)
     local res
     carry = nothing
@@ -749,25 +893,39 @@ function infer_loop!(fr::Frame, s::StmtId)
     result = get(fr.break_vals, bodyr.id, nothing)
     fr.env[s.id] = result === nothing ? Union{} : result   # never-exiting loop: ⊥
     # §5.1 rule 5: loops drop TERMINATES (bounded-trip proofs are future work)
-    fr.effects &= ~UnifiedIR.FLAG_TERMINATES
+    taint_backedge!(fr)
     return nothing
 end
 
 function infer_try!(fr::Frame, s::StmtId)
     ir = fr.ir
     rs = UnifiedIR.live_owned_regions(ir, s)
+    # exceptions raised in the body are caught here: collect their join in a
+    # fresh scope (it types the handler argument); the handler's own throws
+    # land in the enclosing scope (post-pop), i.e. they escape this `try`
+    push!(fr.thrown, Union{})
     r1 = infer_region!(fr, rs[1])
+    thrown = pop!(fr.thrown)
     r2 = nothing
     if length(rs) >= 2
-        h = UnifiedIR.getregion(ir, rs[2])
-        for a in h.args
-            fr.env[a.id] = Any   # %exc
+        if thrown === Union{}
+            # the body provably raises nothing: the handler is dead code —
+            # contributes neither values nor effects (the stock unreachable-
+            # handler rule)
+        else
+            h = UnifiedIR.getregion(ir, rs[2])
+            for (i, a) in enumerate(h.args)
+                fr.env[a.id] = i == 1 ? thrown : Any   # %exc
+            end
+            # throw-edge rule: the handler may run after any prefix of the
+            # body, so refinements of cells the body stores are invalid there
+            killed = push_store_kills!(fr, rs[1])
+            r2 = infer_region!(fr, rs[2])
+            killed && pop!(fr.refinements)
         end
-        # throw-edge rule: the handler may run after any prefix of the body,
-        # so refinements of cells the body stores are invalid inside it
-        killed = push_store_kills!(fr, rs[1])
-        r2 = infer_region!(fr, rs[2])
-        killed && pop!(fr.refinements)
+    else
+        # no handler region: the body's exceptions escape
+        note_thrown!(fr, thrown)
     end
     res = ⊔(fr.st, r1, r2)
     fr.env[s.id] = res === nothing ? Union{} : res
@@ -829,17 +987,21 @@ function infer_closure!(fr::Frame, s::StmtId)
     saved_refs = fr.refinements
     saved_ret = fr.rettype
     saved_eff = fr.effects
+    saved_thrown = fr.thrown
     fr.refinements = RefMap[]
     fr.rettype = nothing
-    effmask = UnifiedIR.FLAG_CONSISTENT | UnifiedIR.FLAG_EFFECT_FREE |
-              UnifiedIR.FLAG_NOTHROW | UnifiedIR.FLAG_TERMINATES
-    fr.effects = effmask
+    fr.effects = CC.EFFECTS_TOTAL
+    fr.thrown = Any[Union{}]   # deferred throws surface at call sites, not here
     infer_region!(fr, rs[1])
     bodyret = fr.rettype === nothing ? Union{} : widenucond(fr.rettype)
-    bodyeff = fr.effects & effmask
+    bodyeff = fr.effects
+    if fr.thrown[1] === Union{}
+        bodyeff = CC.Effects(bodyeff; nothrow = true)   # all body throws caught
+    end
     fr.refinements = saved_refs
     fr.rettype = saved_ret
     fr.effects = saved_eff
+    fr.thrown = saved_thrown
     old = get(fr.closure_rets, s.id, nothing)
     newret = old === nothing ? bodyret :
         CC.tmerge(CC.fallback_lattice, widenucond(old), bodyret)
@@ -848,7 +1010,7 @@ function infer_closure!(fr::Frame, s::StmtId)
         fr.cells_changed = true
     end
     oldeff = get(fr.closure_effs, s.id, nothing)
-    neweff = oldeff === nothing ? bodyeff : (oldeff & bodyeff)
+    neweff = oldeff === nothing ? bodyeff : CC.merge_effects(oldeff, bodyeff)
     if oldeff === nothing || neweff != oldeff
         fr.closure_effs[s.id] = neweff
         fr.cells_changed = true
@@ -876,7 +1038,7 @@ function infer_cfg!(fr::Frame, s::StmtId)
         # backward edge (region ids are in creation = statement order): the
         # island may cycle — §5.1 rule 5 drops TERMINATES. Applies to both
         # in-island backedges and backward cross-island gotos (catch→loop-head).
-        dest.id <= cursrc[] && (fr.effects &= ~UnifiedIR.FLAG_TERMINATES)
+        dest.id <= cursrc[] && taint_backedge!(fr)
         if UnifiedIR.getregion(ir, dest).owner != s
             # sealed cross-island exit: mark reached; values cross scopes
             # through cells, not block args
@@ -967,6 +1129,7 @@ function infer_cfg!(fr::Frame, s::StmtId)
                 elseif k === K"continue"
                     tgt = UnifiedIR.asregion(UnifiedIR.getop(ir, st, 1))
                     condl = opl(fr, UnifiedIR.getop(ir, st, 2))
+                    taint_nonbool_cond!(fr, condl)
                     vals = Any[widenucond(v) for v in opls(fr, st, 3)]
                     prev = get(fr.continue_vals, tgt.id, nothing)
                     joined = prev === nothing ? vals :
@@ -981,6 +1144,7 @@ function infer_cfg!(fr::Frame, s::StmtId)
                     merge_edge!(dest, Any[opl(fr, o) for o in args_ops], curref())
                 elseif k === K"br_if"
                     condl = opl(fr, UnifiedIR.getop(ir, st, 1))
+                    taint_nonbool_cond!(fr, condl)
                     get(ENV, "UIR_DEBUG", "") == "1" && println("DBG br_if %", st.id, " condl=", condl)
                     bundles = UnifiedIR.edge_bundles(ir, st)
                     ref = curref()

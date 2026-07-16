@@ -73,30 +73,18 @@ end
 """
     effects_of(f, argtypes; config=InferenceConfig()) -> NamedTuple
 
-Coarse effects summary over the typed IR (v1: the REMOVABLE-mask bits
-aggregated across statements; §8.2's vocabulary).
+Effects summary over the typed IR: the frame's inferred `Compiler.Effects`
+(published by `infer_ir!` as `ir.meta[:effects]`, conditional bits resolved
+at frame finish), projected onto the historical four-axis NamedTuple.
 """
 function effects_of(@nospecialize(f), argtypes::Vector{Any};
                     config::InferenceConfig = InferenceConfig())
     ir = typed_ir(f, argtypes; config, optimize_until = "inference")
-    refine_effects!(ir)
-    consistent = effect_free = nothrow = terminates = true
-    for s in UnifiedIR.each_stmt(ir)
-        k = UnifiedIR.stmt_kind(ir, s)
-        (k === K"region_arg" || UnifiedIR.is_terminator(k)) && continue
-        UnifiedIR.owns_regions(k) && continue
-        fl = UnifiedIR.stmt_flag(ir, s)
-        consistent &= (fl & UnifiedIR.FLAG_CONSISTENT) != 0
-        effect_free &= (fl & UnifiedIR.FLAG_EFFECT_FREE) != 0
-        nothrow &= (fl & UnifiedIR.FLAG_NOTHROW) != 0
-        terminates &= (fl & UnifiedIR.FLAG_TERMINATES) != 0
-    end
-    # a loop anywhere spoils termination (v1 coarseness)
-    for s in UnifiedIR.each_stmt(ir)
-        UnifiedIR.stmt_kind(ir, s) === K"loop" && (terminates = false)
-        UnifiedIR.stmt_kind(ir, s) === K"cfg" && (terminates = false)
-    end
-    return (; consistent, effect_free, nothrow, terminates)
+    fx = frame_effects_meta(ir)
+    return (; consistent = CC.is_consistent(fx),
+            effect_free = CC.is_effect_free(fx),
+            nothrow = CC.is_nothrow(fx),
+            terminates = CC.is_terminates(fx))
 end
 
 """
