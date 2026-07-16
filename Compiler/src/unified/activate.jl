@@ -210,9 +210,14 @@ function unified_typeinf_ext_toplevel(mi::Core.MethodInstance, world::UInt,
     return Compiler.typeinf_ext_toplevel(interp, mi, source_mode)
 end
 
-# warmup body for the native driver: a loop, a branch, a call — compiles the
-# driver's whole hot path under the current (pre-flip) runtime compiler
+# warmup bodies for the native driver: a loop, a branch, a call — plus a
+# try/catch body for the EH entry/exit path. Driving them through the
+# pipeline BEFORE the jl_typeinf_func flip compiles the driver's whole hot
+# path under the sysimage compiler (every internal compile request resolves
+# instantly), so the post-flip reentrant recursion only covers the long
+# tail of driver specializations the warmup did not reach.
 _driver_warmup(n) = begin s = 0; i = 1; while i <= n; s += i > 2 ? i : -i; i += 1; end; s end
+_driver_warmup_eh(x) = try; div(10, x); catch; -1; end
 
 """
     activate!(; mode::Symbol = :native)
@@ -250,22 +255,28 @@ function activate!(; mode::Symbol = :native)
     end
     mode === :native || error("activate!: unknown mode $mode (supported: :native, :shadow)")
     SHADOW_ENABLED[] = false
-    # 1. the established stdlib-Compiler codegen activation, hooks OFF:
-    #    bootstrap! precompiles the stock inference/optimizer entries (the
-    #    per-body fallback executor — without this sweep, post-flip requests
-    #    interpret the compiler while compiling it, minutes of churn), then
-    #    activate_codegen! points jl_typeinf_func at the stdlib
-    #    typeinf_ext_toplevel — whose entry consults UNIFIED_HOOKS
-    Compiler.activate!(; reflection = false, codegen = true)
-    # 2. install the driver and warm its own path under the pre-flip runtime
-    #    (post-flip, requests for the driver's own code reenter the flipped
-    #    entry and run unified recursively up to the per-task depth bound —
-    #    the warmup keeps that first cascade short)
-    enable_pipeline!()
+    # 1. warm the driver's own path while the runtime's compiler is still
+    #    the (fully precompiled) sysimage one: the warmup passes are DIRECT
+    #    unified_typeinf calls (no hooks needed) executing the whole
+    #    entry→infer→optimize→exit→finish path, and every compile request
+    #    that execution raises resolves instantly pre-flip. Post-flip,
+    #    requests for driver code the warmup missed reenter the flipped
+    #    entry and run unified recursively up to the per-task depth bound.
     let interp = Compiler.NativeInterpreter(Base.get_world_counter())
         unified_typeinf(interp, lookup_method_instance(_driver_warmup, 5),
                         Compiler.SOURCE_MODE_ABI)
+        unified_typeinf(interp, lookup_method_instance(_driver_warmup_eh, 5),
+                        Compiler.SOURCE_MODE_ABI)
     end
+    # 2. the established stdlib-Compiler codegen activation, hooks still
+    #    OFF: bootstrap!'s precompile sweep runs typeinf_ext_toplevel over
+    #    the stock inference/optimizer entries (the per-body fallback
+    #    executor — and the sweep itself must run STOCK, not through the
+    #    driver), then activate_codegen! points jl_typeinf_func at the
+    #    stdlib typeinf_ext_toplevel — whose entry consults UNIFIED_HOOKS
+    Compiler.activate!(; reflection = false, codegen = true)
+    # 3. hooks on: from here every inference request tries unified first
+    enable_pipeline!()
     GLOBAL_MODE[] = true
     return nothing
 end
