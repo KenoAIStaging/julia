@@ -746,6 +746,11 @@ function infer_region!(fr::Frame, r::RegionId)
     npush = 0
     for s in UnifiedIR.region_stmts(ir, r)
         k = UnifiedIR.stmt_kind(ir, s)
+        if k !== K"region_arg" && (UnifiedIR.is_terminator(k) || UnifiedIR.owns_regions(k))
+            # control statements bypass `transfer`; their operand evaluation
+            # (global reads, mutable literals, sparams) still has effects
+            note_operand_effects!(fr, s)
+        end
         if k === K"region_arg"
             continue
         elseif k === K"result"
@@ -1133,6 +1138,9 @@ function infer_cfg!(fr::Frame, s::StmtId)
             for st in UnifiedIR.region_stmts(ir, rid)
                 k = UnifiedIR.stmt_kind(ir, st)
                 k === K"region_arg" && continue
+                if UnifiedIR.is_terminator(k) || UnifiedIR.owns_regions(k)
+                    note_operand_effects!(fr, st)   # control-operand evaluation
+                end
                 if k === K"result"
                     result = ⊔(fr.st, result, joinvals(fr, opls(fr, st, 1)))
                 elseif k === K"return"

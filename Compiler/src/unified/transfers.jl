@@ -220,6 +220,62 @@ function infer_get_binding_type(fr::Frame, args::Vector{Any})::UResult
                    nothrow ? Union{} : TypeError)
 end
 
+"""The abstract_call_unionall port: `UnionAll(tv, body)` construction —
+Const/Type-precise when the body is pinned, nothrow from the argument
+lattices. (`Core.UnionAll` is a type callee, so without this it would
+dispatch into the ccall-backed constructor method.)"""
+function infer_unionall(fr::Frame, args::Vector{Any})::UResult
+    na = length(args)
+    lat = CC.fallback_lattice
+    local a2, a3, nothrow::Bool
+    if na >= 1 && CC.isvarargtype(args[end])
+        na <= 2 && return UResult(Any, CC.EFFECTS_THROWS)
+        na > 4 && return UResult(Union{}, CC.EFFECTS_THROWS)
+        a2 = args[2]
+        a3 = CC.unwrapva(args[3])
+        nothrow = false
+    elseif na == 3
+        a2 = args[2]
+        a3 = args[3]
+        nothrow = CC.:⊑(lat, a2, TypeVar) &&
+                  (CC.:⊑(lat, a3, Type) || CC.:⊑(lat, a3, TypeVar))
+    else
+        return UResult(Union{}, CC.EFFECTS_THROWS)
+    end
+    canconst = true
+    local body
+    if a3 isa CC.Const
+        body = a3.val
+    elseif CC.isconstType(a3)
+        body = CC.type_parameter(a3)
+    elseif CC.isType(a3)
+        body = CC.type_parameter(a3)
+        canconst = false
+    else
+        return UResult(Any, CC.Effects(CC.EFFECTS_TOTAL; nothrow))
+    end
+    (body isa Type || body isa TypeVar) || return UResult(Any, CC.EFFECTS_THROWS)
+    if CC.has_free_typevars(body)
+        local tv
+        if a2 isa CC.Const
+            tv = a2.val
+        elseif a2 isa CC.PartialTypeVar
+            tv = a2.tv
+            canconst = false
+        else
+            return UResult(Any, CC.EFFECTS_THROWS)
+        end
+        tv isa TypeVar || return UResult(Any, CC.EFFECTS_THROWS)
+        body = try
+            UnionAll(tv, body)
+        catch
+            return UResult(Any, CC.EFFECTS_THROWS)
+        end
+    end
+    rt = canconst ? CC.Const(body) : Type{body}
+    return UResult(rt, CC.Effects(CC.EFFECTS_TOTAL; nothrow))
+end
+
 "The abstract_eval_setglobal! port: `args = [setglobal!, M, s, v(, order)]`."
 function infer_setglobal(fr::Frame, args::Vector{Any})::UResult
     st = fr.st
@@ -253,11 +309,11 @@ function infer_setglobal(fr::Frame, args::Vector{Any})::UResult
     return UResult(rt, eff, exct)
 end
 
-"""Record statement effects (and its raisable exception type) and fold them
-into the frame accumulators: non-const global reads among the statement's own
-operands merge their partition-load effects first; the flag column gets the
-UInt32 projection; the exception joins the innermost thrown collector."""
-function note_effects!(fr::Frame, s::StmtId, e::CC.Effects, @nospecialize(exct))
+"""Effects and exception type of evaluating a statement's own operands
+(the abstract_eval_value/abstract_eval_special_value port): non-const
+global reads, mutable literals (#52531), maybe-undefined static parameters.
+Folds `(e, exct)` through and returns the updated pair."""
+function operand_effects(fr::Frame, s::StmtId, e::CC.Effects, @nospecialize(exct))
     ir = fr.ir
     for i in 1:UnifiedIR.nops(ir, s)
         o = UnifiedIR.getop(ir, s, i)
@@ -284,6 +340,27 @@ function note_effects!(fr::Frame, s::StmtId, e::CC.Effects, @nospecialize(exct))
             end
         end
     end
+    return (e, exct)
+end
+
+"Operand-evaluation effects for a control statement (no effects of its own —
+the walkers handle those; `transfer`-dispatched kinds go through
+`note_effects!` instead)."
+function note_operand_effects!(fr::Frame, s::StmtId)
+    e, exct = operand_effects(fr, s, CC.EFFECTS_TOTAL, Union{})
+    e === CC.EFFECTS_TOTAL && exct === Union{} && return nothing
+    e.nothrow ? (exct = Union{}) : (exct === Union{} && (exct = Any))
+    fr.effects = CC.merge_effects(fr.effects, e)
+    exct === Union{} || note_thrown!(fr, exct)
+    return nothing
+end
+
+"""Record statement effects (and its raisable exception type) and fold them
+into the frame accumulators, operand-evaluation effects included; the flag
+column gets the UInt32 projection; the exception joins the innermost thrown
+collector."""
+function note_effects!(fr::Frame, s::StmtId, e::CC.Effects, @nospecialize(exct))
+    e, exct = operand_effects(fr, s, e, exct)
     # a nothrow statement raises nothing; a throwing one raises at least *something*
     e.nothrow ? (exct = Union{}) : (exct === Union{} && (exct = Any))
     fr.stmt_effects[s.id] = effects_mask(e)
@@ -546,6 +623,21 @@ function _transfer(fr::Frame, s::StmtId, k::UnifiedIR.Kind)
             end
         end
         UnifiedIR.nops(ir, s) >= 2 || return (Any, CC.EFFECTS_UNKNOWN)
+        # `@ccall ... @assume_effects`-style overrides ride the cconv tuple
+        # (operand 5, mirroring Expr(:foreigncall).args[5]; stock decode at
+        # abstract_eval_foreigncall)
+        eff = CC.EFFECTS_UNKNOWN
+        if UnifiedIR.nops(ir, s) >= 5
+            cconv = opl(fr, UnifiedIR.getop(ir, s, 5))
+            if cconv isa CC.Const && (q = cconv.val; q isa QuoteNode) &&
+               (v = q.value; v isa Tuple{Symbol, UInt16, Bool})
+                eff = try
+                    CC.override_effects(eff, CC.decode_effects_override(v[2]))
+                catch
+                    eff
+                end
+            end
+        end
         rtl = opl(fr, UnifiedIR.getop(ir, s, 2))
         T = rtl isa CC.Const ? rtl.val : nothing
         mi = get(ir.meta, :mi, nothing)
@@ -557,9 +649,9 @@ function _transfer(fr::Frame, s::StmtId, k::UnifiedIR.Kind)
             catch
                 nothing
             end
-            rt === nothing || return (rt, CC.EFFECTS_UNKNOWN)
+            rt === nothing || return (rt, eff)
         end
-        return (foreigncall_rt(T), CC.EFFECTS_UNKNOWN)
+        return (foreigncall_rt(T), eff)
     elseif k === K"isdefined_global"
         # a binding can become defined later: not consistent; reads the
         # binding table: not inaccessiblememonly
@@ -982,6 +1074,9 @@ function infer_call(fr::Frame, args::Vector{Any})::UResult
         end
         eff = builtin_call_effects(f, argl, rt)
         return UResult(rt, eff, eff.nothrow ? Union{} : builtin_call_exct(f, argl, rt))
+    end
+    if f === Core.UnionAll
+        return infer_unionall(fr, args)
     end
     if f !== nothing && is_return_type_f(f)
         r = infer_return_type_call(fr, args)
@@ -1745,9 +1840,12 @@ function concrete_eval(fr::Frame, match::Core.MethodMatch, args::Vector{Any},
     return r
 end
 
-"Would const-seeding add information over the widened signature?"
+"""Would const-seeding add information over the widened signature? The
+callee position counts too: a `Const` Type callee pins the instance where
+its `Type{T}` widening does not (this nightly's #61323 semantics — a
+constructor body's `fieldtype(self, ...)` only folds on the Const)."""
 function const_args_profitable(args::Vector{Any})
-    for i in 2:length(args)
+    for i in 1:length(args)
         a = args[i]
         if a isa CC.Const
             Base.issingletontype(typeof(a.val)) || return true
