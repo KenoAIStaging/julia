@@ -94,6 +94,31 @@ end
     @test oc_vs_interp(ir, (10,), (1,))
 end
 
+@testset "typed exit: multi-carried loop whose only exit is a break" begin
+    # regression: a `continue` with literal-true condition never exits the
+    # loop, so it must not count toward the exit-value arity — a 2-carried
+    # loop whose only exit is a 1-value break used to materialize a spurious
+    # 1-tuple around the scalar result (returned as junk)
+    b = Builder(name = :tbreakonly)
+    append_stmt!(b, K"region_arg"; type = Any)
+    n = append_stmt!(b, K"region_arg"; type = Int64)
+    r = build_loop!(b, 0, 1; type = Int64, argtypes = Any[Int64, Int64]) do b, args
+        s, j = args
+        body = UnifiedIR.current_region(b)
+        s2 = append_stmt!(b, K"call", GlobalRef(Base, :add_int), s, j; type = Int64)
+        j2 = append_stmt!(b, K"call", GlobalRef(Base, :add_int), j, 1; type = Int64)
+        c = append_stmt!(b, K"call", GlobalRef(Base, :slt_int), n, j2; type = Bool)
+        fi = append_stmt!(b, K"if", c; type = Nothing)
+        UnifiedIR.open_region!(b, fi)
+        append_stmt!(b, K"break", op_region(body), op_stmt(s2))
+        UnifiedIR.close_region!(b)
+        append_stmt!(b, K"continue", op_region(body), true, op_stmt(s2), op_stmt(j2))
+    end
+    append_stmt!(b, K"return", r)
+    ir = finish!(b)
+    @test oc_vs_interp(ir, (10,), (1,), (0,))
+end
+
 @testset "typed exit: cfg island with block args" begin
     src = """
     func @absmax(%1::Any, %2::Int64, %3::Int64) -> Int64 {

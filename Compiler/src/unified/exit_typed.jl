@@ -128,7 +128,10 @@ function result_used(ir::UnifiedIR.IR, s::StmtId)
     return used
 end
 
-"Max value arity of the exits feeding owner `s` (results, breaks, continues)."
+"Max value arity of the exits feeding owner `s` (results, breaks, continues).
+A `continue` whose condition is literal `true` never exits its loop — it
+contributes no result values (`emit_tcontinue!` emits only the back-edge for
+it, and inference joins no exit values from it either)."
 function owner_nvals(ir::UnifiedIR.IR, s::StmtId)
     rs = UnifiedIR.live_owned_regions(ir, s)
     rset = Set{Int32}(r.id for r in rs)
@@ -144,7 +147,12 @@ function owner_nvals(ir::UnifiedIR.IR, s::StmtId)
             tgt.id in rset && (n = max(n, UnifiedIR.nops(ir, st) - 1))
         elseif k === K"continue"
             tgt = UnifiedIR.asregion(UnifiedIR.getop(ir, st, 1))
-            tgt.id in rset && (n = max(n, UnifiedIR.nops(ir, st) - 2))
+            if tgt.id in rset
+                cond = UnifiedIR.getop(ir, st, 2)
+                ctrue = UnifiedIR.optag(cond) == UnifiedIR.TAG_INLINE &&
+                        UnifiedIR.imm_value(cond) === true
+                ctrue || (n = max(n, UnifiedIR.nops(ir, st) - 2))
+            end
         end
     end
     return n
