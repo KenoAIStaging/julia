@@ -103,10 +103,14 @@ end
 # Reentrancy / concurrency guard (see the header comment)
 # ---------------------------------------------------------------------------
 
-"Per-task driver state: nesting depth + the MethodInstances this task is
-currently driving (each holds an engine reservation up-stack)."
+"Per-task driver state: nesting depth, the MethodInstances this task is
+currently driving (each holds an engine reservation up-stack), and whether a
+devirtualization CodeInstance production is in progress (`devirt` — bounds
+eager callee compilation to one level per root chain; see
+`driver_ci_for_invoke`)."
 mutable struct DriverTaskState
     depth::Int
+    devirt::Int
     const inflight::Base.IdSet{Core.MethodInstance}
 end
 
@@ -116,7 +120,7 @@ function driver_task_state()::DriverTaskState
     tls = Base.task_local_storage()
     v = get(tls, DRIVER_TLS_KEY, nothing)
     v isa DriverTaskState && return v
-    st = DriverTaskState(0, Base.IdSet{Core.MethodInstance}())
+    st = DriverTaskState(0, 0, Base.IdSet{Core.MethodInstance}())
     tls[DRIVER_TLS_KEY] = st
     return st
 end
@@ -127,6 +131,9 @@ recurses per DRIVER_MAX_DEPTH), so the bound stays small — declined bodies
 are stock-compiled once and cached, and devirtualization targets degrade to
 MethodInstance invokes whose CodeInstances materialize on first call."
 const DRIVER_REENTRY_LIMIT = Base.RefValue(8)
+
+":invoke emission switch (devirtualize_calls!)."
+const DEVIRTUALIZE = Base.RefValue(true)
 
 # Per-body inference budgets (v0): the driver re-infers each body's callee
 # tree with a fresh state — the edge collector's soundness requires every
@@ -342,6 +349,15 @@ function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInsta
 
     src = nothing
     if optimize && emit_code
+        # :invoke emission for residual statically-resolved calls (each
+        # rewrite is individually sound, so a failure just leaves the
+        # remaining sites as dynamic calls)
+        if DEVIRTUALIZE[]
+            try
+                devirtualize_calls!(uir, st, interp)
+            catch
+            end
+        end
         local ircode
         try
             ircode = ir_to_ircode(uir)
@@ -396,6 +412,119 @@ function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInsta
 
     return DriverResult(src, rt, exct, effects, edges, col.valid_worlds,
                         start_counter, rettype_const, const_flags)
+end
+
+# ---------------------------------------------------------------------------
+# Devirtualization: statically-resolved residual calls become `:invoke`
+# ---------------------------------------------------------------------------
+
+"""
+    driver_ci_for_invoke(interp, mi) -> Union{Nothing,CodeInstance}
+
+A CodeInstance suitable as an `:invoke` target for `mi`: the world-covering
+cache entry when one exists, else a recursive unified pass (per-task depth
+bound and inflight set apply — mutual recursion and over-deep chains return
+`nothing`, and the site degrades to a MethodInstance invoke, which the
+runtime compiles on first call through the ordinary entry). No JIT work
+happens here: the caller's `add_codeinsts_to_jit!` walk collects embedded
+CodeInstance targets via `collectinvokes!`.
+"""
+function driver_ci_for_invoke(interp::Compiler.AbstractInterpreter, mi::Core.MethodInstance)
+    let code = get(Compiler.code_cache(interp), mi, nothing)
+        code isa Compiler.InferenceResult && (code = code.ci)
+        if code isa Core.CodeInstance &&
+           Compiler.ci_meets_requirement(interp, code, Compiler.SOURCE_MODE_ABI)
+            return code
+        end
+    end
+    dts = driver_task_state()
+    (mi in dts.inflight || dts.depth >= DRIVER_REENTRY_LIMIT[]) && return nothing
+    # eager production is bounded to ONE level per root chain: while a
+    # devirtualization-driven pass is on this task's stack, deeper targets
+    # stay MethodInstance invokes (their CodeInstances materialize when the
+    # runtime first needs them — cached, so coverage converges by execution)
+    dts.devirt > 0 && return nothing
+    local ci
+    dts.depth += 1
+    dts.devirt += 1
+    push!(dts.inflight, mi)
+    try
+        ci = _unified_typeinf(interp, mi, Compiler.SOURCE_MODE_ABI)
+    finally
+        dts.depth -= 1
+        dts.devirt -= 1
+        delete!(dts.inflight, mi)
+    end
+    ci isa Core.CodeInstance || return nothing
+    return ci
+end
+
+"""
+    devirtualize_calls!(uir, st, interp) -> Int
+
+Post-optimization `:invoke` emission (stock's inliner leaves
+`Expr(:invoke, ci, ...)` at statically-resolved sites it does not inline):
+for each residual `K"call"` whose signature — built from the final inferred
+operand types, exactly what the last `infer_ir!` pass looked up — resolves
+to a SINGLE, FULLY-COVERING method match in a world-clamped, edge-recorded
+query (`resolve_single_match(st, sig)`), rewrite the statement to
+`K"invoke"` targeting the callee's CodeInstance (produced through the
+driver, bounded recursion) or, when a CI cannot be soundly produced right
+now, the compilable MethodInstance. Soundness: the recorded match edge caps
+this body's CodeInstance whenever the callee set changes, and the emitted
+world bounds are additionally intersected with the callee CI's; sparams of
+non-dispatch-tuple targets are re-derived per call by the runtime's invoke
+convention, so the rewrite is dispatch-exact. Types/effects columns are
+unchanged (the rewrite preserves semantics per statement).
+"""
+function devirtualize_calls!(uir, st::UInferState, interp::Compiler.AbstractInterpreter)
+    n = 0
+    col = st.edges
+    for s in UnifiedIR.each_stmt(uir)
+        UnifiedIR.is_tombstone(uir, s) && continue
+        UnifiedIR.stmt_kind(uir, s) === K"call" || continue
+        nop = UnifiedIR.nops(uir, s)
+        nop >= 1 || continue
+        args = Any[stmt_lattice(uir, UnifiedIR.getop(uir, s, i)) for i in 1:nop]
+        f = CC.singleton_type(args[1])
+        f === nothing && args[1] isa CC.Const && (f = (args[1]::CC.Const).val)
+        f === nothing && continue
+        (f isa Core.Builtin || f isa Core.IntrinsicFunction) && continue
+        argts = Any[CC.widenconst(a) for a in args[2:end]]
+        Base.any(t -> t === Union{} || !(t isa Type) || CC.has_free_typevars(t), argts) && continue
+        ft = f isa Type ? Type{f} : typeof(f)
+        sig = try
+            Tuple{ft, argts...}
+        catch
+            continue
+        end
+        match = resolve_single_match(st, sig)   # records the match edge
+        match === nothing && continue
+        match.fully_covers || continue
+        mi = try
+            CC.specialize_method(match)
+        catch
+            continue
+        end
+        mi isa Core.MethodInstance || continue
+        target = ccall(:jl_normalize_to_compilable_mi, Any, (Any,), mi)
+        target isa Core.MethodInstance || continue
+        ci = driver_ci_for_invoke(interp, target)
+        tgt = ci === nothing ? target : ci
+        if ci isa Core.CodeInstance && col isa UEdges
+            # the embedded CI must cover every world this body claims
+            clamp_world!(col, ci.min_world, ci.max_world) || continue
+        end
+        ops = UnifiedIR.Operand[UnifiedIR.vop(uir, tgt)]
+        for i in 1:nop
+            push!(ops, UnifiedIR.getop(uir, s, i))
+        end
+        UnifiedIR.replace_stmt!(uir, s, K"invoke", ops...;
+                                type = UnifiedIR.stmt_type(uir, s),
+                                flag = UnifiedIR.stmt_flag(uir, s))
+        n += 1
+    end
+    return n
 end
 
 # ---------------------------------------------------------------------------

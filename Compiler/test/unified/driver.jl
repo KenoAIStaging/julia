@@ -42,7 +42,7 @@ end
     @test invoke(drv_const, ci) == 42
 end
 
-@testset "driver: try/catch compiles through unified (A4); generated falls back" begin
+@testset "driver: try/catch compiles through unified (A4)" begin
     UnifiedCompiler.reset_pipeline_stats!()
     # try/catch bodies go through the typed exit's exception-SSA synthesis:
     # cache-grade CodeInstance, correct on the normal AND the handler path
@@ -54,10 +54,151 @@ end
     @test get(pipeline_stats().fallbacks, :typed_exit, 0) == 0
     @test pipeline_stats().unified >= 1
     @test drv_try(5) == 2 && drv_try(0) == -1
+end
+
+@testset "driver: generated functions expand and compile (A5)" begin
+    UnifiedCompiler.reset_pipeline_stats!()
+    # simple staged body
     ci = unified_typeinf(drv_interp(), drv_mi(drv_gen, 1), CC.SOURCE_MODE_ABI)
-    @test ci === nothing
-    @test get(pipeline_stats().fallbacks, :generated, 0) >= 1
+    @test ci isa Core.CodeInstance
+    @test ci.rettype === Int
+    @test invoke(drv_gen, ci, 41) == 42
+    @test pipeline_stats().unified >= 1
     @test drv_gen(41) == 42
+    # a generator whose own execution needs fresh inference
+    @gensym helper genf
+    @eval $helper(T) = string(nameof(T))
+    @eval @generated function $genf(x)
+        nm = $helper(x)
+        return :(($nm, x))
+    end
+    gf = Base.invokelatest(getglobal, @__MODULE__, genf)
+    ci2 = unified_typeinf(drv_interp(), drv_mi(gf, 7), CC.SOURCE_MODE_ABI)
+    @test ci2 isa Core.CodeInstance
+    @test invoke(gf, ci2, 7) == ("Int64", 7)
+    # a staged body with control flow (loop over a type-computed count)
+    @gensym genloop
+    @eval @generated function $genloop(x, n)
+        quote
+            s = zero(x)
+            for i in 1:n
+                s += x
+            end
+            s
+        end
+    end
+    gl = Base.invokelatest(getglobal, @__MODULE__, genloop)
+    ci3 = unified_typeinf(drv_interp(), drv_mi(gl, 2.5, 4), CC.SOURCE_MODE_ABI)
+    @test ci3 isa Core.CodeInstance
+    @test invoke(gl, ci3, 2.5, 4) == 10.0
+end
+
+@noinline drv_bigcallee(x::Int) = begin s = 0; for i in 1:x; s += i * i; end; s end
+drv_devcaller(x::Int) = drv_bigcallee(x) + 1
+
+@testset "driver: :invoke emission for statically-resolved residual calls (A5)" begin
+    interp = drv_interp()
+    ci = unified_typeinf(interp, drv_mi(drv_devcaller, 3), CC.SOURCE_MODE_ABI)
+    @test ci isa Core.CodeInstance
+    src = CC.ci_get_source(interp, ci)
+    @test src isa Core.CodeInfo
+    invokes = [st for st in src.code if Meta.isexpr(st, :invoke)]
+    @test length(invokes) == 1
+    tgt = invokes[1].args[1]
+    @test tgt isa Core.CodeInstance
+    @test CC.get_ci_mi(tgt).def.name === :drv_bigcallee
+    @test invoke(drv_devcaller, ci, 10) == drv_devcaller(10)
+    # redefining the devirtualized callee invalidates the caller
+    @eval @noinline drv_bigcallee(x::Int) = -1
+    @test ci.max_world != typemax(UInt)
+    @test drv_devcaller(10) == 0
+end
+
+@noinline drv_probe_str(s::String) = s * "!"
+@noinline drv_probe_sum(v::Vector{Int}) = sum(v)
+@noinline drv_probe_two(a::Int, b::Int) = a === b ? a : a - b
+drv_probe_c1(s::String) = drv_probe_str(s)
+drv_probe_c2(v::Vector{Int}) = drv_probe_sum(v) + 1
+drv_probe_c3(x::Int) = drv_probe_two(x, 2x)
+
+@testset "driver: :invoke class parity with stock on a probe set" begin
+    saved = Base.REFLECTION_COMPILER[]
+    count_invokes(src) = count(st -> Meta.isexpr(st, :invoke), src.code)
+    try
+        for (f, at) in ((drv_probe_c1, (String,)), (drv_probe_c2, (Vector{Int},)),
+                        (drv_probe_c3, (Int,)))
+            Base.REFLECTION_COMPILER[] = nothing
+            disable_pipeline!()
+            (stock_src, _) = only(Base.code_typed(f, at))
+            Base.REFLECTION_COMPILER[] = Compiler
+            enable_pipeline!()
+            (uni_src, _) = only(Base.code_typed(f, at))
+            # the statically-resolved @noinline callee is an :invoke under
+            # both pipelines, and the unified target is a CodeInstance
+            @test count_invokes(stock_src) >= 1
+            @test count_invokes(uni_src) >= count_invokes(stock_src)
+            tgt = [st for st in uni_src.code if Meta.isexpr(st, :invoke)][1].args[1]
+            @test tgt isa Union{Core.CodeInstance,Core.MethodInstance}
+        end
+    finally
+        disable_pipeline!()
+        Base.REFLECTION_COMPILER[] = saved
+    end
+end
+
+# a non-fully-covering single match must neither inline nor devirtualize
+# (dispatch still throws MethodError for the uncovered part)
+drv_cov_callee(x::Int) = 1
+drv_cov_caller(x::Integer) = drv_cov_callee(x)
+
+@testset "driver: non-covering matches keep dynamic dispatch (soundness)" begin
+    mi = CC.specialize_method(Base._which(Tuple{typeof(drv_cov_caller), Integer};
+                                          world = Base.get_world_counter()))
+    ci = unified_typeinf(drv_interp(), mi, CC.SOURCE_MODE_ABI)
+    @test ci isa Core.CodeInstance
+    @test invoke(drv_cov_caller, ci, 1) == 1
+    @test_throws MethodError invoke(drv_cov_caller, ci, Int8(1))
+end
+
+@testset "driver: reentrant requests run unified (per-task bound)" begin
+    # a nested direct request (same task, different mi) is admitted, not
+    # blanket-declined: the depth guard only rejects at the bound
+    UnifiedCompiler.reset_pipeline_stats!()
+    dts = UnifiedCompiler.driver_task_state()
+    @test dts.depth == 0
+    @eval drv_nested_probe(x) = x + 2
+    f = Base.invokelatest(getglobal, @__MODULE__, :drv_nested_probe)
+    dts.depth = 1   # simulate arriving mid-driver-pass
+    ci = try
+        unified_typeinf(drv_interp(), drv_mi(f, 1), CC.SOURCE_MODE_ABI)
+    finally
+        dts.depth = 0
+    end
+    @test ci isa Core.CodeInstance
+    @test pipeline_stats().unified >= 1
+    # at the bound: precise decline, counted
+    dts.depth = UnifiedCompiler.DRIVER_REENTRY_LIMIT[]
+    @eval drv_depth_probe(x) = x + 3
+    f2 = Base.invokelatest(getglobal, @__MODULE__, :drv_depth_probe)
+    ci2 = try
+        unified_typeinf(drv_interp(), drv_mi(f2, 1), CC.SOURCE_MODE_ABI)
+    finally
+        dts.depth = 0
+    end
+    @test ci2 === nothing
+    @test get(pipeline_stats().fallbacks, :reentrant_depth, 0) >= 1
+    # an mi already being driven by this task declines precisely
+    @eval drv_self_probe(x) = x + 4
+    f3 = Base.invokelatest(getglobal, @__MODULE__, :drv_self_probe)
+    mi3 = drv_mi(f3, 1)
+    push!(dts.inflight, mi3)
+    ci3 = try
+        unified_typeinf(drv_interp(), mi3, CC.SOURCE_MODE_ABI)
+    finally
+        delete!(dts.inflight, mi3)
+    end
+    @test ci3 === nothing
+    @test get(pipeline_stats().fallbacks, :reentrant_self, 0) >= 1
 end
 
 @testset "driver: redefinition invalidation (edges/world bounds)" begin
@@ -153,14 +294,15 @@ end
     ci = unified_typeinf(drv_interp(), drv_mi(Base.invokelatest(getglobal, @__MODULE__, :drv_fresh_ledger), 1),
                          CC.SOURCE_MODE_ABI)
     @test ci isa Core.CodeInstance
-    # a fresh generated body: the remaining decline class (try/catch now
-    # compiles through the unified pipeline)
-    @eval @generated drv_fresh_gen(x) = :(x + 5)
+    # a generated body whose generator throws: the expansion is unavailable,
+    # counted as a precise :staged_source decline (stock then reproduces the
+    # call-time generator error)
+    @eval @generated drv_fresh_gen(x) = error("no expansion for you")
     unified_typeinf(drv_interp(), drv_mi(Base.invokelatest(getglobal, @__MODULE__, :drv_fresh_gen), 4),
                     CC.SOURCE_MODE_ABI)
     st1 = pipeline_stats()
-    @test st1.unified == 1
-    @test sum(values(st1.fallbacks)) >= 1
+    @test st1.unified >= 1
+    @test get(st1.fallbacks, :staged_source, 0) >= 1
     io = IOBuffer()
     UnifiedCompiler.print_pipeline_stats(io)
     out = String(take!(io))
