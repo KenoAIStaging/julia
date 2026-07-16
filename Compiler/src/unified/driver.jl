@@ -370,20 +370,30 @@ function _unified_typeinf(interp::Compiler.AbstractInterpreter, mi::Core.MethodI
             return code
         end
     end
-    result = driver_infer(interp, mi)
-    if result isa DriverResult && result.valid_worlds.max_world == result.start_counter &&
-       Base.get_world_counter() > result.start_counter
-        # the counter moved but no consulted fact was bounded below the pass
-        # start: lazy binding/partition materialization (one bump per binding
-        # per process). The bindings exist now — one retry settles it.
+    local result
+    try
         result = driver_infer(interp, mi)
-    end
-    if result isa Fallback
+        if result isa DriverResult && result.valid_worlds.max_world == result.start_counter &&
+           Base.get_world_counter() > result.start_counter
+            # the counter moved but no consulted fact was bounded below the
+            # pass start: lazy binding/partition materialization (one bump
+            # per binding per process). The bindings exist now — one retry
+            # settles it.
+            result = driver_infer(interp, mi)
+        end
+        if result isa Fallback
+            Compiler.engine_reject(interp, ci)
+            count_fallback!(result.reason, mi, result.err)
+            return nothing
+        end
+        return finish_unified!(interp, mi, ci, result::DriverResult)
+    catch err
+        # fallback discipline: NO unified-path error escapes the hook — the
+        # reservation is released and stock compiles the body
         Compiler.engine_reject(interp, ci)
-        count_fallback!(result.reason, mi, result.err)
+        count_fallback!(:internal_error, mi, err)
         return nothing
     end
-    return finish_unified!(interp, mi, ci, result::DriverResult)
 end
 
 """
@@ -423,7 +433,9 @@ end
 # Reflection bridges (typeinf_code / _infer_effects / _infer_exception_type)
 # ---------------------------------------------------------------------------
 
-# run `f(...)` under the driver guard, declining (nothing) on reentrance
+# run `f(...)` under the driver guard, declining (nothing) on reentrance,
+# concurrency, or any escaped unified-path error (the fallback discipline:
+# the hook caller must always be able to continue on stock)
 function with_driver_guard(f)
     if DRIVER_ACTIVE[]
         count_fallback!(:reentrant)
@@ -436,6 +448,9 @@ function with_driver_guard(f)
     try
         DRIVER_ACTIVE[] = true
         return f()
+    catch err
+        count_fallback!(:internal_error, nothing, err)
+        return nothing
     finally
         DRIVER_ACTIVE[] = false
         Base.unlock(DRIVER_LOCK)
