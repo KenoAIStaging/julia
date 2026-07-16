@@ -231,12 +231,14 @@ function emit_stmt!(cx::ExitCtx, s::StmtId, k::UnifiedIR.Kind, loopctxs)
         breakkey = (:brk, s.id)
         marklabel!(cx, headkey)
         newctxs = copy(loopctxs)
-        newctxs[bodyr.id] = (headkey, breakkey, rslot, carried, length(cx.trystack))
+        newctxs[bodyr.id] = (headkey, breakkey, rslot, carried,
+                             length(cx.trystack), length(cx.excstack))
         emit_region!(cx, bodyr, newctxs)
         marklabel!(cx, breakkey)
     elseif k === K"continue"
         tgt = UnifiedIR.asregion(UnifiedIR.getop(ir, s, 1))
-        (headkey, breakkey, rslot, carried, trydepth) = loopctxs[tgt.id]
+        (headkey, breakkey, rslot, carried, trydepth, excdepth) = loopctxs[tgt.id]
+        emit_pops!(cx, excdepth)
         emit_leaves!(cx, trydepth)
         cond = exit_value(cx, UnifiedIR.getop(ir, s, 2))
         vals = exit_values(cx, s, 3)
@@ -252,7 +254,8 @@ function emit_stmt!(cx::ExitCtx, s::StmtId, k::UnifiedIR.Kind, loopctxs)
         emitgoto!(cx, breakkey)
     elseif k === K"break"
         tgt = UnifiedIR.asregion(UnifiedIR.getop(ir, s, 1))
-        (headkey, breakkey, rslot, carried, trydepth) = loopctxs[tgt.id]
+        (headkey, breakkey, rslot, carried, trydepth, excdepth) = loopctxs[tgt.id]
+        emit_pops!(cx, excdepth)
         emit_leaves!(cx, trydepth)
         vals = exit_values(cx, s, 2)
         bind_loop_result!(cx, rslot, vals)
