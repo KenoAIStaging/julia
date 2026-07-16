@@ -2,7 +2,7 @@
 # completeness"; harness in src/unified/completeness.jl, fuzzer in
 # cellfuzz.jl, full-scale runs in bench/unified_completeness.jl).
 
-include("cellfuzz.jl")
+isdefined(@__MODULE__, :CellFuzz) || include("cellfuzz.jl")   # typed_exit.jl may have loaded it
 using .CellFuzz: count_cellops, outcome
 
 const UC = UnifiedCompiler

@@ -42,14 +42,17 @@ end
     @test invoke(drv_const, ci) == 42
 end
 
-@testset "driver: try/catch and generated bodies fall back, counted" begin
+@testset "driver: try/catch compiles through unified (A4); generated falls back" begin
     UnifiedCompiler.reset_pipeline_stats!()
+    # try/catch bodies go through the typed exit's exception-SSA synthesis:
+    # cache-grade CodeInstance, correct on the normal AND the handler path
     ci = unified_typeinf(drv_interp(), drv_mi(drv_try, 4), CC.SOURCE_MODE_ABI)
-    @test ci === nothing                       # hook declines; stock handles the body
-    @test get(pipeline_stats().fallbacks, :typed_exit, 0) >= 1
-    # the standard entry point serves it through stock — still correct
-    ci = Compiler.typeinf_ext_toplevel(drv_interp(), drv_mi(drv_try, 4), Compiler.SOURCE_MODE_ABI)
-    @test ci isa Core.CodeInstance && ci.rettype === Int
+    @test ci isa Core.CodeInstance
+    @test ci.rettype === Int
+    @test invoke(drv_try, ci, 5) == 2          # normal path through the real ABI
+    @test invoke(drv_try, ci, 0) == -1         # handler path through the real ABI
+    @test get(pipeline_stats().fallbacks, :typed_exit, 0) == 0
+    @test pipeline_stats().unified >= 1
     @test drv_try(5) == 2 && drv_try(0) == -1
     ci = unified_typeinf(drv_interp(), drv_mi(drv_gen, 1), CC.SOURCE_MODE_ABI)
     @test ci === nothing
@@ -150,10 +153,10 @@ end
     ci = unified_typeinf(drv_interp(), drv_mi(Base.invokelatest(getglobal, @__MODULE__, :drv_fresh_ledger), 1),
                          CC.SOURCE_MODE_ABI)
     @test ci isa Core.CodeInstance
-    # a fresh try/catch body (the cached drv_try would be served from the
-    # global cache without a pass)
-    @eval drv_fresh_try(x) = try; div(12, x); catch; -2; end
-    unified_typeinf(drv_interp(), drv_mi(Base.invokelatest(getglobal, @__MODULE__, :drv_fresh_try), 4),
+    # a fresh generated body: the remaining decline class (try/catch now
+    # compiles through the unified pipeline)
+    @eval @generated drv_fresh_gen(x) = :(x + 5)
+    unified_typeinf(drv_interp(), drv_mi(Base.invokelatest(getglobal, @__MODULE__, :drv_fresh_gen), 4),
                     CC.SOURCE_MODE_ABI)
     st1 = pipeline_stats()
     @test st1.unified == 1
@@ -176,7 +179,7 @@ end
     gsum(100) == 5050 || exit(1)
     gbranch(x) = x > 10 ? "big" : x > 0 ? "small" : "neg"
     (gbranch(11) == "big" && gbranch(5) == "small" && gbranch(-1) == "neg") || exit(2)
-    gtry(x) = try; div(10, x); catch; -1; end      # try/catch: per-body fallback
+    gtry(x) = try; div(10, x); catch; -1; end      # try/catch: unified EH exit (A4)
     (gtry(5) == 2 && gtry(0) == -1) || exit(3)
     join(sort([3, 1, 2]), "-") == "1-2-3" || exit(4)
     stats = U.pipeline_stats()

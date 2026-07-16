@@ -60,7 +60,13 @@ println("\n== standard bodies ==")
 totbad += measure("gcd", Base.gcd, Any[Int, Int])[4]
 totbad += measure("_gcd", Base._gcd, Any[Int, Int])[4]
 totbad += measure("countlines kw", Base.var"#countlines#389", Any[Char, typeof(countlines), IOStream])[4]
+# the TypeEgal'd closure-tuple specialization shape (originally mined from a
+# session against the pre-carrier UnifiedCompiler package, whose gensym'd
+# closure type no longer exists — any closure type preserves the shape)
+_fresh_clo = let c = 1
+    x -> x + c
+end
 totbad += measure("code_lowered kw", Base.var"#code_lowered#201",
-                  Any[Bool, Symbol, typeof(code_lowered), Core.TypeEgal{Tuple{Base.UnifiedCompiler.var"#134#135", Int64}}])[4]
+                  Any[Bool, Symbol, typeof(code_lowered), Core.TypeEgal{Tuple{typeof(_fresh_clo), Int64}}])[4]
 
 println("\nBUG-CLASS RESIDUALS TOTAL: ", totbad, totbad == 0 ? "  (acceptance: PASS)" : "  (acceptance: FAIL)")
