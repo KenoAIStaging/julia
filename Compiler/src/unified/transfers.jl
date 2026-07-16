@@ -134,6 +134,125 @@ function global_is_const_defined(st::UInferState, mod::Module, name::Symbol)
     return isconst(mod, name) && isdefined(mod, name)
 end
 
+"""The `global_assignment_rt_exct` port (frame-free): the stored-value rt and
+exception type of assigning `vl` to the binding, from its partition kind at
+the inference world (guard → ErrorException; const/import → error; typed
+global → TypeError unless the value type fits). Records the binding edge in
+driver mode."""
+function global_assign_rt_exct(st::UInferState, M::Module, s::Symbol, @nospecialize(vl))
+    col = st.edges
+    try
+        b = convert(Core.Binding, GlobalRef(M, s))
+        partition = CC.lookup_binding_partition(st.cfg.world, b)
+        if col !== nothing
+            clamp_world!(col, partition.min_world, partition.max_world)
+            record_binding!(col, b)
+        end
+        kind = CC.binding_kind(partition)
+        if CC.is_some_guard(kind)
+            return (vl, ErrorException)
+        elseif CC.is_some_const_binding(kind) || CC.is_some_imported(kind)
+            # N.B.: backdating should not improve inference in an earlier world
+            return (kind == CC.PARTITION_KIND_BACKDATED_CONST ? vl : Union{}, ErrorException)
+        end
+        ty = kind == CC.PARTITION_KIND_DECLARED ? Any : CC.partition_restriction(partition)
+        wnew = CC.widenconst(widenucond(vl))
+        if !CC.hasintersect(wnew, ty)
+            return (Union{}, TypeError)
+        elseif !(wnew <: ty)
+            return (CC.tmeet(CC.fallback_lattice, widenucond(vl), ty), TypeError)
+        end
+        return (vl, Union{})
+    catch
+        col === nothing || (col.ok = false)
+        return (vl, Any)
+    end
+end
+
+"""The abstract_eval_get_binding_type port (frame-free): fold
+`Core.get_binding_type(M, s)` from the leaf partition kind (typed global →
+`Const(ty)`; const binding → `Const(Any)`; guard/declared → `Type`), with the
+binding edge recorded in driver mode. The fold makes `global x = 1`'s
+lowered convert-guard branch dead, like stock."""
+function infer_get_binding_type(fr::Frame, args::Vector{Any})::UResult
+    st = fr.st
+    if length(args) != 3 || CC.isvarargtype(args[end])
+        return UResult(Union{}, CC.EFFECTS_THROWS, ArgumentError)
+    end
+    ml = args[2]; sl = args[3]
+    if ml isa CC.Const && sl isa CC.Const
+        M = ml.val; s = sl.val
+        (M isa Module && s isa Symbol) ||
+            return UResult(Union{}, CC.EFFECTS_THROWS, TypeError)
+        col = st.edges
+        rt = try
+            b = convert(Core.Binding, GlobalRef(M, s))
+            partition = CC.lookup_binding_partition(st.cfg.world, b)
+            if col !== nothing
+                clamp_world!(col, partition.min_world, partition.max_world)
+            end
+            valid_worlds, (leaf_b, leaf_partition) =
+                CC.walk_binding_partition(b, partition, st.cfg.world)
+            if col !== nothing
+                clamp_world!(col, valid_worlds)
+                record_binding!(col, b)
+            end
+            kind = CC.binding_kind(leaf_partition)
+            if CC.is_some_guard(kind) || kind == CC.PARTITION_KIND_DECLARED
+                Type
+            elseif CC.is_some_const_binding(kind)
+                CC.Const(Any)
+            else
+                CC.Const(CC.partition_restriction(leaf_partition))
+            end
+        catch
+            col === nothing || (col.ok = false)
+            Type
+        end
+        return UResult(rt, CC.EFFECTS_TOTAL, Union{})
+    end
+    wM = CC.widenconst(widenucond(ml)); wS = CC.widenconst(widenucond(sl))
+    if !(CC.hasintersect(wM, Module) && CC.hasintersect(wS, Symbol))
+        return UResult(Union{}, CC.EFFECTS_THROWS, TypeError)
+    end
+    nothrow = wM <: Module && wS <: Symbol
+    return UResult(Type, CC.Effects(CC.EFFECTS_TOTAL; nothrow),
+                   nothrow ? Union{} : TypeError)
+end
+
+"The abstract_eval_setglobal! port: `args = [setglobal!, M, s, v(, order)]`."
+function infer_setglobal(fr::Frame, args::Vector{Any})::UResult
+    st = fr.st
+    if !(4 <= length(args) <= 5) || CC.isvarargtype(args[end])
+        return UResult(Union{}, CC.EFFECTS_THROWS, ArgumentError)
+    end
+    order_exct = Union{}
+    if length(args) == 5
+        order_exct = try
+            CC.global_order_exct(args[5], #=loading=#false, #=storing=#true)
+        catch
+            Any
+        end
+    end
+    ml = args[2]; sl = args[3]; vl = args[4]
+    local rt, exct
+    if ml isa CC.Const && sl isa CC.Const && ml.val isa Module && sl.val isa Symbol
+        rt, exct = global_assign_rt_exct(st, ml.val::Module, sl.val::Symbol, vl)
+    else
+        wM = CC.widenconst(widenucond(ml)); wS = CC.widenconst(widenucond(sl))
+        if !(CC.hasintersect(wM, Module) && CC.hasintersect(wS, Symbol))
+            return UResult(Union{}, CC.EFFECTS_THROWS, TypeError)
+        elseif wM <: Module && wS <: Symbol
+            rt, exct = vl, ErrorException
+        else
+            rt, exct = vl, Union{TypeError, ErrorException}
+        end
+    end
+    exct = exct === Any ? Any : Union{exct, order_exct}
+    eff = CC.Effects(CC.setglobal!_effects; nothrow = exct === Union{})
+    return UResult(rt, eff, exct)
+end
+
 """Record statement effects (and its raisable exception type) and fold them
 into the frame accumulators: non-const global reads among the statement's own
 operands merge their partition-load effects first; the flag column gets the
@@ -142,11 +261,27 @@ function note_effects!(fr::Frame, s::StmtId, e::CC.Effects, @nospecialize(exct))
     ir = fr.ir
     for i in 1:UnifiedIR.nops(ir, s)
         o = UnifiedIR.getop(ir, s, i)
-        if UnifiedIR.optag(o) == UnifiedIR.TAG_GLOBAL
+        t = UnifiedIR.optag(o)
+        if t == UnifiedIR.TAG_GLOBAL
             g = ir.body.globals[UnifiedIR.payload(o)]
             rte = global_rte(fr.st, g.mod, g.name)
             e = CC.merge_effects(e, rte.effects)
             exct = exct === Any ? Any : CC.tmerge(CC.fallback_lattice, exct, rte.exct)
+        elseif t == UnifiedIR.TAG_CONST
+            # a literal referencing mutable memory (QuoteNode'd Ref, closure
+            # box) makes that memory reachable without an argument: not
+            # inaccessiblememonly (stock abstract_eval_special_value, #52531)
+            v = ir.body.constants[UnifiedIR.payload(o)]
+            CC.is_mutation_free_argtype(typeof(v)) ||
+                (e = CC.merge_effects(e, MUTABLE_LITERAL_EFFECTS))
+        elseif t == UnifiedIR.TAG_SPARAM
+            # an undefined static parameter read throws UndefVarError
+            # (stock abstract_eval_static_parameter)
+            if sparam_maybe_undef(ir, Int(UnifiedIR.payload(o)))
+                e = CC.Effects(e; nothrow = false)
+                exct = exct === Any ? Any :
+                       CC.tmerge(CC.fallback_lattice, exct, UndefVarError)
+            end
         end
     end
     # a nothrow statement raises nothing; a throwing one raises at least *something*
@@ -155,6 +290,24 @@ function note_effects!(fr::Frame, s::StmtId, e::CC.Effects, @nospecialize(exct))
     fr.effects = CC.merge_effects(fr.effects, e)
     exct === Union{} || note_thrown!(fr, exct)
     return nothing
+end
+
+const MUTABLE_LITERAL_EFFECTS =
+    CC.Effects(CC.EFFECTS_TOTAL; inaccessiblememonly = CC.ALWAYS_FALSE)
+
+"Is static parameter `i` possibly undefined at runtime (`sptypes[i].undef`)?"
+function sparam_maybe_undef(ir::UnifiedIR.IR, i::Int)
+    und = get(ir.meta, :sptypes_undef, nothing)
+    if und isa Vector{Bool}
+        return 1 <= i <= length(und) ? und[i] : true
+    end
+    # no decoded undef information: sound only when assumed-undefined; but
+    # a plain-value sparam (the common fully-specialized case) is defined
+    if 1 <= i <= length(ir.sptypes)
+        sp = ir.sptypes[i]
+        return sp isa Core.SimpleVector || sp isa TypeVar
+    end
+    return true
 end
 
 # ---------------------------------------------------------------------------
@@ -783,6 +936,10 @@ function infer_call(fr::Frame, args::Vector{Any})::UResult
             return UResult(Union{}, CC.EFFECTS_THROWS, exct)
         elseif f === Core.throw_methoderror
             return UResult(Union{}, CC.EFFECTS_THROWS, MethodError)
+        elseif f === setglobal!
+            return infer_setglobal(fr, args)
+        elseif f === Core.get_binding_type
+            return infer_get_binding_type(fr, args)
         end
         # module-global reads: builtin_tfunction(sv=nothing) cannot consult
         # bindings; fold here (the abstract_eval_globalref port)
@@ -1340,16 +1497,43 @@ function method_src(m::Method, mi::Core.MethodInstance, world::UInt,
     end
 end
 
+"Static-parameter indices read in statement position by lowered source (the
+entry converter aliases such reads away, losing their maybe-undef throw)."
+function sparam_statement_reads(ci::Core.CodeInfo)
+    out = Int[]
+    for st in ci.code
+        if st isa Expr && st.head === :static_parameter
+            n = st.args[1]
+            n isa Int && push!(out, n)
+        end
+    end
+    return out
+end
+
 function convert_src(srcci::Core.CodeInfo, m::Method, mi::Core.MethodInstance)
     try
         ir = codeinfo_to_ir(srcci; nargs = Int(m.nargs), name = m.name)
         ir.sptypes = Any[t for t in mi.sparam_vals]
         ir.meta[:sptypes_lat] = sptypes_lattice(mi)
+        und = sptypes_undef(mi)
+        und === nothing || (ir.meta[:sptypes_undef] = und)
+        let reads = sparam_statement_reads(srcci)
+            isempty(reads) || (ir.meta[:sparam_reads] = reads)
+        end
         ir.meta[:mi] = mi     # sp_type_rewrap context for foreigncall rts
         ir.meta[:propagate_inbounds] = srcci.propagate_inbounds
         return ir
     catch e
         e isa UnsupportedIR || rethrow()
+        return nothing
+    end
+end
+
+"Per-sparam maybe-undefined-at-runtime bits (stock `sptypes[i].undef`)."
+function sptypes_undef(mi::Core.MethodInstance)
+    try
+        return Bool[vs.undef for vs in CC.sptypes_from_meth_instance(mi)]
+    catch
         return nothing
     end
 end

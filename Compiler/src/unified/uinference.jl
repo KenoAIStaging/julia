@@ -243,6 +243,8 @@ mutable struct Frame
                                           # (their value cannot reach the result:
                                           # no frame consistency taint — the stock
                                           # post-opt boundscheck rule, at inference)
+    exc_read::Set{Int32}                  # handler regions reading their exception
+                                          # value (stock's :the_exception consistency taint)
     propagate_inbounds::Bool              # src.propagate_inbounds (meta)
 end
 
@@ -296,7 +298,7 @@ function Frame(ir::UnifiedIR.IR, st::UInferState, env::Vector{Any})
                fill(~UInt32(0), length(env)), Any[Union{}], frame_override(ir),
                Set{Int32}(), nothing,
                Dict{Int32,Vector{Any}}(), Dict{Int32,Any}(), Dict{Int32,CC.Effects}(),
-               Set{Int32}(), Set{Int32}(), Set{Int32}(), Set{Int32}(),
+               Set{Int32}(), Set{Int32}(), Set{Int32}(), Set{Int32}(), Set{Int32}(),
                get(ir.meta, :propagate_inbounds, false) === true)
     # One structural scan (positions do not change during inference):
     #   - escape discipline (§5.7): a closure value that flows anywhere but
@@ -336,6 +338,12 @@ function Frame(ir::UnifiedIR.IR, st::UInferState, env::Vector{Any})
                 (k === K"call" && j == UnifiedIR.nops(ir, s) && j >= 4 &&
                  is_boundscheck_callee(static_operand_value(ir, UnifiedIR.getop(ir, s, 1)))) ||
                     push!(bcdirty, d.id)
+            elseif dk === K"region_arg"
+                # a use of a handler's exception argument: the caught value's
+                # identity is inconsistent (stock's :the_exception rule)
+                rid = UnifiedIR.stmt_region(ir, d)
+                reg = UnifiedIR.getregion(ir, rid)
+                reg.kind === UnifiedIR.REGION_HANDLER && push!(fr.exc_read, rid.id)
             end
             if dk === K"closure"
                 (k === K"call" && j == 1) || push!(fr.closure_escaped, d.id)
@@ -467,6 +475,21 @@ function infer_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
         t = fr.env[i]
         t === nothing && continue
         UnifiedIR.set_type!(ir, s, widenucond(t))
+    end
+    # statement-position static-parameter reads elided by the entry converter:
+    # a maybe-undefined one throws UndefVarError at runtime (stock
+    # abstract_eval_static_parameter; operand-position reads are handled per
+    # statement in note_effects!)
+    let reads = get(ir.meta, :sparam_reads, nothing)
+        if reads isa Vector{Int}
+            for n in reads
+                if sparam_maybe_undef(ir, n)
+                    fr.effects = CC.Effects(fr.effects; nothrow = false)
+                    note_thrown!(fr, UndefVarError)
+                    break
+                end
+            end
+        end
     end
     rt = fr.rettype === nothing ? Union{} : fr.rettype
     if rt isa UCond
@@ -916,6 +939,11 @@ function infer_try!(fr::Frame, s::StmtId)
             h = UnifiedIR.getregion(ir, rs[2])
             for (i, a) in enumerate(h.args)
                 fr.env[a.id] = i == 1 ? thrown : Any   # %exc
+            end
+            if rs[2].id in fr.exc_read
+                # the handler reads the caught value: its identity depends on
+                # the dynamic environment (stock's :the_exception taint)
+                fr.effects = CC.Effects(fr.effects; consistent = CC.ALWAYS_FALSE)
             end
             # throw-edge rule: the handler may run after any prefix of the
             # body, so refinements of cells the body stores are invalid there

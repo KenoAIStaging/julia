@@ -119,6 +119,28 @@ struct DriverResult
     const_flags::UInt8              # stock encoding: 0x2 rettype_const set, 0x3 const ABI
 end
 
+"""Per-axis upward refinement of the inference-time ipo effects with the
+post-optimization recompute (stock `refine_effects!` semantics: an axis only
+improves when the optimized body PROVES the better value — both computations
+are sound for the emitted body, so taking the better bit per axis is too)."""
+function refine_post_opt(base::Compiler.Effects, post::Compiler.Effects)
+    return Compiler.Effects(base;
+        consistent = post.consistent === Compiler.ALWAYS_TRUE ?
+            Compiler.ALWAYS_TRUE : base.consistent,
+        effect_free = post.effect_free === Compiler.ALWAYS_TRUE ?
+            Compiler.ALWAYS_TRUE : base.effect_free,
+        nothrow = base.nothrow | post.nothrow,
+        terminates = base.terminates | post.terminates,
+        notaskstate = base.notaskstate | post.notaskstate,
+        inaccessiblememonly = post.inaccessiblememonly === Compiler.ALWAYS_TRUE ?
+            Compiler.ALWAYS_TRUE : base.inaccessiblememonly,
+        noub = post.noub === Compiler.ALWAYS_TRUE ? Compiler.ALWAYS_TRUE :
+            (post.noub === Compiler.NOUB_IF_NOINBOUNDS &&
+             base.noub === Compiler.ALWAYS_FALSE ? Compiler.NOUB_IF_NOINBOUNDS :
+             base.noub),
+        nortcall = base.nortcall | post.nortcall)
+end
+
 "Encode the collector's records as a stock-format CodeInstance edges vector:
 Binding edges, then per-lookup MethodMatchInfo encodings (mi_edge=true, so
 backedges land on MethodInstances — the unified pipeline creates no callee
@@ -215,6 +237,12 @@ function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInsta
     uir.meta[:propagate_inbounds] = src0.propagate_inbounds
     uir.sptypes = Any[t for t in mi.sparam_vals]
     uir.meta[:sptypes_lat] = sptypes_lattice(mi)
+    let und = sptypes_undef(mi)
+        und === nothing || (uir.meta[:sptypes_undef] = und)
+    end
+    let reads = sparam_statement_reads(src0)
+        isempty(reads) || (uir.meta[:sparam_reads] = reads)
+    end
 
     st = UInferState(UInferConfig(; world,
         max_methods = Compiler.InferenceParams(interp).max_methods,
@@ -224,10 +252,23 @@ function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInsta
     argl = method_arglattice(def, mi, Any[])
     argl === nothing && return Fallback(:arglattice)
 
-    local rt
+    local rt, effects, exct
     try
         infer_ir!(uir, copy(argl); state = st)
-        optimize && (uir = optimize_ir!(uir, argl; state = st, inline = true))
+        # the ipo effects baseline is the INFERENCE-time frame effects with
+        # the method-level `@assume_effects` override (stock's finish order);
+        # the optimizer's recompute below only REFINES it upward — a
+        # recompute over the inlined body can lose callee-override precision
+        # (inlining dissolves the callee frames the overrides applied to)
+        effects = apply_effects_override(def, frame_effects_meta(uir))
+        exct = get(uir.meta, :exct, Any)
+        if optimize
+            uir = optimize_ir!(uir, argl; state = st, inline = true)
+            # stock's ipo_dataflow_analysis!/refine_effects! analog: the
+            # post-optimization body (branches folded, dead throws gone)
+            # re-inferred; upgrade any axis it proves
+            effects = refine_post_opt(effects, frame_effects_meta(uir))
+        end
         rt = get(uir.meta, :rettype, Any)
     catch err
         err isa UnsupportedIR || return Fallback(:inference_error, err)
@@ -235,12 +276,6 @@ function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInsta
     end
     rt = sanitize_intercond(def, rt)
     rt isa UInterCond && (rt = Bool)
-    # frame effects: `infer_ir!` published the full `Compiler.Effects` (rt-based
-    # adjustments applied; when `optimize` ran, the meta reflects the OPTIMIZED
-    # body — branch folding/DCE refinement, stock's post-opt analysis analog);
-    # the method-level `@assume_effects` override goes on top, stock's order
-    effects = apply_effects_override(def, frame_effects_meta(uir))
-    exct = get(uir.meta, :exct, Any)
     Compiler.is_nothrow(effects) && (exct = Union{})
 
     src = nothing
