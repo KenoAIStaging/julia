@@ -1744,7 +1744,14 @@ caller of the same widened shape — a miscompile, not just imprecision
 (`(x * 1.0) * 10` once folded the `10` to the first multiply's `1.0` through
 exactly that collision in the promote/indexed_iterate chain)."""
 function const_key_elem(@nospecialize(a))
-    a isa CC.Const && return (0x0, a.val)
+    if a isa CC.Const
+        v = a.val
+        # mutable payloads key by IDENTITY: `:consistent`-cy (the concrete-eval
+        # license) is an egal contract — two isequal-but-not-egal Dicts must
+        # not share a memoized fold (objectid of immutables is content-based,
+        # so the extra component is inert for them)
+        return (0x0, v, ismutable(v) ? objectid(v) : nothing)
+    end
     if a isa CC.PartialStruct
         enc = Vector{Any}(undef, length(a.fields))
         for (i, f) in enumerate(a.fields)
@@ -1779,15 +1786,7 @@ function const_key(mi::Core.MethodInstance, args::Vector{Any})
     return t
 end
 
-"""Is a Const payload egal-stable, i.e. does egality pin its contents? Types,
-symbols, strings (content-egal) and modules qualify despite the mutable flag;
-identity-egal mutable objects (arrays, Refs) do not — a concrete evaluation
-over them could bake in mutable state."""
-egal_stable(@nospecialize(v)) =
-    !ismutable(v) || v isa Union{Type, Symbol, String, Module, Method,
-                                 Core.MethodInstance, Core.CodeInstance}
-
-"""The concrete_eval_call port: when every argument is an egal-stable Const
+"""The concrete_eval_call port: when every argument is a Const
 and the callee's own (widened, context-free) inferred effects satisfy stock's
 `_concrete_eval_eligible` criteria — `is_foldable(effects, check_rtcall=true)`,
 plus nothrow under `--check-bounds=no` — evaluate the call for real and
@@ -1809,10 +1808,11 @@ function concrete_eval(fr::Frame, match::Core.MethodMatch, args::Vector{Any},
     argvals = Vector{Any}(undef, length(args) - 1)
     for i in 2:length(args)
         a = args[i]
+        # any Const qualifies (stock's is_all_const_arg): the callee's proven
+        # :consistent-cy is exactly the license to evaluate over the argument
+        # objects, mutable ones included
         a isa CC.Const || return nothing
-        v = (a::CC.Const).val
-        egal_stable(v) || return nothing
-        argvals[i - 1] = v
+        argvals[i - 1] = (a::CC.Const).val
     end
     # the callee's effects come from its widened frame (memoized; computed
     # once per mi). Foldable implies a clean, converged, cutoff-free frame:
