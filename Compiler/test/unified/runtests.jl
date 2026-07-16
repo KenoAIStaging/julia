@@ -140,6 +140,21 @@ end
     @test Base.invokelatest(g, 5) == callpt(5)
 end
 
+@testset "const memo keys pin PartialStruct seeds exactly" begin
+    # regression: the const-seeded memo used to key PartialStruct arguments
+    # by their widenconst, replaying the first caller's field-precise answer
+    # (indexed_iterate of the promote pair) for every same-shaped caller —
+    # `(x * 1.0) * 10` folded the 10 into the first multiply's 1.0
+    twomul(x) = (x * 1.0) * 10
+    st = UnifiedCompiler.UInferState()
+    ir = UnifiedCompiler.lowered_ir(twomul, Tuple{Int64})
+    ir = UnifiedCompiler.optimize_ir!(ir, Any[CC.Const(twomul), Int64]; state = st)
+    g = UnifiedCompiler.define_ir_method!(@__MODULE__, gensym(:twomul), 2, ir)
+    @test Base.invokelatest(g, 5) === 50.0
+    rt = UnifiedCompiler.infer_return(twomul, Any[CC.Const(4)])
+    @test !(rt isa CC.Const) || rt.val === 40.0
+end
+
 @testset "queries (§8.5)" begin
     @test UnifiedCompiler.infer_return(compute, Any[Int64]) == Int64
     rc = UnifiedCompiler.infer_return(compute, Any[CC.Const(4)])

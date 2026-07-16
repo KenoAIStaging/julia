@@ -1266,12 +1266,40 @@ function apply_effects_override(m::Method, fx::UInt32)
     return fx
 end
 
+"""Key-encode one argument lattice element for the const memo, or nothing
+when the element carries information the key cannot capture. The key MUST
+pin the seed exactly: the memoized result was computed at this precise
+lattice element, so a key that widens (e.g. a PartialStruct keyed by its
+widenconst) would replay one caller's field-precise answer for every other
+caller of the same widened shape — a miscompile, not just imprecision
+(`(x * 1.0) * 10` once folded the `10` to the first multiply's `1.0` through
+exactly that collision in the promote/indexed_iterate chain)."""
+function const_key_elem(@nospecialize(a))
+    a isa CC.Const && return (0x0, a.val)
+    if a isa CC.PartialStruct
+        enc = Vector{Any}(undef, length(a.fields))
+        for (i, f) in enumerate(a.fields)
+            e = const_key_elem(f)
+            e === nothing && return nothing
+            enc[i] = e
+        end
+        return (0x2, CC.widenconst(a), CC._getundefs(a), (enc...,))
+    end
+    a isa Type && return (0x1, a)
+    CC.isvarargtype(a) && return (0x1, a)
+    # UCond/UInterCond/other extended elements: context-dependent seeds the
+    # key cannot soundly identify — skip memoization for such frames
+    return nothing
+end
+
 "Hashable memo key for a const-seeded frame, or nothing."
 function const_key(mi::Core.MethodInstance, args::Vector{Any})
     key = Vector{Any}(undef, length(args) + 1)
     key[1] = mi
     for (i, a) in enumerate(args)
-        key[i + 1] = a isa CC.Const ? (0x0, a.val) : (0x1, CC.widenconst(a))
+        e = const_key_elem(a)
+        e === nothing && return nothing
+        key[i + 1] = e
     end
     t = (key...,)
     try
