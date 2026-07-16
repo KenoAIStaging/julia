@@ -1326,6 +1326,12 @@ typeinf_code(interp::AbstractInterpreter, method::Method, @nospecialize(atype), 
              run_optimizer::Bool) =
     typeinf_code(interp, specialize_method(method, atype, sparams), run_optimizer)
 function typeinf_code(interp::AbstractInterpreter, mi::MethodInstance, run_optimizer::Bool)
+    let hooks = unified_hooks(interp)
+        if hooks !== nothing
+            src = hooks.typeinf_code(interp, mi, run_optimizer)
+            src isa CodeInfo && return src
+        end
+    end
     frame = typeinf_frame(interp, mi, run_optimizer)
     frame === nothing && return nothing
     return frame.src
@@ -1487,6 +1493,32 @@ function ci_meets_requirement(interp::AbstractInterpreter, code::CodeInstance, s
     source_mode == SOURCE_MODE_ABI && return ci_has_abi(interp, code)
     source_mode == SOURCE_MODE_GET_SOURCE && return ci_has_source(interp, code)
     return false
+end
+
+# Unified-pipeline hook (Compiler.Unified driver; see Compiler/src/unified/driver.jl).
+# When a hook object is installed, the standard entry points (`typeinf_ext_toplevel`,
+# `typeinf_code`, `_infer_effects`, `_infer_exception_type`) consult it for
+# `NativeInterpreter`-based requests; a `nothing` result from a hook function (or no
+# hook installed) means the stock path below runs unchanged — that is the per-body
+# fallback contract. Custom `AbstractInterpreter`s always take the stock path (v0
+# scope). Each field holds a function; the object is `Any`-typed so this file needs
+# no knowledge of the lazily loaded unified compiler:
+#   typeinf_ext_toplevel(interp, mi, source_mode) -> Union{Nothing,CodeInstance}
+#   typeinf_code(interp, mi, run_optimizer)       -> Union{Nothing,CodeInfo}
+#   infer_effects(interp, tt, optimize)           -> Union{Nothing,Effects}
+#   infer_exception_type(interp, tt, optimize)    -> Union{Nothing,Type}
+struct UnifiedHooks
+    typeinf_ext_toplevel::Any
+    typeinf_code::Any
+    infer_effects::Any
+    infer_exception_type::Any
+end
+const UNIFIED_HOOKS = RefValue{Any}(nothing)
+
+@inline function unified_hooks(interp::AbstractInterpreter)
+    hooks = UNIFIED_HOOKS[]
+    (hooks !== nothing && isa(interp, NativeInterpreter)) || return nothing
+    return hooks::UnifiedHooks
 end
 
 # compute (and cache) an inferred AST and return type
@@ -1758,6 +1790,12 @@ function add_codeinsts_to_jit!(interp::AbstractInterpreter, ci, source_mode::UIn
 end
 
 function typeinf_ext_toplevel(interp::AbstractInterpreter, mi::MethodInstance, source_mode::UInt8)
+    let hooks = unified_hooks(interp)
+        if hooks !== nothing
+            ci = hooks.typeinf_ext_toplevel(interp, mi, source_mode)
+            ci isa CodeInstance && return ci
+        end
+    end
     mi2 = ccall(:jl_normalize_to_compilable_mi, Any, (Any,), mi)::MethodInstance
     ci = typeinf_ext(interp, mi2, source_mode)
     ci = add_codeinsts_to_jit!(interp, ci, source_mode)

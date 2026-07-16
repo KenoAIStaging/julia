@@ -7,6 +7,12 @@ _may_throw_methoderror(matches::MethodLookupResult) =
     matches.ambig || !any(match::Core.MethodMatch->match.fully_covers, matches.matches)
 
 function _infer_exception_type(interp::AbstractInterpreter, @nospecialize(tt), optimize::Bool)
+    let hooks = unified_hooks(interp)
+        if hooks !== nothing
+            result = hooks.infer_exception_type(interp, tt, optimize)
+            result === nothing || return result
+        end
+    end
     matches = _findall_matches(interp, tt)
     matches === nothing && return nothing
     exct = Union{}
@@ -24,6 +30,12 @@ function _infer_exception_type(interp::AbstractInterpreter, @nospecialize(tt), o
 end
 
 function _infer_effects(interp::AbstractInterpreter, @nospecialize(tt), optimize::Bool)
+    let hooks = unified_hooks(interp)
+        if hooks !== nothing
+            result = hooks.infer_effects(interp, tt, optimize)
+            result isa Effects && return result
+        end
+    end
     matches = _findall_matches(interp, tt)
     matches === nothing && return nothing
     effects = EFFECTS_TOTAL
