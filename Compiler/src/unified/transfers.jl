@@ -444,6 +444,9 @@ elided by an `@inbounds` inlining context — so `noub = ALWAYS_FALSE` (from the
 unprovable-inbounds argument type) refines to the conditional bit."""
 function refine_bc_noub(fr::Frame, s::StmtId, e::CC.Effects)
     e.noub === CC.ALWAYS_FALSE || return e
+    # a body with (dropped) @inbounds markers: the boundscheck value may be
+    # pinned false by other compilations — no conditional promise
+    fr.has_inbounds && return e
     ir = fr.ir
     n = UnifiedIR.nops(ir, s)
     n >= 4 || return e
@@ -456,14 +459,17 @@ end
 
 """The stock callsite NOUB_IF_NOINBOUNDS resolution (abstract_eval_basic_
 statement): a callee's conditional noub refers to the callee's own
-`@boundscheck` blocks — when this frame does not propagate inbounds, those
-blocks are never elided through us, so the callee promise is unconditional
-here. (The `IR_FLAG_INBOUNDS` demotion half is inapplicable: the unified
-entry converter drops `@inbounds` markers, i.e. the unified pipeline never
-elides boundschecks — @inbounds is permission, not mandate.)"""
+`@boundscheck` blocks. When this frame contains `@inbounds` markers (which
+the entry converter drops, so we cannot tell WHICH callsites they cover),
+any callee's blocks may be elided by other compilations of this body —
+including the stock-compiled code that concrete evaluation executes — so
+the conditional demotes to ALWAYS_FALSE (stock's IR_FLAG_INBOUNDS branch,
+body-granular). Otherwise, when the frame does not propagate inbounds, the
+blocks are never elided through us and the promise is unconditional."""
 function callsite_noub(fr::Frame, e::CC.Effects)
-    if e.noub === CC.NOUB_IF_NOINBOUNDS && !fr.propagate_inbounds
-        return CC.Effects(e; noub = CC.ALWAYS_TRUE)
+    if e.noub === CC.NOUB_IF_NOINBOUNDS
+        fr.has_inbounds && return CC.Effects(e; noub = CC.ALWAYS_FALSE)
+        fr.propagate_inbounds || return CC.Effects(e; noub = CC.ALWAYS_TRUE)
     end
     return e
 end
@@ -942,13 +948,31 @@ function infer_call(fr::Frame, args::Vector{Any})::UResult
             return infer_get_binding_type(fr, args)
         end
         # module-global reads: builtin_tfunction(sv=nothing) cannot consult
-        # bindings; fold here (the abstract_eval_globalref port)
-        if (f === getglobal || f === getfield) && 3 <= length(args) <= 5
+        # bindings; fold here (the abstract_eval_globalref/getglobal port)
+        if (f === getglobal && 3 <= length(args) <= 4) ||
+           (f === getfield && length(args) == 3)
             ml = args[2]; sl = args[3]
             if ml isa CC.Const && ml.val isa Module && sl isa CC.Const && sl.val isa Symbol
                 rte = global_rte(st, ml.val, sl.val)
-                return UResult(rte.rt, rte.effects, rte.exct)
+                eff = rte.effects
+                exct = rte.exct
+                if length(args) == 4
+                    # the memory-order argument may be invalid (stock's
+                    # global_order_exct merge)
+                    goe = try
+                        CC.global_order_exct(args[4], #=loading=#true, #=storing=#false)
+                    catch
+                        Any
+                    end
+                    if goe !== Union{}
+                        eff = CC.Effects(eff; nothrow = false)
+                        exct = exct === Any ? Any : CC.tmerge(CC.fallback_lattice, exct, goe)
+                    end
+                end
+                return UResult(rte.rt, eff, exct)
             end
+        elseif f === getglobal && !(2 <= length(args) <= 4)
+            return UResult(Union{}, CC.EFFECTS_THROWS, ArgumentError)
         end
         argl = args[2:end]
         rt = try
@@ -1227,19 +1251,28 @@ end
 lattices by running the `iterate` protocol abstractly. Phase 1 unrolls finite
 iterators precisely (guaranteed-present elements only); phase 2 folds the
 remainder into a `Vararg` tail at the widened state fixpoint. Returns
-`Any[Union{}]` when iteration provably throws or cannot terminate."""
+`(elems, effects, exct)` — the iterate calls' joined effects (stock merges
+them into the apply's, abstract_apply-style); `Any[Union{}]` elements mean
+iteration provably throws or cannot terminate."""
 function iterate_elements(fr::Frame, @nospecialize(x))
     lat = CC.fallback_lattice
     itf = CC.Const(Base.iterate)
-    r = infer_call(fr, Any[itf, x])
+    fx = CC.EFFECTS_TOTAL
+    exct = Union{}
+    join!(r::UResult) = begin
+        fx = CC.merge_effects(fx, r.effects)
+        exct = exct === Any ? Any : CC.tmerge(lat, exct, r.exct)
+        r
+    end
+    r = join!(infer_call(fr, Any[itf, x]))
     sod = widenucond(r.rt)               # state-or-done, precise
     sodw = CC.widenconst(sod)
-    sodw === Union{} && return Any[Union{}]   # not an iterator: throws
+    sodw === Union{} && return (Any[Union{}], fx, exct)   # not an iterator: throws
     elems = Any[]
     statetype = Union{}
     # phase 1: precise unroll while termination is impossible
     while true
-        sodw === Nothing && return elems      # provably exhausted (exact)
+        sodw === Nothing && return (elems, fx, exct)   # provably exhausted (exact)
         (Nothing <: sodw || length(elems) >= 32) && break
         (sodw isa DataType && sodw <: Tuple && !CC.isvatuple(sodw) &&
          length(sodw.parameters) == 2) || break
@@ -1251,10 +1284,10 @@ function iterate_elements(fr::Frame, @nospecialize(x))
         end
         # no new state information: the iterator cannot be finite (stock's
         # infinite-iteration rule — the apply never completes)
-        CC.:⊑(lat, nst, statetype) && return Any[Union{}]
+        CC.:⊑(lat, nst, statetype) && return (Any[Union{}], fx, exct)
         push!(elems, vt)
         statetype = nst
-        r = infer_call(fr, Any[itf, x, statetype])
+        r = join!(infer_call(fr, Any[itf, x, statetype]))
         sod = widenucond(r.rt)
         sodw = CC.widenconst(sod)
     end
@@ -1278,19 +1311,19 @@ function iterate_elements(fr::Frame, @nospecialize(x))
             # fixpoint (or the iterator failed / gave an invalid answer)
             if !CC.hasintersect(sodw, Nothing)
                 # ...and cannot terminate during this loop
-                may_have_terminated || return Any[Union{}]
+                may_have_terminated || return (Any[Union{}], fx, exct)
                 valtype = Union{}   # only completes if it ended before here
             end
             break
         end
         valtype = CC.tmerge(lat, valtype, nounion.parameters[1])
         statew = CC.tmerge(lat, statew, nounion.parameters[2])
-        r = infer_call(fr, Any[itf, x, statew])
+        r = join!(infer_call(fr, Any[itf, x, statew]))
         sod = widenucond(r.rt)
         sodw = CC.widenconst(sod)
     end
     valtype === Union{} || push!(elems, Vararg{CC.widenconst(valtype)})
-    return elems
+    return (elems, fx, exct)
 end
 
 "Core._apply_iterate(iterate, f, iters...): flatten precisely when possible."
@@ -1301,6 +1334,8 @@ function infer_apply(fr::Frame, args::Vector{Any})::UResult
     flat = Any[fl]
     exact = true
     precise = true
+    iterfx = CC.EFFECTS_TOTAL      # the iterate protocol's own effects
+    iterexct = Union{}
     for i in 4:length(args)
         a = args[i]
         if CC.isvarargtype(a)
@@ -1310,9 +1345,13 @@ function infer_apply(fr::Frame, args::Vector{Any})::UResult
         ce = container_elements(fr, a)
         if ce === nothing
             # not a tuple-shaped container: run the iterate protocol
-            # abstractly (user iterate methods ⇒ inexact, unknown effects)
-            elems = iterate_elements(fr, a)
+            # abstractly; its calls' effects merge into the apply's
+            # (stock abstract_apply)
+            elems, ifx, iexct = iterate_elements(fr, a)
             append!(flat, elems)
+            iterfx = CC.merge_effects(iterfx, ifx)
+            iterexct = iterexct === Any ? Any :
+                       CC.tmerge(CC.fallback_lattice, iterexct, iexct)
             exact = false
             continue
         end
@@ -1322,7 +1361,10 @@ function infer_apply(fr::Frame, args::Vector{Any})::UResult
     if !precise
         flat = Any[fl, Vararg{Any}]
         exact = false
-    else
+        iterfx = CC.Effects()      # unknowable iteration
+        iterexct = Any
+    end
+    if precise
         # fold a mid-list Vararg into a merged tail (stock's truncation rule)
         for k in 2:length(flat)
             if CC.isvarargtype(flat[k]) && k < length(flat)
@@ -1337,8 +1379,11 @@ function infer_apply(fr::Frame, args::Vector{Any})::UResult
     r = infer_call(fr, flat)
     # flattened positions do not map to caller operands: widen InterConditionals
     r.rt isa UInterCond && (r = UResult(Bool, r.effects, r.exct))
-    # non-tuple containers run user iterate methods with unknown effects
-    return exact ? r : UResult(r.rt, CC.Effects())
+    exact && return r
+    # non-tuple containers: the iterate calls' effects taint the apply
+    return UResult(r.rt, CC.merge_effects(r.effects, iterfx),
+                   iterexct === Any ? Any :
+                   CC.tmerge(CC.fallback_lattice, r.exct, iterexct))
 end
 
 # ---------------------------------------------------------------------------
@@ -1510,6 +1555,21 @@ function sparam_statement_reads(ci::Core.CodeInfo)
     return out
 end
 
+"Does the lowered source mark any statement `@inbounds`? Lowering encodes it
+as `IR_FLAG_INBOUNDS` in `ssaflags` (legacy sources: `Expr(:inbounds)`
+markers). The entry converter drops both, so this is the (body-granular)
+stand-in for stock's per-statement flag: within such a body, callee
+`@boundscheck` blocks may be elided by other compilations of this code."
+function source_has_inbounds(ci::Core.CodeInfo)
+    for flag in ci.ssaflags
+        (flag & CC.IR_FLAG_INBOUNDS) != 0 && return true
+    end
+    for st in ci.code
+        st isa Expr && st.head === :inbounds && return true
+    end
+    return false
+end
+
 function convert_src(srcci::Core.CodeInfo, m::Method, mi::Core.MethodInstance)
     try
         ir = codeinfo_to_ir(srcci; nargs = Int(m.nargs), name = m.name)
@@ -1522,6 +1582,7 @@ function convert_src(srcci::Core.CodeInfo, m::Method, mi::Core.MethodInstance)
         end
         ir.meta[:mi] = mi     # sp_type_rewrap context for foreigncall rts
         ir.meta[:propagate_inbounds] = srcci.propagate_inbounds
+        ir.meta[:has_inbounds] = source_has_inbounds(srcci)
         return ir
     catch e
         e isa UnsupportedIR || rethrow()

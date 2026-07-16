@@ -246,6 +246,10 @@ mutable struct Frame
     exc_read::Set{Int32}                  # handler regions reading their exception
                                           # value (stock's :the_exception consistency taint)
     propagate_inbounds::Bool              # src.propagate_inbounds (meta)
+    has_inbounds::Bool                    # source had @inbounds markers (meta; the
+                                          # entry converter drops them, so callee
+                                          # boundschecks may be elided by OTHER
+                                          # compilations of this body)
 end
 
 """May the `latestworld` statement `L` execute after the creation of closure
@@ -299,7 +303,8 @@ function Frame(ir::UnifiedIR.IR, st::UInferState, env::Vector{Any})
                Set{Int32}(), nothing,
                Dict{Int32,Vector{Any}}(), Dict{Int32,Any}(), Dict{Int32,CC.Effects}(),
                Set{Int32}(), Set{Int32}(), Set{Int32}(), Set{Int32}(), Set{Int32}(),
-               get(ir.meta, :propagate_inbounds, false) === true)
+               get(ir.meta, :propagate_inbounds, false) === true,
+               get(ir.meta, :has_inbounds, false) === true)
     # One structural scan (positions do not change during inference):
     #   - escape discipline (§5.7): a closure value that flows anywhere but
     #     the callee position of a call escapes — unknown callers, and after

@@ -188,6 +188,14 @@ function canonicalize_getfields!(ir::UnifiedIR.IR)
         (nop == 3 || nop == 4) || continue
         callee = static_operand_value(ir, UnifiedIR.getop(ir, s, 1))
         callee === Core.getfield || callee === Base.getfield || continue
+        if nop == 4
+            # the trailing operand (boundscheck flag or memory order) is
+            # dropped by the conversion: only legal when it provably does not
+            # change behavior — a Bool literal or :not_atomic (an INVALID
+            # order symbol makes the original getfield throw)
+            extra = static_operand_value(ir, UnifiedIR.getop(ir, s, 4))
+            (extra === true || extra === false || extra === :not_atomic) || continue
+        end
         vo = UnifiedIR.getop(ir, s, 2)
         UnifiedIR.optag(vo) == UnifiedIR.TAG_STMT || continue
         io = UnifiedIR.getop(ir, s, 3)
