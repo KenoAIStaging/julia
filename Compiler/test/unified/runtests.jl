@@ -320,6 +320,8 @@ include("ssaflags.jl")
 
 include("driver.jl")
 
+include("optimizer_parity.jl")
+
 include("port_ssair.jl")
 include("port_compact.jl")
 include("port_interpreter_exec.jl")

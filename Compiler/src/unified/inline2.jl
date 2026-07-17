@@ -395,7 +395,13 @@ function union_split_calls!(ir::UnifiedIR.IR, state::UInferState;
             comps = cs
             break
         end
-        j == 0 && continue
+        if j == 0
+            # no splittable Union argument: try the match-based split
+            # (abstract callsites — stock's union-split devirtualization
+            # with the method-error fallback edge)
+            match_split_call!(ir, s, state, ft, argts) && (nsplit += 1)
+            continue
+        end
         xop = UnifiedIR.getop(ir, s, j)
         T1 = comps[1]
         residual = length(comps) == 2 ? comps[2] : Union{comps[2:end]...}
@@ -422,4 +428,192 @@ function union_split_calls!(ir::UnifiedIR.IR, state::UInferState;
         nsplit += 1
     end
     return nsplit
+end
+
+# The single tested argument position for a match: exactly one position
+# whose static type is not already inside the match's signature slot (v1
+# emits one isa test per arm). Returns (position j in operand numbering,
+# narrowed type) or nothing.
+function match_test_position(@nospecialize(specT), argts::Vector{Any})
+    specT isa DataType || return nothing
+    ps = specT.parameters
+    length(ps) == length(argts) + 1 || return nothing
+    j = 0
+    local Tj
+    for i in 1:length(argts)
+        p = ps[i + 1]
+        p isa Type || return nothing
+        argts[i] <: p && continue
+        j == 0 || return nothing   # more than one tested position
+        j = i + 1
+        Tj = p
+    end
+    j == 0 && return nothing
+    return (j, Tj)
+end
+
+"""
+    match_split_call!(ir, s, st, ft, argts) -> Bool
+
+Union-split DEVIRTUALIZATION for abstract callsites (stock
+`ssair/inlining.jl` union splitting, the non-`Union`-argument face): a
+dynamic `call` whose full signature has ≤ 2 applicable methods (complete,
+unambiguous, edge-recorded `findall`) becomes an isa-dispatch:
+
+    %c = isa(x, T₁)                       # match₁'s tested position
+    %r = if %c { call f(x::refine T₁) }   # resolves to match₁ next round
+         else  { … }
+
+with the else arm one of: a direct `invoke` of match₂ (both-matches, sig
+fully covered — the else values provably dispatch there), a nested
+isa-guarded call of match₂ plus a `Core.throw_methoderror` arm (not
+covered), or the method-error call alone (single non-covering match).
+Soundness: the recorded match edge caps this body whenever the callee set
+changes; per-position `isa` tests decide tuple membership exactly because
+match signatures with free typevars (cross-position constraints) are
+refused; completeness of `findall` (not truncated) makes the residual
+dispatch-exact.
+"""
+function match_split_call!(ir::UnifiedIR.IR, s::StmtId, st::UInferState,
+                           @nospecialize(ft), argts::Vector{Any})
+    nop = UnifiedIR.nops(ir, s)
+    Base.any(t -> !(t isa Type) || CC.has_free_typevars(t), argts) && return false
+    sig = try
+        Tuple{ft, argts...}
+    catch
+        return false
+    end
+    world = st.cfg.world
+    result = try
+        CC.findall(sig, CC.InternalMethodTable(world); limit = 2)
+    catch
+        nothing
+    end
+    result === nothing && return false
+    result.ambig && return false
+    n = length(result.matches)
+    1 <= n <= 2 || return false
+    col = st.edges
+    col === nothing || record_call!(col, sig, result)
+    match1 = result.matches[1]::Core.MethodMatch
+    spec1 = match1.spec_types
+    CC.has_free_typevars(spec1) && return false
+    tp1 = match_test_position(spec1, argts)
+    tp1 === nothing && return false
+    j1, T1 = tp1
+    # the tested-arm call must become statically resolvable under the
+    # narrowed signature (method shadowing gives a single covering match)
+    sig1 = Tuple{ft, argts[1:j1-2]..., T1, argts[j1:end]...}
+    resolve_single_match(st, sig1) === nothing && return false
+    covered = false
+    local match2, spec2
+    if n == 2
+        match2 = result.matches[2]::Core.MethodMatch
+        spec2 = match2.spec_types
+        CC.has_free_typevars(spec2) && return false
+        covered = sig <: Union{spec1, spec2}
+    end
+    rt = UnifiedIR.stmt_type(ir, s)
+    callops = UnifiedIR.operands(ir, s)
+    xop1 = UnifiedIR.getop(ir, s, j1)
+    resused = UnifiedIR.use_counts(ir)[s.id] > 0
+    interp = st.cfg.interp
+    if covered
+        # else-arm values lie in spec2 minus spec1: dispatch-exact invoke
+        mi2 = try
+            CC.specialize_method(match2)
+        catch
+            return false
+        end
+        mi2 isa Core.MethodInstance || return false
+        tgt = ccall(:jl_normalize_to_compilable_mi, Any, (Any,), mi2)
+        tgt isa Core.MethodInstance || return false
+        (ci, _) = driver_ci_for_invoke(interp, tgt, true)
+        if ci isa Core.CodeInstance && col isa UEdges
+            clamp_world!(col, ci.min_world, ci.max_world) || (ci = nothing)
+        end
+        invtgt = ci === nothing ? tgt : ci
+        isacall = UnifiedIR.insert_before!(ir, s, K"call", UnifiedIR.vop(ir, isa),
+                                           xop1, UnifiedIR.vop(ir, T1);
+                                           type = Bool, flag = UnifiedIR.FLAG_PURE)
+        UnifiedIR.wrap_in_if!(ir, s, s, isacall; else_arm = (ir2, er) -> begin
+            iops = UnifiedIR.Operand[UnifiedIR.vop(ir2, invtgt)]
+            sp2 = spec2 isa DataType ? spec2.parameters : nothing
+            for i in 1:length(callops)
+                o = callops[i]
+                if sp2 !== nothing && i >= 2 && sp2[i] isa Type && !(argts[i-1] <: sp2[i])
+                    rx = UnifiedIR.push_stmt!(ir2, er, K"refine", o; type = sp2[i])
+                    o = UnifiedIR.op_stmt(rx)
+                end
+                push!(iops, o)
+            end
+            iv = UnifiedIR.push_stmt!(ir2, er, K"invoke", iops...; type = rt)
+            if resused
+                UnifiedIR.push_stmt!(ir2, er, K"result", UnifiedIR.op_stmt(iv))
+            else
+                UnifiedIR.push_stmt!(ir2, er, K"result")
+            end
+        end)
+    elseif n == 2
+        # not covered: nested isa guard for match2, then the method error
+        tp2 = match_test_position(spec2, argts)
+        tp2 === nothing && return false
+        j2, T2 = tp2
+        sig2 = Tuple{ft, argts[1:j2-2]..., T2, argts[j2:end]...}
+        resolve_single_match(st, sig2) === nothing && return false
+        xop2 = UnifiedIR.getop(ir, s, j2)
+        isacall = UnifiedIR.insert_before!(ir, s, K"call", UnifiedIR.vop(ir, isa),
+                                           xop1, UnifiedIR.vop(ir, T1);
+                                           type = Bool, flag = UnifiedIR.FLAG_PURE)
+        UnifiedIR.wrap_in_if!(ir, s, s, isacall; else_arm = (ir2, er) -> begin
+            c2 = UnifiedIR.push_stmt!(ir2, er, K"call", UnifiedIR.vop(ir2, isa),
+                                      xop2, UnifiedIR.vop(ir2, T2);
+                                      type = Bool, flag = UnifiedIR.FLAG_PURE)
+            nif = UnifiedIR.push_stmt!(ir2, er, K"if", UnifiedIR.op_stmt(c2);
+                                       type = rt)
+            a1 = UnifiedIR.new_region!(ir2, nif, UnifiedIR.REGION_ARM)
+            rx2 = UnifiedIR.push_stmt!(ir2, a1, K"refine", xop2; type = T2)
+            cops = copy(callops)
+            cops[j2] = UnifiedIR.op_stmt(rx2)
+            cc = UnifiedIR.push_stmt!(ir2, a1, K"call", cops...; type = rt)
+            if resused
+                UnifiedIR.push_stmt!(ir2, a1, K"result", UnifiedIR.op_stmt(cc))
+            else
+                UnifiedIR.push_stmt!(ir2, a1, K"result")
+            end
+            a2 = UnifiedIR.new_region!(ir2, nif, UnifiedIR.REGION_ARM)
+            th = UnifiedIR.push_stmt!(ir2, a2, K"call",
+                                      UnifiedIR.vop(ir2, Core.throw_methoderror),
+                                      callops...; type = Union{})
+            if resused
+                UnifiedIR.push_stmt!(ir2, a2, K"result", UnifiedIR.op_stmt(th))
+            else
+                UnifiedIR.push_stmt!(ir2, a2, K"result")
+            end
+            if resused
+                UnifiedIR.push_stmt!(ir2, er, K"result", UnifiedIR.op_stmt(nif))
+            else
+                UnifiedIR.push_stmt!(ir2, er, K"result")
+            end
+        end)
+    else
+        # single non-covering match: guarded call + the method error
+        isacall = UnifiedIR.insert_before!(ir, s, K"call", UnifiedIR.vop(ir, isa),
+                                           xop1, UnifiedIR.vop(ir, T1);
+                                           type = Bool, flag = UnifiedIR.FLAG_PURE)
+        UnifiedIR.wrap_in_if!(ir, s, s, isacall; else_arm = (ir2, er) -> begin
+            th = UnifiedIR.push_stmt!(ir2, er, K"call",
+                                      UnifiedIR.vop(ir2, Core.throw_methoderror),
+                                      callops...; type = Union{})
+            if resused
+                UnifiedIR.push_stmt!(ir2, er, K"result", UnifiedIR.op_stmt(th))
+            else
+                UnifiedIR.push_stmt!(ir2, er, K"result")
+            end
+        end)
+    end
+    # narrow the guarded call's argument inside the then-arm
+    rx1 = UnifiedIR.insert_before!(ir, s, K"refine", xop1; type = T1)
+    UnifiedIR.setop!(ir, s, j1, UnifiedIR.op_stmt(rx1))
+    return true
 end
