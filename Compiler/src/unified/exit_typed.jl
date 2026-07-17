@@ -425,6 +425,14 @@ function emit_tregion!(cx::TCtx, r::RegionId, jctx::Union{Nothing,JoinCtx})
             throw(UnsupportedIR("cell_shared in typed exit"))   # gated above
         else
             push!(cx.cur.items, s)
+            if UnifiedIR.stmt_type(ir, s) === Union{}
+                # stock's unreachable-after rule: a Bottom-typed statement
+                # never completes — the region tail is dead and contributes
+                # no join edge (dead join edges after Union{} calls prune
+                # here, like stock's convert_to_ircode `sv.unreachable`)
+                setterm!(cx.cur, (:unreachable,))
+                return nothing
+            end
         end
     end
     return nothing
@@ -1207,8 +1215,17 @@ function assemble_ircode(cx::TCtx, ir::UnifiedIR.IR, argmap::Dict{Int32,Int}, na
                 rv = p.iscell ? pval(v) : tval(v)
                 rv === CELL_UNDEF || (vals[i] = rv)   # undef edge: unassigned
             end
-            stmts[pos] = Core.PhiNode(edges, vals)
             t = p.typ
+            if length(edges) == 1 && isassigned(vals, 1)
+                # a join left with a single live edge (dead edges pruned by
+                # the unreachable-after rule) is no φ at all — stock never
+                # emits 1-edge φs. A bare value statement (renaming copy) is
+                # legal IRCode and, unlike PiNode, also legal pre-inference
+                # method source (the ssa_method engine legs).
+                stmts[pos] = vals[1]
+            else
+                stmts[pos] = Core.PhiNode(edges, vals)
+            end
             types[pos] = t === nothing ? Any : t
         end
         for pc in bb.phics
