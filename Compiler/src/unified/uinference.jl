@@ -609,15 +609,18 @@ function note_return!(fr::Frame, s::StmtId)
 end
 
 "A branch/continue condition that is not provably Bool throws a TypeError at
-runtime (the stock GotoIfNot rule: merge EFFECTS_THROWS)."
+runtime (the stock GotoIfNot rule: merge EFFECTS_THROWS). Returns whether the
+condition MUST throw (no intersection with Bool at all — stock types such a
+GotoIfNot Bottom and the branch never completes, #41975)."
 function taint_nonbool_cond!(fr::Frame, @nospecialize(condl))
-    condl isa UCond && return nothing
+    condl isa UCond && return false
     t = CC.widenconst(widenucond(condl))
     if !(t isa Type && t <: Bool)
         fr.effects = CC.merge_effects(fr.effects, CC.EFFECTS_THROWS)
         note_thrown!(fr, TypeError)
+        return t isa Type && !CC.hasintersect(t, Bool)
     end
-    return nothing
+    return false
 end
 
 "Cyclic control (loop backedges, island back-gotos) drops `terminates` unless
@@ -760,7 +763,12 @@ function infer_region!(fr::Frame, r::RegionId)
         elseif k === K"continue"
             tgt = UnifiedIR.asregion(UnifiedIR.getop(ir, s, 1))
             condl = opl(fr, UnifiedIR.getop(ir, s, 2))
-            taint_nonbool_cond!(fr, condl)
+            if taint_nonbool_cond!(fr, condl)
+                # must-throw condition: neither the backedge nor the loop
+                # exit is taken (stock's Bottom GotoIfNot rule)
+                fr.env[s.id] = Union{}
+                continue
+            end
             vals = opls(fr, s, 3)
             prev = get(fr.continue_vals, tgt.id, nothing)
             joined = prev === nothing ? vals :
@@ -828,7 +836,13 @@ end
 function infer_if!(fr::Frame, s::StmtId)::Union{Nothing,RefMap}
     ir = fr.ir
     condl = opl(fr, UnifiedIR.getop(ir, s, 1))
-    taint_nonbool_cond!(fr, condl)
+    if taint_nonbool_cond!(fr, condl)
+        # the condition cannot be Bool: the branch throws TypeError before
+        # either arm runs (stock types the GotoIfNot Bottom; the region rest
+        # is the caller's dead-tail rule)
+        fr.env[s.id] = Union{}
+        return nothing
+    end
     rs = UnifiedIR.live_owned_regions(ir, s)
     local res
     carry = nothing
@@ -1171,7 +1185,10 @@ function infer_cfg!(fr::Frame, s::StmtId)
                 elseif k === K"continue"
                     tgt = UnifiedIR.asregion(UnifiedIR.getop(ir, st, 1))
                     condl = opl(fr, UnifiedIR.getop(ir, st, 2))
-                    taint_nonbool_cond!(fr, condl)
+                    if taint_nonbool_cond!(fr, condl)
+                        fr.env[st.id] = Union{}
+                        continue
+                    end
                     vals = Any[widenucond(v) for v in opls(fr, st, 3)]
                     prev = get(fr.continue_vals, tgt.id, nothing)
                     joined = prev === nothing ? vals :
@@ -1186,7 +1203,11 @@ function infer_cfg!(fr::Frame, s::StmtId)
                     merge_edge!(st, dest, Any[opl(fr, o) for o in args_ops], curref())
                 elseif k === K"br_if"
                     condl = opl(fr, UnifiedIR.getop(ir, st, 1))
-                    taint_nonbool_cond!(fr, condl)
+                    if taint_nonbool_cond!(fr, condl)
+                        # must-throw condition: no edge is taken
+                        fr.env[st.id] = Union{}
+                        continue
+                    end
                     get(ENV, "UIR_DEBUG", "") == "1" && println("DBG br_if %", st.id, " condl=", condl)
                     bundles = UnifiedIR.edge_bundles(ir, st)
                     ref = curref()

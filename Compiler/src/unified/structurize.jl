@@ -175,6 +175,15 @@ function collapse_branches!(ir::UnifiedIR.IR)
             if Tr == Fr
                 # degenerate branch: both edges to the same block
                 map(o -> o.bits, aT) == map(o -> o.bits, aF) || continue
+                # the branch's mandatory Bool typecheck must survive the
+                # collapse (#41975: `if nothing` throws TypeError; a br_if
+                # types its condition even when both edges coincide). For a
+                # provably-Bool condition the assert is nothrow/removable and
+                # DCE drops it; otherwise it throws exactly where the branch
+                # would have.
+                UnifiedIR.insert_before!(ir, t, K"call",
+                                         UnifiedIR.vop(ir, Core.typeassert), cond,
+                                         UnifiedIR.vop(ir, Bool); type = Any)
                 UnifiedIR.replace_stmt!(ir, t, K"goto", UnifiedIR.op_block(Tr),
                                         UnifiedIR.op_inline(length(aT)), aT...)
                 n += 1; changed = true
