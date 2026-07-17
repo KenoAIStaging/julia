@@ -132,6 +132,18 @@ are stock-compiled once and cached, and devirtualization targets degrade to
 MethodInstance invokes whose CodeInstances materialize on first call."
 const DRIVER_REENTRY_LIMIT = Base.RefValue(8)
 
+"Per-session admission budget for REENTRANT passes (requests arriving while
+this task is already inside the driver — the self-hosting burn-in). Every
+pass re-infers its callee tree with fresh state (the pre-A6 soundness
+basis), so unbounded admission makes first activation re-derive the
+compiler's own call graph body by body — an hour-class burn-in. Admit up to
+this many reentrant bodies through the pipeline per session (unified,
+cached), then decline precisely (`:reentrant_budget` — stock compiles and
+caches those, so a repeated workload is reentrant-quiet either way). A6's
+cross-body memoization removes the need for this valve."
+const DRIVER_REENTRANT_BUDGET = Base.RefValue(1_000)
+const REENTRANT_ADMITTED = Base.Threads.Atomic{Int}(0)
+
 ":invoke emission switch (devirtualize_calls!)."
 const DEVIRTUALIZE = Base.RefValue(true)
 
@@ -448,11 +460,13 @@ function driver_ci_for_invoke(interp::Compiler.AbstractInterpreter, mi::Core.Met
     end
     dts = driver_task_state()
     (mi in dts.inflight || dts.depth >= DRIVER_REENTRY_LIMIT[]) && return nothing
-    # eager production is bounded to ONE level per root chain: while a
-    # devirtualization-driven pass is on this task's stack, deeper targets
-    # stay MethodInstance invokes (their CodeInstances materialize when the
-    # runtime first needs them — cached, so coverage converges by execution)
-    dts.devirt > 0 && return nothing
+    # eager production is bounded to ONE level, from ROOT passes only: a
+    # nested (reentrant or production) pass embeds cached CodeInstances or
+    # MethodInstance invokes. Without the root restriction the burn-in
+    # compiles the STATIC call graph — far beyond the runtime-demand set —
+    # eagerly; targets left as mi-invokes materialize (and cache) when the
+    # runtime first needs them, so coverage converges by execution.
+    (dts.devirt > 0 || dts.depth > 1) && return nothing
     local ci
     dts.depth += 1
     dts.devirt += 1
@@ -654,6 +668,15 @@ function unified_typeinf(interp::Compiler.AbstractInterpreter, mi::Core.MethodIn
     if dts.depth >= DRIVER_REENTRY_LIMIT[]
         count_fallback!(:reentrant_depth)
         return nothing
+    end
+    if dts.depth > 0
+        # reentrant request (the self-hosting burn-in): admit within the
+        # session budget, else decline precisely — stock compiles + caches
+        if REENTRANT_ADMITTED[] >= DRIVER_REENTRANT_BUDGET[]
+            count_fallback!(:reentrant_budget)
+            return nothing
+        end
+        Base.Threads.atomic_add!(REENTRANT_ADMITTED, 1)
     end
     local ci
     dts.depth += 1
