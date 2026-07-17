@@ -147,6 +147,14 @@ const REENTRANT_ADMITTED = Base.Threads.Atomic{Int}(0)
 ":invoke emission switch (devirtualize_calls!)."
 const DEVIRTUALIZE = Base.RefValue(true)
 
+"Eager CodeInstance productions per root pass (devirtualize_calls!): the
+first N uncached targets get a recursive driver pass; the rest keep
+MethodInstance invokes (dispatch-free; compiled and cached by the runtime
+on first call). Deterministic and small — a root whose optimized body has
+dozens of resolved callees (collect/print chains) must not multiply its
+own compile time by that fan-out."
+const DEVIRT_PRODUCTION_BUDGET = Base.RefValue(4)
+
 # Per-body inference budgets (v0): the driver re-infers each body's callee
 # tree with a fresh state — the edge collector's soundness requires every
 # consumed method-table/binding fact to be observed within this body's pass —
@@ -440,33 +448,37 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    driver_ci_for_invoke(interp, mi) -> Union{Nothing,CodeInstance}
+    driver_ci_for_invoke(interp, mi, allow_production) -> (Union{Nothing,CodeInstance}, produced)
 
 A CodeInstance suitable as an `:invoke` target for `mi`: the world-covering
-cache entry when one exists, else a recursive unified pass (per-task depth
-bound and inflight set apply — mutual recursion and over-deep chains return
-`nothing`, and the site degrades to a MethodInstance invoke, which the
-runtime compiles on first call through the ordinary entry). No JIT work
-happens here: the caller's `add_codeinsts_to_jit!` walk collects embedded
-CodeInstance targets via `collectinvokes!`.
+cache entry when one exists, else — when `allow_production` — a recursive
+unified pass (per-task depth bound and inflight set apply; mutual
+recursion, over-deep chains, and exhausted budgets return `nothing`, and
+the site degrades to a MethodInstance invoke, which the runtime compiles
+on first call through the ordinary entry). `produced` reports whether a
+recursive pass ran (the per-pass DEVIRT_PRODUCTION_BUDGET accounting). No
+JIT work happens here: the caller's `add_codeinsts_to_jit!` walk collects
+embedded CodeInstance targets via `collectinvokes!`.
 """
-function driver_ci_for_invoke(interp::Compiler.AbstractInterpreter, mi::Core.MethodInstance)
+function driver_ci_for_invoke(interp::Compiler.AbstractInterpreter, mi::Core.MethodInstance,
+                              allow_production::Bool)
     let code = get(Compiler.code_cache(interp), mi, nothing)
         code isa Compiler.InferenceResult && (code = code.ci)
         if code isa Core.CodeInstance &&
            Compiler.ci_meets_requirement(interp, code, Compiler.SOURCE_MODE_ABI)
-            return code
+            return (code, false)
         end
     end
+    allow_production || return (nothing, false)
     dts = driver_task_state()
-    (mi in dts.inflight || dts.depth >= DRIVER_REENTRY_LIMIT[]) && return nothing
+    (mi in dts.inflight || dts.depth >= DRIVER_REENTRY_LIMIT[]) && return (nothing, false)
     # eager production is bounded to ONE level, from ROOT passes only: a
     # nested (reentrant or production) pass embeds cached CodeInstances or
     # MethodInstance invokes. Without the root restriction the burn-in
     # compiles the STATIC call graph — far beyond the runtime-demand set —
     # eagerly; targets left as mi-invokes materialize (and cache) when the
     # runtime first needs them, so coverage converges by execution.
-    (dts.devirt > 0 || dts.depth > 1) && return nothing
+    (dts.devirt > 0 || dts.depth > 1) && return (nothing, false)
     local ci
     dts.depth += 1
     dts.devirt += 1
@@ -478,8 +490,8 @@ function driver_ci_for_invoke(interp::Compiler.AbstractInterpreter, mi::Core.Met
         dts.devirt -= 1
         delete!(dts.inflight, mi)
     end
-    ci isa Core.CodeInstance || return nothing
-    return ci
+    ci isa Core.CodeInstance || return (nothing, true)
+    return (ci, true)
 end
 
 """
@@ -502,6 +514,7 @@ unchanged (the rewrite preserves semantics per statement).
 """
 function devirtualize_calls!(uir, st::UInferState, interp::Compiler.AbstractInterpreter)
     n = 0
+    produced = 0
     col = st.edges
     for s in UnifiedIR.each_stmt(uir)
         UnifiedIR.is_tombstone(uir, s) && continue
@@ -532,7 +545,9 @@ function devirtualize_calls!(uir, st::UInferState, interp::Compiler.AbstractInte
         mi isa Core.MethodInstance || continue
         target = ccall(:jl_normalize_to_compilable_mi, Any, (Any,), mi)
         target isa Core.MethodInstance || continue
-        ci = driver_ci_for_invoke(interp, target)
+        (ci, did_produce) = driver_ci_for_invoke(interp, target,
+                                                 produced < DEVIRT_PRODUCTION_BUDGET[])
+        did_produce && (produced += 1)
         tgt = ci === nothing ? target : ci
         if ci isa Core.CodeInstance && col isa UEdges
             # the embedded CI must cover every world this body claims
