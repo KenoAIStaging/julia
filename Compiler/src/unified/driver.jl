@@ -545,6 +545,15 @@ function devirtualize_calls!(uir, st::UInferState, interp::Compiler.AbstractInte
         mi isa Core.MethodInstance || continue
         target = ccall(:jl_normalize_to_compilable_mi, Any, (Any,), mi)
         target isa Core.MethodInstance || continue
+        # stock's :invoke legality (compileable_specialization): the target's
+        # static parameters must be fully determined. An under-constrained
+        # match (free TypeVars/Varargs/SimpleVectors in the environment the
+        # runtime re-derives per call) leaves the callee's sparam reads
+        # unbound — the emitted code throws `UndefVarError: T` at the first
+        # `static_parameter` use. Such sites keep the dynamic :call.
+        sparams = target.sparam_vals
+        (CC.unionall_depth((match.method).sig) == length(sparams) &&
+         CC.validate_sparams(sparams)) || continue
         (ci, did_produce) = driver_ci_for_invoke(interp, target,
                                                  produced < DEVIRT_PRODUCTION_BUDGET[])
         did_produce && (produced += 1)

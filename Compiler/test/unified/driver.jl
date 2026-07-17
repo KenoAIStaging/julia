@@ -160,6 +160,28 @@ drv_cov_caller(x::Integer) = drv_cov_callee(x)
     @test_throws MethodError invoke(drv_cov_caller, ci, Int8(1))
 end
 
+# an under-constrained match (free TypeVar in the re-derived sparams) must
+# not devirtualize: the emitted :invoke would compile the callee with an
+# unbound static parameter (`UndefVarError: T` at the first sparam use);
+# the site must keep the dynamic :call (stock's validate_sparams rule)
+@noinline drv_sp_callee(x::Vector{T}) where {T} = T
+drv_sp_caller(v) = drv_sp_callee(v)
+
+@testset "driver: under-constrained sparams keep dynamic dispatch (soundness)" begin
+    mi = CC.specialize_method(Base._which(Tuple{typeof(drv_sp_caller), Vector};
+                                          world = Base.get_world_counter()))
+    interp = drv_interp()
+    ci = unified_typeinf(interp, mi, CC.SOURCE_MODE_ABI)
+    @test ci isa Core.CodeInstance
+    src = CC.ci_get_source(interp, ci)
+    @test src isa Core.CodeInfo
+    # no :invoke to the under-constrained callee survives
+    @test !any(st -> Meta.isexpr(st, :invoke), src.code)
+    # the dynamic call re-derives T per concrete argument type
+    @test invoke(drv_sp_caller, ci, [1, 2, 3]) === Int
+    @test invoke(drv_sp_caller, ci, Any["x"]) === Any
+end
+
 @testset "driver: reentrant requests run unified (per-task bound)" begin
     # a nested direct request (same task, different mi) is admitted, not
     # blanket-declined: the depth guard only rejects at the bound
