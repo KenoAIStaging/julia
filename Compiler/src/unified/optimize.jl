@@ -29,7 +29,7 @@ function refine_effects!(ir::UnifiedIR.IR; interp = CC.NativeInterpreter())
             flags = UnifiedIR.FLAG_EFFECT_FREE | UnifiedIR.FLAG_NOTHROW |
                     UnifiedIR.FLAG_TERMINATES
             ismutabletype(T) || (flags |= UnifiedIR.FLAG_CONSISTENT)
-            flags |= UnifiedIR.stmt_flag(ir, s) & FLAGS_CARRIED
+            flags |= UnifiedIR.stmt_flag(ir, s)   # refinement is monotone upward
             if flags != UnifiedIR.stmt_flag(ir, s)
                 UnifiedIR.set_flag!(ir, s, flags)
                 n += 1
@@ -43,7 +43,7 @@ function refine_effects!(ir::UnifiedIR.IR; interp = CC.NativeInterpreter())
             g = ir.body.globals[UnifiedIR.payload(o)]
             (isconst(g.mod, g.name) && isdefined(g.mod, g.name)) || continue
             flags = UnifiedIR.FLAG_CONSISTENT | UnifiedIR.FLAG_REMOVABLE
-            flags |= UnifiedIR.stmt_flag(ir, s) & FLAGS_CARRIED
+            flags |= UnifiedIR.stmt_flag(ir, s)   # refinement is monotone upward
             if flags != UnifiedIR.stmt_flag(ir, s)
                 UnifiedIR.set_flag!(ir, s, flags)
                 n += 1
@@ -66,7 +66,11 @@ function refine_effects!(ir::UnifiedIR.IR; interp = CC.NativeInterpreter())
         CC.is_effect_free(effects) && (flags |= UnifiedIR.FLAG_EFFECT_FREE)
         CC.is_nothrow(effects) && (flags |= UnifiedIR.FLAG_NOTHROW)
         CC.is_terminates(effects) && (flags |= UnifiedIR.FLAG_TERMINATES)
-        flags |= UnifiedIR.stmt_flag(ir, s) & FLAGS_CARRIED
+        # inference's transfer results (just published into the flag column)
+        # can be strictly more precise than the builtin recompute
+        # (apply_type_nothrow with Const args, e.g.); never downgrade — the
+        # refinement must be monotone upward or the round ledger flaps
+        flags |= UnifiedIR.stmt_flag(ir, s)
         if flags != UnifiedIR.stmt_flag(ir, s)
             UnifiedIR.set_flag!(ir, s, flags)
             n += 1
@@ -450,6 +454,44 @@ function fold_pure_queries!(ir::UnifiedIR.IR)
     return n
 end
 
+"""
+    fold_splatnews!(ir) -> Int
+
+Stock `inline_splatnew`: a `splatnew(T, t)` whose result type has a known
+field count and whose splatted operand is a local `Core.tuple(a...)` of
+exactly that arity becomes `new(T, a...)` (the abstract-`NamedTuple`
+keyword-argument path). The type operand may stay dynamic — `new`
+performs the same runtime field-type checks `splatnew` would.
+"""
+function fold_splatnews!(ir::UnifiedIR.IR)
+    n = 0
+    for s in UnifiedIR.each_stmt(ir)
+        UnifiedIR.stmt_kind(ir, s) === K"splatnew" || continue
+        UnifiedIR.nops(ir, s) == 2 || continue
+        rt = UnifiedIR.stmt_type(ir, s)
+        nf = CC.nfields_tfunc(CC.fallback_lattice, rt isa Type ? rt : CC.widenconst(rt))
+        (nf isa CC.Const && nf.val isa Int) || continue
+        tupop = UnifiedIR.getop(ir, s, 2)
+        UnifiedIR.optag(tupop) == UnifiedIR.TAG_STMT || continue
+        def = skip_refines(ir, UnifiedIR.asstmt(tupop))
+        UnifiedIR.stmt_kind(ir, def) === K"call" || continue
+        static_operand_value(ir, UnifiedIR.getop(ir, def, 1)) === Core.tuple || continue
+        UnifiedIR.nops(ir, def) - 1 == nf.val || continue
+        elems = UnifiedIR.Operand[UnifiedIR.getop(ir, def, i)
+                                  for i in 2:UnifiedIR.nops(ir, def)]
+        ok = true
+        for el in elems
+            UnifiedIR.optag(el) == UnifiedIR.TAG_STMT || continue
+            UnifiedIR.visible(ir, UnifiedIR.asstmt(el), s) || (ok = false; break)
+        end
+        ok || continue
+        UnifiedIR.replace_stmt!(ir, s, K"new", UnifiedIR.getop(ir, s, 1), elems...;
+                                type = rt)
+        n += 1
+    end
+    return n
+end
+
 "compact!, carrying the cell-name channel (meta[:cell_names], the undef-guard
 variable names) across the statement renumbering."
 function compact_carry_names!(ir::UnifiedIR.IR)
@@ -494,6 +536,7 @@ function optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
         changed += materialize_consts!(ir)
         changed += canonicalize_getfields!(ir)
         changed += forward_extracts!(ir)
+        changed += fold_splatnews!(ir)
         changed += fold_pure_queries!(ir)
         changed += forward_refines!(ir)
         changed += forward_if_results!(ir)

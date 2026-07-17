@@ -62,6 +62,11 @@ op_call_fb(x) = op_split_fb(x)
 op_call_one(x) = op_split_one(x)
 op_call_none() = op_split_one(nothing)
 
+@eval op_construct_splatnew(T, fields) = $(Expr(:splatnew, :T, :fields))
+op_invoke34900(x::Int, y) = x
+op_invoke34900(x, y::Int) = y
+op_invoke34900(x::Int, y::Int) = invoke(op_invoke34900, Tuple{Int, Any}, x, y)
+
 mutable struct OPTAFoo; x; end
 function op_typeassert_elim(a)
     x1 = OPTAFoo(a)
@@ -145,6 +150,20 @@ end
             # the round budget must not strand folded-but-unswept const calls
             src = _code_typed1(op_sin_chain, ())
             @test length(src.code) == 1 && _isreturn(src.code[1])
+        end
+
+        @testset "splatnew folds to new; Core.invoke calls inline" begin
+            for tt in Any[(Int, Int), (Any, Any)]
+                src = _code_typed1((a, b) -> op_construct_splatnew(
+                    NamedTuple{(:a, :b), typeof((a, b))}, (a, b)), tt)
+                @test count(x -> Meta.isexpr(x, :splatnew), src.code) == 0
+                @test count(_isnew, src.code) == 1
+            end
+            @test op_construct_splatnew(NamedTuple{(:a, :b), Tuple{Int, Int}}, (1, 2)) == (a = 1, b = 2)
+            src = _code_typed1(op_invoke34900, (Int, Int))
+            @test length(src.code) == 1 && _isreturn(src.code[1]) &&
+                  src.code[1].val == Core.Argument(2)
+            @test op_invoke34900(3, 4) === 3
         end
 
         @testset "finalizer resolution" begin

@@ -61,6 +61,28 @@ function resolve_single_match(st::UInferState, @nospecialize(sig))
     return match
 end
 
+# `invoke`'s method selection: the most specific method whose signature
+# FULLY COVERS the declared type-tuple (jl_gf_invoke_lookup semantics) —
+# non-covering intersections are irrelevant (invoke ignores runtime
+# dispatch beyond the membership check). Edge-recorded: a callee-set
+# change for `sig` invalidates the baked selection.
+function resolve_invoke_lookup(st::UInferState, @nospecialize(sig))
+    result = try
+        CC.findall(sig, CC.InternalMethodTable(st.cfg.world); limit = 4)
+    catch
+        nothing
+    end
+    result === nothing && return nothing
+    result.ambig && return nothing
+    col = st.edges
+    col === nothing || record_call!(col, sig, result)
+    for m in result.matches
+        m = m::Core.MethodMatch
+        m.fully_covers && return m
+    end
+    return nothing
+end
+
 # ---------------------------------------------------------------------------
 # Multi-return normalization (deliverable 2a)
 # ---------------------------------------------------------------------------
@@ -178,28 +200,59 @@ end
 # Call/invoke inlining (deliverables 2a/2b/2d)
 # ---------------------------------------------------------------------------
 
-# Resolve an inlinable (method, method-instance) for a call/invoke statement,
-# or nothing. Applies the dispatch-level legality checks only.
+# Resolve an inlinable (method, method-instance, invoke_call) for a
+# call/invoke statement, or nothing. Applies the dispatch-level legality
+# checks only. `invoke_call` marks the `Core.invoke(f, types, args...)`
+# call form, whose argument map skips the type-tuple operand.
 function resolve_inline_target(ir::UnifiedIR.IR, s::StmtId, k::UnifiedIR.Kind, st::UInferState)
     if k === K"call"
         nop = UnifiedIR.nops(ir, s)
         args = Any[stmt_lattice(ir, UnifiedIR.getop(ir, s, i)) for i in 1:nop]
         f = CC.singleton_type(args[1])
         f === nothing && args[1] isa CC.Const && (f = args[1].val)
+        if f === Core.invoke && nop >= 3
+            # Core.invoke(f2, types::Type{<:Tuple}, args...): the target
+            # method is looked up on the DECLARED signature. Inlining drops
+            # invoke's runtime argument check, so it is only legal when the
+            # static argument types already prove membership.
+            f2 = CC.singleton_type(args[2])
+            f2 === nothing && args[2] isa CC.Const && (f2 = (args[2]::CC.Const).val)
+            (f2 === nothing || f2 isa Core.Builtin || f2 isa Core.IntrinsicFunction) &&
+                return nothing
+            types = static_operand_value(ir, UnifiedIR.getop(ir, s, 3))
+            (types isa Type && types <: Tuple && !CC.has_free_typevars(types)) ||
+                return nothing
+            types isa DataType || return nothing
+            declared = types.parameters
+            length(declared) == nop - 3 || return nothing
+            for i in 4:nop
+                at = CC.widenconst(args[i])
+                d = declared[i - 3]
+                (at isa Type && d isa Type && at <: d) || return nothing
+            end
+            sig = try
+                Tuple{f2 isa Type ? Type{f2} : typeof(f2), declared...}
+            catch
+                return nothing
+            end
+            match = resolve_invoke_lookup(st, sig)
+            match === nothing && return nothing
+            return (match.method, CC.specialize_method(match), true)
+        end
         (f === nothing || f isa Core.Builtin || f isa Core.IntrinsicFunction) && return nothing
         argts = Any[CC.widenconst(a) for a in args[2:end]]
         any(t -> t === Union{}, argts) && return nothing
         sig = Tuple{f isa Type ? Type{f} : typeof(f), argts...}
         match = resolve_single_match(st, sig)
         match === nothing && return nothing
-        return (match.method, CC.specialize_method(match))
+        return (match.method, CC.specialize_method(match), false)
     else  # K"invoke"
         ci_op = static_operand_value(ir, UnifiedIR.getop(ir, s, 1))
         mi = ci_op isa Core.CodeInstance ? ci_op.def : ci_op
         mi isa Core.MethodInstance || return nothing
         m = mi.def
         m isa Method || return nothing
-        return (m, mi)
+        return (m, mi, false)
     end
 end
 
@@ -283,13 +336,17 @@ function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
         UnifiedIR.stmt_flag(ir, s) & UnifiedIR.FLAG_NOINLINE != 0 && continue
         target = resolve_inline_target(ir, s, k, state)
         target === nothing && continue
-        m, mi = target
+        m, mi, invoke_call = target
         # a staged method's runnable body is the generator's EXPANSION;
         # `uncompressed_ir(m)` below is not it — never inline those
         isdefined(m, :generator) && continue
         argofs = k === K"invoke" ? 1 : 0
         m.isva && continue
-        Int(m.nargs) == UnifiedIR.nops(ir, s) - argofs || continue
+        if invoke_call
+            Int(m.nargs) == UnifiedIR.nops(ir, s) - 2 || continue
+        else
+            Int(m.nargs) == UnifiedIR.nops(ir, s) - argofs || continue
+        end
         caller_m === m && continue                        # direct self-recursion
         src = try
             Base.uncompressed_ir(m)
@@ -330,8 +387,17 @@ function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
         if UnifiedIR.stmt_flag(ir, s) & UnifiedIR.FLAG_INBOUNDS != 0
             mark_inbounds_context!(callee_ir)
         end
-        argmap = UnifiedIR.Operand[UnifiedIR.getop(ir, s, i)
-                                   for i in (argofs + 1):UnifiedIR.nops(ir, s)]
+        argmap = if invoke_call
+            # Core.invoke(f, types, args...): callee params map to (f, args...)
+            ops = UnifiedIR.Operand[UnifiedIR.getop(ir, s, 2)]
+            for i in 4:UnifiedIR.nops(ir, s)
+                push!(ops, UnifiedIR.getop(ir, s, i))
+            end
+            ops
+        else
+            UnifiedIR.Operand[UnifiedIR.getop(ir, s, i)
+                              for i in (argofs + 1):UnifiedIR.nops(ir, s)]
+        end
         UnifiedIR.splice_body!(ir, s, callee_ir; argmap, sparams = spvals)
         inlined += 1
     end
