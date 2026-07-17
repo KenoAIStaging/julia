@@ -50,15 +50,82 @@ function skip_refines(ir::UnifiedIR.IR, def::StmtId)
     end
     return def
 end
+# ---------------------------------------------------------------------------
+# Definite-initialization analysis for uninitialized-field SROA
+# ---------------------------------------------------------------------------
+#
+# `getfield` of an uninitialized field throws `UndefRefError`; a promoted
+# cell read must never reach that state, so a load of a field the `new` did
+# not supply is only convertible when EVERY path from the allocation to the
+# load passes a store. Two structural cases prove it (both piggyback on the
+# promotion suite's editable-state dominance helpers, §6 throw-edge rules
+# included — handler crossings refuse, throws exit the region so a path
+# that continues past a store-bearing region prefix has executed it):
+#
+#   (a) a store dominates the load (`_cell_dominates_ed` + `comes_before`);
+#   (b) an `if` op dominates the load and every one of its (two, non-guard)
+#       live arms definitely stores the field — directly or through a
+#       nested all-arms-store `if` (recursively).
+
+function _store_dominates(ir::UnifiedIR.IR, stores::Vector{StmtId}, site::StmtId)
+    for st in stores
+        UnifiedIR.comes_before(ir, st, site) || continue
+        UnifiedIR._cell_dominates_ed(ir, st, site) && return true
+    end
+    return false
+end
+
+function _arm_definitely_stores(ir::UnifiedIR.IR, stores::Vector{StmtId},
+                                arm::RegionId, depth::Int)
+    reg = UnifiedIR.getregion(ir, arm)
+    reg.kind === UnifiedIR.REGION_ARM || return false
+    UnifiedIR.is_guard(reg) && return false
+    for m in UnifiedIR.region_stmts(ir, arm)
+        UnifiedIR.is_tombstone(ir, m) && continue
+        m in stores && return true
+        if UnifiedIR.stmt_kind(ir, m) === K"if" &&
+           _if_all_arms_store(ir, stores, m, depth + 1)
+            return true
+        end
+    end
+    return false
+end
+
+function _if_all_arms_store(ir::UnifiedIR.IR, stores::Vector{StmtId}, I::StmtId,
+                            depth::Int)
+    depth > 16 && return false
+    arms = UnifiedIR.live_owned_regions(ir, I)
+    length(arms) == 2 || return false
+    return _arm_definitely_stores(ir, stores, arms[1], depth) &&
+           _arm_definitely_stores(ir, stores, arms[2], depth)
+end
+
+"Every path from the allocation to `site` passes one of `stores` (see above)."
+function definitely_initialized(ir::UnifiedIR.IR, stores::Vector{StmtId}, site::StmtId)
+    isempty(stores) && return false
+    _store_dominates(ir, stores, site) && return true
+    for I in UnifiedIR.each_stmt(ir)
+        UnifiedIR.is_tombstone(ir, I) && continue
+        UnifiedIR.stmt_kind(ir, I) === K"if" || continue
+        UnifiedIR.comes_before(ir, I, site) || continue
+        UnifiedIR._cell_dominates_ed(ir, I, site) || continue
+        _if_all_arms_store(ir, stores, I, 0) && return true
+    end
+    return false
+end
+
 """
     sroa_mutables!(ir) -> Int
 
-Mutable-struct SROA (§10.4 / stock `sroa_mutables!` cases): fully-initialized
-`new` of a concrete mutable struct whose value never escapes — every use is
+Mutable-struct SROA (§10.4 / stock `sroa_mutables!` cases): `new` of a
+concrete mutable struct whose value never escapes — every use is
 `extract`/`getfield(it, const fld)` or `setfield!(it, const fld, v)` — is
 replaced by per-field frame cells. Loads become `cell_get`, stores become
-`cell_set` (+ a `refine` carrying setfield!'s value result). Editable state;
-`promote_cells!`/`dce!` finish the job on the next dense round.
+`cell_set` (+ a `refine` carrying setfield!'s value result). Uninitialized
+trailing fields are admitted when every load of such a field is definitely
+initialized (see the analysis above); otherwise the allocation keeps memory
+form (an unprovable load must keep `getfield`'s `UndefRefError`). Editable
+state; `promote_cells!`/`dce!` finish the job on the next dense round.
 """
 function sroa_mutables!(ir::UnifiedIR.IR)
     UnifiedIR.check_state(ir, UnifiedIR.LAYOUT_EDITABLE, "sroa_mutables!")
@@ -69,7 +136,8 @@ function sroa_mutables!(ir::UnifiedIR.IR)
         T = concrete_datatype(stmt_lattice(ir, UnifiedIR.getop(ir, s, 1)))
         (T isa DataType && ismutabletype(T)) || continue
         nf = fieldcount(T)
-        UnifiedIR.nops(ir, s) - 1 == nf || continue   # fully-initialized only (v1)
+        nsupplied = UnifiedIR.nops(ir, s) - 1
+        nsupplied <= nf || continue                   # over-arity `new` throws
         any(i -> Base.isfieldatomic(T, i), 1:nf) && continue
         # inside a cfg island the replacement cells could never promote
         # (promote_cells! §6 policy refuses island cells) — a pure
@@ -107,12 +175,36 @@ function sroa_mutables!(ir::UnifiedIR.IR)
             end
         end
         ok || continue
-        # rewrite: per-field cells + initial stores, placed just before the new
+        if nsupplied < nf
+            # every load of an uninitialized field must be provably
+            # initialized on all paths, or the whole allocation stays
+            for (u, fld) in loads
+                fld <= nsupplied && continue
+                fstores = StmtId[st for (st, f2) in stores if f2 == fld]
+                definitely_initialized(ir, fstores, u) || (ok = false; break)
+            end
+            ok || continue
+        end
+        # a promoted store must behave like the setfield!/new it replaces:
+        # a value the field type does not admit would have thrown TypeError
+        for (u, fld) in stores
+            vt = CC.widenconst(stmt_lattice(ir, UnifiedIR.getop(ir, u, 4)))
+            (vt isa Type && vt <: fieldtype(T, fld)) || (ok = false; break)
+        end
+        ok || continue
+        for i in 1:nsupplied
+            vt = CC.widenconst(stmt_lattice(ir, UnifiedIR.getop(ir, s, i + 1)))
+            (vt isa Type && vt <: fieldtype(T, i)) || (ok = false; break)
+        end
+        ok || continue
+        # rewrite: per-field cells (+ initial stores for supplied fields),
+        # placed just before the new
         cells = StmtId[]
         for i in 1:nf
             ft = fieldtype(T, i)
             c = UnifiedIR.insert_before!(ir, s, K"cell", UnifiedIR.vop(ir, ft); type = ft)
             push!(cells, c)
+            i <= nsupplied || continue
             UnifiedIR.insert_before!(ir, s, K"cell_set", UnifiedIR.op_stmt(c),
                                      UnifiedIR.getop(ir, s, i + 1))
         end
