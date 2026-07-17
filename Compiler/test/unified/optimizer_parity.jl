@@ -62,6 +62,14 @@ op_call_fb(x) = op_split_fb(x)
 op_call_one(x) = op_split_one(x)
 op_call_none() = op_split_one(nothing)
 
+mutable struct OPTAFoo; x; end
+function op_typeassert_elim(a)
+    x1 = OPTAFoo(a)
+    x2 = OPTAFoo(x1)
+    typeassert(x2.x, OPTAFoo).x
+end
+op_typeassert_keep(a) = (a::Int) + 1
+
 let b = Expr(:block, (:(y += sin($x)) for x in randn(300))...)
     @eval function op_sin_chain()
         y = 0.0
@@ -148,6 +156,30 @@ end
             src = _code_typed1(op_useless_finalizer, ())
             @test !any(x -> _iscall(src, Core.finalizer, x), src.code)
             @test length(src.code) == 2
+        end
+
+        @testset "comparison lifting and pure-query folds" begin
+            src = _code_typed1((c, x) -> (y = c ? x : nothing; y === nothing), (Bool, Int))
+            @test !any(x -> _iscall(src, ===, x), src.code)
+            src = _code_typed1((c, x) -> (y = c ? x : nothing; isa(y, Int)), (Bool, Int))
+            @test !any(x -> _iscall(src, isa, x), src.code)
+            src = _code_typed1((c, x) -> (y = c ? x : nothing; isdefined(y, 1)), (Bool, Some{Int}))
+            @test !any(x -> _iscall(src, isdefined, x), src.code)
+            # behavior of the lifted forms
+            @test ((c, x) -> (y = c ? x : nothing; y === nothing))(true, 1) === false
+            @test ((c, x) -> (y = c ? x : nothing; y === nothing))(false, 1) === true
+            # ifelse const/equal-arm forwarding
+            src = _code_typed1((a, b) -> Core.ifelse(true, a, b), (Any, Any))
+            @test length(src.code) == 1 && _isreturn(src.code[1]) &&
+                  src.code[1].val == Core.Argument(2)
+            src = _code_typed1((c, x) -> Core.ifelse(c, x, x), (Bool, Float64))
+            @test length(src.code) == 1 && _isreturn(src.code[1]) &&
+                  src.code[1].val == Core.Argument(3)
+            # typeassert elimination when the subject's type proves it
+            src = _code_typed1(op_typeassert_elim, (Int,))
+            @test !any(x -> _iscall(src, typeassert, x), src.code)
+            # ...and preservation when it does not
+            @test_throws TypeError op_typeassert_keep("nope")
         end
 
         @testset "match-based union split: covered pair" begin

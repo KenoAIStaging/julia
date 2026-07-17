@@ -173,6 +173,61 @@ function merge_goto_chains!(ir::UnifiedIR.IR)
 end
 
 """
+    fold_uniform_block_args!(ir) -> Int
+
+Block-arg constant folding (the φ-of-one-constant case, island form): a
+non-entry island block argument whose every in-edge passes the SAME
+constant has its uses rewritten to that constant. The definedness-channel
+φs the cell-promotion passes synthesize (`φ (true, true)`) fold this way,
+which lets the guard branch fold and the guard block drop on the next
+round. Editable state; edge bundles stay untouched (argument lists must
+keep their arity), DCE collects the dead channel later.
+"""
+function fold_uniform_block_args!(ir::UnifiedIR.IR)
+    UnifiedIR.check_state(ir, UnifiedIR.LAYOUT_EDITABLE, "fold_uniform_block_args!")
+    n = 0
+    incoming = Dict{Int32,Vector{Vector{UnifiedIR.Operand}}}()
+    for s in UnifiedIR.each_stmt(ir)
+        UnifiedIR.is_tombstone(ir, s) && continue
+        is_edge_kind(UnifiedIR.stmt_kind(ir, s)) || continue
+        for (dest, args) in UnifiedIR.edge_bundles(ir, s)
+            push!(get!(Vector{Vector{UnifiedIR.Operand}}, incoming, dest.id), args)
+        end
+    end
+    for s in collect(UnifiedIR.each_stmt(ir))
+        UnifiedIR.is_tombstone(ir, s) && continue
+        UnifiedIR.stmt_kind(ir, s) === K"cfg" || continue
+        rs = UnifiedIR.live_owned_regions(ir, s)
+        for (bi, rid) in enumerate(rs)
+            bi == 1 && continue          # entry block args come from the op
+            reg = UnifiedIR.getregion(ir, rid)
+            isempty(reg.args) && continue
+            ins = get(incoming, rid.id, nothing)
+            ins === nothing && continue
+            for (i, a) in enumerate(reg.args)
+                UnifiedIR.is_tombstone(ir, a) && continue
+                all(argl -> length(argl) >= i, ins) || continue
+                v0 = static_operand_value(ir, ins[1][i])
+                v0 === nothing && continue
+                ismutable(v0) && !(v0 isa Union{Type,Function,Module,Symbol,String}) && continue
+                uniform = true
+                for argl in ins
+                    v = static_operand_value(ir, argl[i])
+                    (v !== nothing && v === v0) || (uniform = false; break)
+                end
+                uniform || continue
+                cnt = UnifiedIR.use_counts(ir)[a.id]
+                cnt > 0 || continue
+                UnifiedIR.replace_uses_where!(u -> !UnifiedIR.is_tombstone(ir, u), ir,
+                                              a => UnifiedIR.vop(ir, v0))
+                n += 1
+            end
+        end
+    end
+    return n
+end
+
+"""
     dissolve_islands!(ir) -> Int
 
 A `cfg` op with exactly one live block whose terminator is `result` dissolves

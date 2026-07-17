@@ -236,6 +236,26 @@ function canonicalize_getfields!(ir::UnifiedIR.IR)
     return n
 end
 
+"Result-terminated live arms of an `if`/region-owning op: (arm region,
+result terminator) pairs; diverging arms (throw/unreachable) are omitted.
+Returns nothing when any live arm is a guard or lacks a terminator."
+function result_arms(ir::UnifiedIR.IR, def::StmtId)
+    arms = Tuple{RegionId,StmtId}[]
+    for rid in UnifiedIR.live_owned_regions(ir, def)
+        reg = UnifiedIR.getregion(ir, rid)
+        reg.kind === UnifiedIR.REGION_ARM || return nothing
+        t = UnifiedIR.region_terminator(ir, rid)
+        t === nothing && return nothing
+        tk = UnifiedIR.stmt_kind(ir, t)
+        if tk === K"result"
+            push!(arms, (rid, t))
+        elseif !UnifiedIR.is_diverge_kind(tk)
+            return nothing
+        end
+    end
+    return arms
+end
+
 """
     forward_extracts!(ir) -> Int
 
@@ -243,7 +263,10 @@ Immutable-struct SROA, load-forwarding case (deliverable 1a): `extract(x, i)`
 of a locally-constructed `call Core.tuple(a...)` or `K"new"` of a concrete
 *immutable* type — following `refine` chains — becomes `refine a[i]`.
 Legality of the forwarded operand at the use site is checked with
-`UnifiedIR.visible` (§5.1).
+`UnifiedIR.visible` (§5.1). Additionally, `extract` of a multi-result `if`
+whose every result-terminated arm passes the SAME constant at that
+position folds to the constant (the definedness-channel case the entry
+lowering produces for `local`-scoped conditionals).
 """
 function forward_extracts!(ir::UnifiedIR.IR)
     n = 0
@@ -255,7 +278,25 @@ function forward_extracts!(ir::UnifiedIR.IR)
         idx = Int(UnifiedIR.imm_value(UnifiedIR.getop(ir, s, 2))::Int64)
         dk = UnifiedIR.stmt_kind(ir, def)
         local el::UnifiedIR.Operand
-        if dk === K"call"
+        if dk === K"if"
+            arms = result_arms(ir, def)
+            (arms === nothing || isempty(arms)) && continue
+            v0 = nothing
+            uniform = true
+            for (_, t) in arms
+                idx <= UnifiedIR.nops(ir, t) || (uniform = false; break)
+                v = static_operand_value(ir, UnifiedIR.getop(ir, t, idx))
+                v === nothing && (uniform = false; break)
+                ismutable(v) && !(v isa Union{Type,Function,Module,Symbol,String}) &&
+                    (uniform = false; break)
+                v0 === nothing ? (v0 = v) : (v === v0 || (uniform = false; break))
+            end
+            (uniform && v0 !== nothing) || continue
+            UnifiedIR.replace_stmt!(ir, s, K"refine", UnifiedIR.vop(ir, v0);
+                                    type = UnifiedIR.stmt_type(ir, s))
+            n += 1
+            continue
+        elseif dk === K"call"
             callee = static_operand_value(ir, UnifiedIR.getop(ir, def, 1))
             callee === Core.tuple || continue
             1 + idx <= UnifiedIR.nops(ir, def) || continue
@@ -274,6 +315,136 @@ function forward_extracts!(ir::UnifiedIR.IR)
             UnifiedIR.visible(ir, UnifiedIR.asstmt(el), s) || continue
         end
         UnifiedIR.replace_stmt!(ir, s, K"refine", el; type = UnifiedIR.stmt_type(ir, s))
+        n += 1
+    end
+    return n
+end
+
+"""
+    fold_pure_queries!(ir) -> Int
+
+Query-call folding and comparison lifting (stock `lift_comparison!` /
+`typeassert` elimination, over the structured encoding — the subjects
+stock sees as `PhiNode`s arrive here as `select`s):
+
+  * `typeassert(x, T)` whose subject's type already proves `<: T` becomes
+    `refine x` (the post-SROA typeassert elimination corpus);
+  * `Core.ifelse(c::Const, a, b)` forwards the chosen operand;
+    `Core.ifelse(c::Bool, a, a)` forwards `a`;
+  * `===` / `isa` / `isdefined` whose subject is a `select` (or a residual
+    `Core.ifelse` call) with a per-arm Const answer becomes
+    `select(c, ans₁, ans₂)` — the union-typed comparison disappears.
+"""
+function fold_pure_queries!(ir::UnifiedIR.IR)
+    n = 0
+    L = CC.fallback_lattice
+    for s in UnifiedIR.each_stmt(ir)
+        UnifiedIR.stmt_kind(ir, s) === K"call" || continue
+        nop = UnifiedIR.nops(ir, s)
+        callee = static_operand_value(ir, UnifiedIR.getop(ir, s, 1))
+        if callee === Core.typeassert && nop == 3
+            xo = UnifiedIR.getop(ir, s, 2)
+            T = static_operand_value(ir, UnifiedIR.getop(ir, s, 3))
+            T isa Type || continue
+            xt = CC.widenconst(stmt_lattice(ir, xo))
+            (xt isa Type && xt <: T) || continue
+            UnifiedIR.replace_stmt!(ir, s, K"refine", xo;
+                                    type = UnifiedIR.stmt_type(ir, s))
+            n += 1
+            continue
+        end
+        if callee === Core.ifelse && nop == 4
+            co = UnifiedIR.getop(ir, s, 2)
+            cv = static_operand_value(ir, co)
+            ao = UnifiedIR.getop(ir, s, 3)
+            bo = UnifiedIR.getop(ir, s, 4)
+            if cv isa Bool
+                UnifiedIR.replace_stmt!(ir, s, K"refine", cv ? ao : bo;
+                                        type = UnifiedIR.stmt_type(ir, s))
+                n += 1
+            elseif ao == bo && CC.widenconst(stmt_lattice(ir, co)) === Bool
+                UnifiedIR.replace_stmt!(ir, s, K"refine", ao;
+                                        type = UnifiedIR.stmt_type(ir, s))
+                n += 1
+            end
+            continue
+        end
+        # comparison lifting: subject is a select, a residual Core.ifelse
+        # call, an if-result, or an extract of a multi-result if
+        (callee === (===) || callee === isa || callee === isdefined) || continue
+        nop == 3 || continue
+        subj = 0
+        armlats = Any[]
+        local co::UnifiedIR.Operand
+        for i in (callee === (===) ? (2, 3) : (2,))
+            o = UnifiedIR.getop(ir, s, i)
+            UnifiedIR.optag(o) == UnifiedIR.TAG_STMT || continue
+            d = skip_refines(ir, UnifiedIR.asstmt(o))
+            dk = UnifiedIR.stmt_kind(ir, d)
+            pos = 0
+            if dk === K"extract" && begin
+                   bo = UnifiedIR.getop(ir, d, 1)
+                   UnifiedIR.optag(bo) == UnifiedIR.TAG_STMT &&
+                       UnifiedIR.stmt_kind(ir, UnifiedIR.asstmt(bo)) === K"if"
+               end
+                pos = Int(UnifiedIR.imm_value(UnifiedIR.getop(ir, d, 2))::Int64)
+                d = UnifiedIR.asstmt(UnifiedIR.getop(ir, d, 1))
+                dk = K"if"
+            elseif dk === K"if"
+                pos = 1
+            end
+            if dk === K"select" ||
+               (dk === K"call" && UnifiedIR.nops(ir, d) == 4 &&
+                static_operand_value(ir, UnifiedIR.getop(ir, d, 1)) === Core.ifelse)
+                ofs = dk === K"select" ? 0 : 1
+                co = UnifiedIR.getop(ir, d, 1 + ofs)
+                push!(armlats, stmt_lattice(ir, UnifiedIR.getop(ir, d, 2 + ofs)))
+                push!(armlats, stmt_lattice(ir, UnifiedIR.getop(ir, d, 3 + ofs)))
+                subj = i
+                break
+            elseif dk === K"if" && pos >= 1
+                arms = result_arms(ir, d)
+                (arms === nothing || isempty(arms)) && continue
+                bad = false
+                for (_, t) in arms
+                    pos <= UnifiedIR.nops(ir, t) || (bad = true; break)
+                    push!(armlats, stmt_lattice(ir, UnifiedIR.getop(ir, t, pos)))
+                end
+                bad && (empty!(armlats); continue)
+                co = UnifiedIR.getop(ir, d, 1)
+                subj = i
+                break
+            end
+        end
+        subj == 0 && continue
+        CC.widenconst(stmt_lattice(ir, co)) === Bool || continue
+        otherlat = stmt_lattice(ir, UnifiedIR.getop(ir, s, subj == 2 ? 3 : 2))
+        answers = Bool[]
+        ok = true
+        for armlat in armlats
+            r = callee === (===) ? CC.egal_tfunc(L, armlat, otherlat) :
+                callee === isa ? CC.isa_tfunc(L, armlat, otherlat) :
+                CC.isdefined_tfunc(L, armlat, otherlat)
+            (r isa CC.Const && r.val isa Bool) || (ok = false; break)
+            push!(answers, r.val::Bool)
+        end
+        (ok && !isempty(answers)) || continue
+        if length(answers) == 1
+            # the other arm diverges: the comparison's value is unconditional
+            UnifiedIR.replace_stmt!(ir, s, K"refine", UnifiedIR.vop(ir, answers[1]);
+                                    type = CC.Const(answers[1]))
+            n += 1
+            continue
+        end
+        length(answers) == 2 || continue
+        # the subject's condition must be reusable at the comparison site
+        if UnifiedIR.optag(co) == UnifiedIR.TAG_STMT
+            UnifiedIR.visible(ir, UnifiedIR.asstmt(co), s) || continue
+        end
+        UnifiedIR.replace_stmt!(ir, s, K"select", co,
+                                UnifiedIR.vop(ir, answers[1]), UnifiedIR.vop(ir, answers[2]);
+                                type = answers[1] == answers[2] ?
+                                       CC.Const(answers[1]) : Bool)
         n += 1
     end
     return n
@@ -323,6 +494,7 @@ function optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
         changed += materialize_consts!(ir)
         changed += canonicalize_getfields!(ir)
         changed += forward_extracts!(ir)
+        changed += fold_pure_queries!(ir)
         changed += forward_refines!(ir)
         changed += forward_if_results!(ir)
         changed += UnifiedIR.promote_cells!(ir)
@@ -350,6 +522,7 @@ function optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
             c == 0 && break
             changed += c
         end
+        changed += fold_uniform_block_args!(ir)
         changed += selectify!(ir)
         changed += resolve_finalizers!(ir, state)
         changed += sroa_mutables!(ir)
