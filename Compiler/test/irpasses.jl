@@ -311,7 +311,12 @@ let # FIXME: some nested example
     src = code_typed1((Int,)) do x
         Ref(Ref(x))[][]
     end
-    @test_broken is_scalar_replaced(src)
+    # the UnifiedIR pipeline scalarizes the nested Ref chain; stock does not
+    if isdefined(Main, :__unified_pipeline_active)
+        @test is_scalar_replaced(src)
+    else
+        @test_broken is_scalar_replaced(src)
+    end
 
     src = code_typed1((Int,)) do x
         Ref(Ref(Ref(Ref(Ref(Ref(Ref(Ref(Ref(Ref((x)))))))))))[][][][][][][][][][]
@@ -319,21 +324,29 @@ let # FIXME: some nested example
     @test_broken is_scalar_replaced(src)
 end
 
-# FIXME: immutable(mutable(...)) case
+# immutable(mutable(...)) case: eliminated by the UnifiedIR pipeline; stock cannot (FIXME)
 let src = code_typed1((Any,Any,Any)) do x, y, z
         xyz = ImmutableXYZ(x, y, z)
         outer = MutableOuter(xyz, xyz, xyz)
         outer.x.x, outer.y.y, outer.z.z
     end
-    @test_broken !any(isnew, src.code)
+    if isdefined(Main, :__unified_pipeline_active)
+        @test !any(isnew, src.code)
+    else
+        @test_broken !any(isnew, src.code)
+    end
 end
-# FIXME: mutable(mutable(...)) case
+# mutable(mutable(...)) case: eliminated by the UnifiedIR pipeline; stock cannot (FIXME)
 let src = code_typed1((Any,Any,Any)) do x, y, z
         xyz = MutableXYZ(x, y, z)
         outer = MutableOuter(xyz, xyz, xyz)
         outer.x.x, outer.y.y, outer.z.z
     end
-    @test_broken !any(isnew, src.code)
+    if isdefined(Main, :__unified_pipeline_active)
+        @test !any(isnew, src.code)
+    else
+        @test_broken !any(isnew, src.code)
+    end
 end
 
 let # should work with constant globals

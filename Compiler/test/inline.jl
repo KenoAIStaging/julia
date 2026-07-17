@@ -1349,8 +1349,13 @@ let src = code_typed1(Tuple{Any}) do x
     nnothrow_invokes = count(isinvoke(:nothrow_side_effect), src.code)
     @test count(iscall(f->!isa(singleton_type(argextype(f, src)), Core.Builtin)), src.code) ==
           count(iscall((src, nothrow_side_effect)), src.code) == 2 - nnothrow_invokes
-    # TODO: Our effect modeling is not yet strong enough to fully eliminate this
-    @test_broken count(isnew, src.code) == 0
+    # TODO: Stock effect modeling is not yet strong enough to fully eliminate this;
+    # the UnifiedIR pipeline is
+    if isdefined(Main, :__unified_pipeline_active)
+        @test count(isnew, src.code) == 0
+    else
+        @test_broken count(isnew, src.code) == 0
+    end
 end
 
 # Test finalizer varargs

@@ -954,7 +954,12 @@ unknown_sparam_nothrow2(x::Ref{Ref{T}}) where T = (T; nothing)
 abstractly_recursive1() = abstractly_recursive2()
 abstractly_recursive2() = (Base._return_type(abstractly_recursive1, Tuple{}); 1)
 abstractly_recursive3() = abstractly_recursive2()
-@test_broken Compiler.is_terminates(Base.infer_effects(abstractly_recursive3, ()))
+# (the UnifiedIR pipeline avoids the recursion-cycle taint; stock does not)
+if isdefined(Main, :__unified_pipeline_active)
+    @test Compiler.is_terminates(Base.infer_effects(abstractly_recursive3, ()))
+else
+    @test_broken Compiler.is_terminates(Base.infer_effects(abstractly_recursive3, ()))
+end
 actually_recursive1(x) = actually_recursive2(x)
 actually_recursive2(x) = (x <= 0) ? 1 : actually_recursive1(x - 1)
 actually_recursive3(x) = actually_recursive2(x)
