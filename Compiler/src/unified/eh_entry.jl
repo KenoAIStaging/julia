@@ -286,6 +286,17 @@ function codeinfo_to_ir_eh(ci::Core.CodeInfo; nargs::Int, name::Symbol)
                 record!(i, UnifiedIR.op_stmt(excarg[he]))
             elseif st isa Expr
                 emit_expr!(i, st)
+            elseif st isa GlobalRef
+                if isconst(st.mod, st.name) && isdefined(st.mod, st.name)
+                    record!(i, convert_value(st))
+                else
+                    # non-const statement-position global read stays a
+                    # statement (F3; see codeinfo_entry.jl — placement
+                    # carries the load's ordering and stock's value-position
+                    # canonicality)
+                    s = append_stmt!(b, K"globalref", UnifiedIR.vop(b.ir, st); type = Any)
+                    record!(i, UnifiedIR.op_stmt(s))
+                end
             else
                 # bare value statement
                 record!(i, convert_value(st))

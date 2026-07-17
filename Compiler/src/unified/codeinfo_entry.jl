@@ -89,9 +89,12 @@ function codeinfo_to_ir(ci::Core.CodeInfo; nargs::Int, name::Symbol = :f)
         elseif st isa Core.EnterNode || Meta.isexpr(st, :enter) ||
                Meta.isexpr(st, :leave) || Meta.isexpr(st, :pop_exception)
             throw(UnsupportedIR("exception handler IR (EnterNode/:leave) — outside the cfg-wrap v1 feature matrix"))
-        elseif st isa Core.PhiNode || st isa Core.PhiCNode || st isa Core.UpsilonNode
+        elseif st isa Core.PhiCNode || st isa Core.UpsilonNode
+            # pre-SSA'd exceptional stores need the eh path's scope recovery
             throw(UnsupportedIR("$(typeof(st)) in slot-form input"))
         end
+        # PhiNode input is accepted (F6): a block's leading φs become its
+        # region args; the values travel on the in-edges (see blockphis)
     end
     leaders = [i for i in 1:n if isleader[i]]
     blockof = zeros(Int, n)                 # stmt -> block index
@@ -102,6 +105,22 @@ function codeinfo_to_ir(ci::Core.CodeInfo; nargs::Int, name::Symbol = :f)
         end
     end
     nblocks = length(leaders)
+
+    # -- φ input (F6): a block's leading φs become its region args ----------
+    # φ edges name the predecessor's terminator statement; the edge-emission
+    # sites look the values up by predecessor block. φs outside a block's
+    # leading run are malformed SSA; a φ in the entry block has no value for
+    # the function-entry edge; an edgeless φ is undef and must be unused.
+    blockphis = Dict{Int,Vector{Pair{Int,Core.PhiNode}}}()
+    for (i, st) in enumerate(code)
+        st isa Core.PhiNode || continue
+        bi = blockof[i]
+        i == leaders[bi] || code[i - 1] isa Core.PhiNode ||
+            throw(UnsupportedIR("PhiNode outside its block's leading positions"))
+        isempty(st.edges) && continue           # undef φ: poisoned at the walk
+        bi == 1 && throw(UnsupportedIR("PhiNode in the entry block"))
+        push!(get!(() -> Pair{Int,Core.PhiNode}[], blockphis, bi), i => st)
+    end
 
     # -- builder ------------------------------------------------------------
     b = UnifiedIR.Builder(; name)
@@ -136,7 +155,9 @@ function codeinfo_to_ir(ci::Core.CodeInfo; nargs::Int, name::Symbol = :f)
 
     function convert_value(@nospecialize(v))::UnifiedIR.Operand
         if v isa Core.SSAValue
+            isassigned(ssamap, v.id) || throw(UnsupportedIR("forward SSA reference"))
             o = ssamap[v.id]
+            o === :undef_phi && throw(UnsupportedIR("use of an edgeless φ (undef value)"))
             o isa UnifiedIR.Operand || throw(UnsupportedIR("forward SSA reference"))
             return o
         elseif v isa Core.SlotNumber
@@ -158,6 +179,28 @@ function codeinfo_to_ir(ci::Core.CodeInfo; nargs::Int, name::Symbol = :f)
         else
             return UnifiedIR.vop(b.ir, v)
         end
+    end
+
+    # the values a `frombi → tobi` edge carries for `tobi`'s φ block args
+    # (in φ-edge order; region-IR edge args are parallel by construction). A
+    # φ lacking an assigned value on a taken edge is the undef-φ class —
+    # region IR carried args are total by construction (B3A map row 2).
+    function edge_args(frombi::Int, tobi::Int)
+        phis = get(blockphis, tobi, nothing)
+        phis === nothing && return UnifiedIR.Operand[]
+        ops = UnifiedIR.Operand[]
+        for (_, phi) in phis
+            ki = 0
+            for (k2, e) in enumerate(phi.edges)
+                (1 <= Int(e) <= n && blockof[Int(e)] == frombi) || continue
+                ki = k2
+                break
+            end
+            (ki != 0 && isassigned(phi.values, ki)) ||
+                throw(UnsupportedIR("undef φ edge (region IR carried args are total)"))
+            push!(ops, convert_value(phi.values[ki]))
+        end
+        return ops
     end
 
     returns = 0
@@ -188,22 +231,42 @@ function codeinfo_to_ir(ci::Core.CodeInfo; nargs::Int, name::Symbol = :f)
             end
             returns += 1
         elseif st isa Core.GotoNode
-            dest = blockregions[blockof[st.label]]
-            append_stmt!(b, K"goto", UnifiedIR.op_block(dest), UnifiedIR.op_inline(0))
+            dbi = blockof[st.label]
+            dargs = edge_args(blockof[i], dbi)
+            append_stmt!(b, K"goto", UnifiedIR.op_block(blockregions[dbi]),
+                         UnifiedIR.op_inline(length(dargs)), dargs...)
         elseif st isa Core.GotoIfNot
             cond = convert_value(st.cond)
-            fall = blockregions[blockof[i] + 1]
-            dest = blockregions[blockof[st.dest]]
+            fbi = blockof[i] + 1
+            dbi = blockof[st.dest]
+            fargs = edge_args(blockof[i], fbi)
+            dargs = edge_args(blockof[i], dbi)
             append_stmt!(b, K"br_if", cond,
-                         UnifiedIR.op_block(fall), UnifiedIR.op_inline(0),
-                         UnifiedIR.op_block(dest), UnifiedIR.op_inline(0))
+                         UnifiedIR.op_block(blockregions[fbi]),
+                         UnifiedIR.op_inline(length(fargs)), fargs...,
+                         UnifiedIR.op_block(blockregions[dbi]),
+                         UnifiedIR.op_inline(length(dargs)), dargs...)
         elseif st isa Core.NewvarNode
             sl = st.slot.id
             haskey(cellmap, sl) && append_stmt!(b, K"cell_new", UnifiedIR.op_stmt(cellmap[sl]))
             ssamap[i] = UnifiedIR.vop(b.ir, nothing)
         elseif st isa Expr
             convert_expr!(i, st)
-        elseif st isa Core.SlotNumber || st isa Core.SSAValue || st isa GlobalRef ||
+        elseif st isa GlobalRef
+            if isconst(st.mod, st.name) && isdefined(st.mod, st.name)
+                # a defined-const binding is legal (and stable) in value
+                # position — dissolve into an operand like any literal
+                ssamap[i] = convert_value(st)
+            else
+                # otherwise the statement-position read must SURVIVE: both
+                # the load's ordering (its UndefVarError/world-sensitivity
+                # point) and stock IRCode canonicality (unbound/partitioned
+                # GlobalRefs are not allowed in value position) depend on
+                # the placement (F3)
+                s = append_stmt!(b, K"globalref", UnifiedIR.vop(b.ir, st); type = Any)
+                ssamap[i] = UnifiedIR.op_stmt(s)
+            end
+        elseif st isa Core.SlotNumber || st isa Core.SSAValue ||
                st isa QuoteNode || !(st isa Union{Core.GotoNode,Core.GotoIfNot})
             # bare value statement: its SSA value is the value itself
             ssamap[i] = convert_value(st)
@@ -332,6 +395,13 @@ function codeinfo_to_ir(ci::Core.CodeInfo; nargs::Int, name::Symbol = :f)
 
     if single
         for (i, st) in enumerate(code)
+            if st isa Core.PhiNode
+                # no branches exist, so a φ can carry no edge value: undef
+                isempty(st.edges) ||
+                    throw(UnsupportedIR("PhiNode with edges in a single-block body"))
+                ssamap[i] = :undef_phi
+                continue
+            end
             convert_stmt_carry!(i, st)
         end
     else
@@ -348,16 +418,28 @@ function codeinfo_to_ir(ci::Core.CodeInfo; nargs::Int, name::Symbol = :f)
             push!(b.open, rid)
             lo = leaders[bi]
             hi = bi < nblocks ? leaders[bi + 1] - 1 : n
+            # the block's φs become its region args (F6); edgeless φs stay
+            # undef-poisoned (legal only while unused)
+            for (j, phi) in get(() -> Pair{Int,Core.PhiNode}[], blockphis, bi)
+                a = append_stmt!(b, K"region_arg"; type = Any)
+                ssamap[j] = UnifiedIR.op_stmt(a)
+            end
             for i in lo:hi
-                convert_stmt_carry!(i, code[i])
+                st = code[i]
+                if st isa Core.PhiNode
+                    isempty(st.edges) && (ssamap[i] = :undef_phi)
+                    continue                     # bound above (or poisoned)
+                end
+                convert_stmt_carry!(i, st)
             end
             # implicit fallthrough becomes explicit goto (§5.5)
             lastst = code[hi]
             if !(lastst isa Core.GotoNode || lastst isa Core.GotoIfNot ||
                  lastst isa Core.ReturnNode)
                 bi == nblocks && throw(UnsupportedIR("function falls off the end"))
+                fargs = edge_args(bi, bi + 1)
                 append_stmt!(b, K"goto", UnifiedIR.op_block(blockregions[bi + 1]),
-                             UnifiedIR.op_inline(0))
+                             UnifiedIR.op_inline(length(fargs)), fargs...)
             end
             reg.last = StmtId(Int(b.ir.body.len))
             pop!(b.open)

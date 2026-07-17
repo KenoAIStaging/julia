@@ -651,24 +651,87 @@ end
     irc3 = UnifiedCompiler.ir_to_ircode(ir3)
     @test Compiler.verify_ir(irc3) === nothing
     # stock prunes the dead (post-Union{}) join edge so no PhiNode remains;
-    # the unified optimizer does not yet prune it (precision gap, not a
-    # soundness issue — behavior below is right)
-    @test_broken count(s -> s isa Core.PhiNode, irc3.stmts.stmt) == 0
+    # the typed exit's unreachable-after rule (F5 fixed) prunes it the same
+    # way — the must-throw arm contributes no edge and the single-edge join
+    # collapses to a plain value
+    @test count(s -> s isa Core.PhiNode, irc3.stmts.stmt) == 0
     g3 = UnifiedCompiler.define_ir_method!(B3ADefs, gensym(:mte), 1, ir3)
     @test_throws ErrorException Base.invokelatest(g3)
     Core.eval(B3AConstGlobs, :(global_error_switch = false))
     @test Base.invokelatest(g3) == 1
     Core.eval(B3AConstGlobs, :(global_error_switch = true))
-    # the raw-CodeInfo entry path for phi-bearing generated-function sources
-    # is a declared converter gap (codeinfo_to_ir accepts slot-form only) —
-    # pinned here so the gap is visible until an entry for pre-SSA'd sources
-    # exists (COMPILER-PORT-PLAN A5)
+    # the raw-CodeInfo entry path for phi-bearing sources (F6 fixed): a
+    # block's leading φs become its region args, the values travel on the
+    # in-edges; an edgeless φ is undef and legal while unused. Generated
+    # functions returning pre-SSA'd CodeInfo can now enter the pipeline.
     fields = UnifiedCompiler.default_codeinfo_fields(2, 1, Symbol[Symbol("#self#")],
                                                      fill(0x08, 1))
     fields[:code] = Any[Core.PhiNode(Int32[], Any[]), Core.ReturnNode(1)]
     ci = UnifiedCompiler.make_codeinfo(; fields...)
+    ir_phi = UnifiedCompiler.codeinfo_to_ir(ci; nargs = 1, name = :phi_entry)
+    @test UnifiedIR.verify_ir(ir_phi; level = 1)
+    @test UnifiedIR.interpret(ir_phi, nothing) === 1
+    # a φ join over a runtime-global branch — the original
+    # gen_must_throw_phinode_edge/unreachable_phinode_edge input shape
+    # (statement-position global read, GotoIfNot on its SSA value, φ join
+    # with one edge from the fallthrough arm)
+    fields2 = UnifiedCompiler.default_codeinfo_fields(7, 2,
+        Symbol[Symbol("#self#"), :x], fill(0x08, 2))
+    fields2[:code] = Any[
+        GlobalRef(B3AConstGlobs, :global_error_switch),
+        Core.GotoIfNot(Core.SSAValue(1), 5),
+        Expr(:call, GlobalRef(Base, :+), 10, 1),
+        Core.GotoNode(6),
+        Expr(:call, GlobalRef(Base, :*), 4, 5),
+        Core.PhiNode(Int32[4, 5], Any[Core.SSAValue(3), Core.SSAValue(5)]),
+        Core.ReturnNode(Core.SSAValue(6)),
+    ]
+    ci2 = UnifiedCompiler.make_codeinfo(; fields2...)
+    ir_join = UnifiedCompiler.codeinfo_to_ir(ci2; nargs = 2, name = :phi_join)
+    @test UnifiedIR.verify_ir(ir_join; level = 1)
+    @test UnifiedIR.interpret(ir_join, nothing, 100) == 11   # switch true: then-arm
+    stj = UnifiedCompiler.UInferState()
+    ir_join = UnifiedCompiler.optimize_ir!(ir_join, Any[Any, Int]; state = stj)
+    @test UnifiedIR.verify_ir(ir_join; level = 1)
+    @test Compiler.verify_ir(UnifiedCompiler.ir_to_ircode(ir_join)) === nothing
+    gj = UnifiedCompiler.define_ir_method!(B3ADefs, gensym(:phijoin), 2, ir_join)
+    @test Base.invokelatest(gj, 100) == 11
+    Core.eval(B3AConstGlobs, :(global_error_switch = false))
+    @test Base.invokelatest(gj, 100) == 20
+    Core.eval(B3AConstGlobs, :(global_error_switch = true))
+    # backedge φs that permute each other (the #29262 parallel-move class,
+    # entering as raw SSA): φa/φb swap on every trip; three trips land back
+    # on the initial assignment
+    fields3 = UnifiedCompiler.default_codeinfo_fields(10, 1,
+        Symbol[Symbol("#self#")], fill(0x08, 1))
+    fields3[:code] = Any[
+        Core.GotoNode(2),
+        Core.PhiNode(Int32[1, 8], Any[0, Core.SSAValue(5)]),
+        Core.PhiNode(Int32[1, 8], Any[QuoteNode(:a), Core.SSAValue(4)]),
+        Core.PhiNode(Int32[1, 8], Any[QuoteNode(:b), Core.SSAValue(3)]),
+        Expr(:call, GlobalRef(Base, :+), Core.SSAValue(2), 1),
+        Expr(:call, GlobalRef(Base, :<), Core.SSAValue(5), 3),
+        Core.GotoIfNot(Core.SSAValue(6), 9),
+        Core.GotoNode(2),
+        Expr(:call, GlobalRef(Core, :tuple), Core.SSAValue(3), Core.SSAValue(4)),
+        Core.ReturnNode(Core.SSAValue(9)),
+    ]
+    ci3 = UnifiedCompiler.make_codeinfo(; fields3...)
+    ir_swap = UnifiedCompiler.codeinfo_to_ir(ci3; nargs = 1, name = :phi_swap)
+    @test UnifiedIR.verify_ir(ir_swap; level = 1)
+    @test UnifiedIR.interpret(ir_swap, nothing) === (:a, :b)
+    sts = UnifiedCompiler.UInferState()
+    ir_swap = UnifiedCompiler.optimize_ir!(ir_swap, Any[Any]; state = sts)
+    @test UnifiedIR.verify_ir(ir_swap; level = 1)
+    gs = UnifiedCompiler.define_ir_method!(B3ADefs, gensym(:phiswap), 1, ir_swap)
+    @test Base.invokelatest(gs) === (:a, :b)
+    # exceptional pre-SSA'd forms still take the declared eh-path gap
+    fields4 = UnifiedCompiler.default_codeinfo_fields(2, 1, Symbol[Symbol("#self#")],
+                                                      fill(0x08, 1))
+    fields4[:code] = Any[Core.UpsilonNode(1), Core.ReturnNode(1)]
+    ci4 = UnifiedCompiler.make_codeinfo(; fields4...)
     @test_throws UnifiedCompiler.UnsupportedIR UnifiedCompiler.codeinfo_to_ir(
-        ci; nargs = 1, name = :phi_entry)
+        ci4; nargs = 1, name = :ups_entry)
 end
 
 # ---------------------------------------------------------------------------
@@ -706,19 +769,20 @@ end
     # (were the check dropped, this would be a null pointer load)
     g = UnifiedCompiler.redefine_through_ir(f_if_typecheck, Tuple{})
     @test_throws TypeError Base.invokelatest(g)
-    # KNOWN GAP: the typed pipeline currently folds the non-Bool branch away
-    # entirely (`if nothing` leaves no trace — no Union{} statement, no
-    # branch, no unreachable), losing the mandatory TypeError; stock keeps a
-    # typeassert(nothing, Bool)::Union{} + unreachable. Executing the
-    # miscompiled body would dereference Ptr(0), so the pin is the static
-    # witness for the check, not a call.
+    # F2 fixed: the degenerate-branch collapse emits the branch's mandatory
+    # Bool typecheck (`typeassert(cond, Bool)` — nothrow/removable for
+    # provably-Bool conditions, throwing otherwise), and inference types a
+    # cannot-be-Bool branch condition Bottom (stock's must-throw GotoIfNot
+    # rule), so `if nothing` leaves a Union{} witness and the TypeError
+    # survives to runtime. (Executing the once-miscompiled body would have
+    # dereferenced Ptr(0); the static witness stays the assert.)
     tir = UnifiedCompiler.typed_ir(f_if_typecheck, Any[])
     hascheck = any(UnifiedIR.each_stmt(tir)) do s
         k = UnifiedIR.stmt_kind(tir, s)
         k === K"if" || k === K"unreachable" ||
             UnifiedIR.stmt_type(tir, s) === Union{}
     end
-    @test_broken hascheck
+    @test hascheck
 end
 
 @testset "issue #57153 shape: loop + try/finally + return crossing finally" begin
@@ -743,19 +807,20 @@ end
     tir = UnifiedCompiler.typed_ir(_worker_task57153, Any[])
     @test UnifiedIR.verify_ir(tir; level = 1)
     irc = UnifiedCompiler.ir_to_ircode(tir)
-    # KNOWN GAP: the body references unbound globals (`q`, `m` — undefined
-    # here, as in the original), and the typed exit leaves the unbound
-    # GlobalRefs in value position — exactly the non-canonical placement
-    # ssair.jl's verifier tests reject ("GlobalRef in value position is
-    # non-canonical"). Stock keeps unbound global reads as statements; the
-    # exit should too.
+    # F3 fixed: the body references unbound globals (`q`, `m` — undefined
+    # here, as in the original). Lowering emits such reads as statements;
+    # the entry converters now PRESERVE statement-position global loads as
+    # `globalref` statements (instead of dissolving them into operands), so
+    # the typed exit keeps them out of value position and stock's
+    # canonicality rule ("Unbound or partitioned GlobalRef not allowed in
+    # value position") is satisfied.
     stockok = try
         Compiler.verify_ir(irc, false)
         true
     catch
         false
     end
-    @test_broken stockok
+    @test stockok
 end
 
 @testset "issue #60660: nested-iterator comprehension through the converters" begin
