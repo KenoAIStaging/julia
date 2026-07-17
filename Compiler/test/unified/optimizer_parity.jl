@@ -60,6 +60,7 @@ op_mut_sroa(x, y, z) = begin m = OPMutXYZ(x, y, z); m.y = 42; (m.x, m.y, m.z) en
 op_call_cov(x) = op_split_cov(x)
 op_call_fb(x) = op_split_fb(x)
 op_call_one(x) = op_split_one(x)
+op_call_none() = op_split_one(nothing)
 
 @noinline op_fin_effect(x) =
     Base.@assume_effects :total !:effect_free @ccall jl_(x::Any)::Cvoid
@@ -150,6 +151,13 @@ end
             @test op_call_fb(1) === :Number
             @test op_call_fb(Int) === :Type
             @test_throws MethodError op_call_fb("s")
+        end
+
+        @testset "match-based union split: no applicable method" begin
+            src = _code_typed1(op_call_none, ())
+            @test count(x -> _iscall(src, Core.throw_methoderror, x), src.code) == 1
+            @test !any(x -> _iscall(src, op_split_one, x), src.code)
+            @test_throws MethodError op_call_none()
         end
 
         @testset "match-based union split: single non-covering match" begin

@@ -492,9 +492,18 @@ function match_split_call!(ir::UnifiedIR.IR, s::StmtId, st::UInferState,
     result === nothing && return false
     result.ambig && return false
     n = length(result.matches)
-    1 <= n <= 2 || return false
+    n <= 2 || return false
     col = st.edges
     col === nothing || record_call!(col, sig, result)
+    if n == 0
+        callops0 = UnifiedIR.operands(ir, s)
+        # no applicable method at all: the call is a guaranteed MethodError
+        # (stock rewrites these to the throwing form outright)
+        UnifiedIR.replace_stmt!(ir, s, K"call",
+                                UnifiedIR.vop(ir, Core.throw_methoderror),
+                                callops0...; type = Union{})
+        return true
+    end
     match1 = result.matches[1]::Core.MethodMatch
     spec1 = match1.spec_types
     CC.has_free_typevars(spec1) && return false
