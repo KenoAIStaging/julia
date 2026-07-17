@@ -225,6 +225,128 @@ function sroa_mutables!(ir::UnifiedIR.IR)
 end
 
 # ---------------------------------------------------------------------------
+# Finalizer resolution (stock `try_resolve_finalizer!` cases)
+# ---------------------------------------------------------------------------
+
+"""
+    resolve_finalizers!(ir, st) -> Int
+
+`Core.finalizer(f, obj)` registrations the optimizer can discharge
+(stock ssair/passes.jl `try_resolve_finalizer!` — the CASES):
+
+  * `f`'s call effects for `obj`'s type are removable-if-unused → the
+    finalizer can never do observable work: the registration is erased
+    (no escape analysis needed — this is legal for escaping objects too).
+  * `f` is finalizer-inlineable (nothrow ∧ notaskstate) and `obj` is a
+    non-escaping local `new` of a mutable type whose only other uses are
+    field loads/stores: the registration is erased and `f(obj)` is placed
+    right after the last use's top-level container in the allocation's
+    home region (the statically-known end of the object's lifetime; v1
+    requires the registration itself to sit in that region, so the call
+    runs exactly on the executions that registered it). The placed call
+    then inlines on later rounds, exposing loads that mutable SROA
+    scalarizes — the allocation disappears entirely.
+
+Editable state. Effects queries run through the unified inference
+machinery on `st` (edge-recorded in driver mode).
+"""
+function resolve_finalizers!(ir::UnifiedIR.IR, st::UInferState)
+    UnifiedIR.check_state(ir, UnifiedIR.LAYOUT_EDITABLE, "resolve_finalizers!")
+    n = 0
+    for s in collect(UnifiedIR.each_stmt(ir))
+        UnifiedIR.is_tombstone(ir, s) && continue
+        UnifiedIR.stmt_kind(ir, s) === K"call" || continue
+        UnifiedIR.nops(ir, s) == 3 || continue
+        callee = static_operand_value(ir, UnifiedIR.getop(ir, s, 1))
+        (callee === Core.finalizer || callee === Base.finalizer) || continue
+        fo = UnifiedIR.getop(ir, s, 2)
+        f = static_operand_value(ir, fo)
+        f === nothing && continue
+        objo = UnifiedIR.getop(ir, s, 3)
+        UnifiedIR.optag(objo) == UnifiedIR.TAG_STMT || continue
+        obj = UnifiedIR.asstmt(objo)
+        objT = CC.widenconst(stmt_lattice(ir, objo))
+        (objT isa DataType && ismutabletype(objT)) || continue
+        r = try
+            fr = Frame(UnifiedIR.Builder().ir, st, Any[])
+            infer_call(fr, Any[CC.Const(f), objT])
+        catch
+            nothing
+        end
+        r === nothing && continue
+        fx = r.effects
+        if CC.is_removable_if_unused(fx)
+            UnifiedIR.replace_stmt!(ir, s, K"refine", objo;
+                                    type = UnifiedIR.stmt_type(ir, s))
+            n += 1
+            continue
+        end
+        Compiler.is_finalizer_inlineable(fx) || continue
+        UnifiedIR.stmt_kind(ir, obj) === K"new" || continue
+        homer = UnifiedIR.stmt_region(ir, obj)
+        UnifiedIR.stmt_region(ir, s) == homer || continue
+        # escape check: every other use is a field load/store
+        ok = true
+        uses = StmtId[]
+        UnifiedIR.each_ssa_use(ir) do site, used
+            (ok && used == obj) || return
+            site isa UnifiedIR.StmtOperand || (ok = false; return)
+            u = site.user
+            UnifiedIR.is_tombstone(ir, u) && return
+            u == s && return
+            uk = UnifiedIR.stmt_kind(ir, u)
+            if uk === K"extract" && site.opidx == 1
+                push!(uses, u)
+            elseif uk === K"call"
+                callee2 = static_operand_value(ir, UnifiedIR.getop(ir, u, 1))
+                nopu = UnifiedIR.nops(ir, u)
+                if (callee2 === Core.getfield || callee2 === Base.getfield) &&
+                   site.opidx == 2 && (nopu == 3 || nopu == 4)
+                    push!(uses, u)
+                elseif (callee2 === Core.setfield! || callee2 === Base.setfield!) &&
+                       site.opidx == 2 && nopu == 4
+                    push!(uses, u)
+                else
+                    ok = false
+                end
+            else
+                ok = false
+            end
+        end
+        ok || continue
+        # anchor = the flat-last use's top-level container within the home
+        # region (uses inside ifs/loops resolve to the owning op; handler
+        # positions refuse — a throw path must keep the GC-time semantics)
+        anchor = s
+        for u in uses
+            c = u
+            rr = UnifiedIR.stmt_region(ir, c)
+            steps = 0
+            while rr != homer
+                (steps += 1) <= UnifiedIR.nregions(ir) || (ok = false; break)
+                reg = UnifiedIR.getregion(ir, rr)
+                reg.kind === UnifiedIR.REGION_HANDLER && (ok = false; break)
+                c = reg.owner
+                c.id == 0 && (ok = false; break)
+                rr = UnifiedIR.stmt_region(ir, c)
+            end
+            ok || break
+            UnifiedIR.comes_before(ir, anchor, c) && (anchor = c)
+        end
+        ok || continue
+        members = UnifiedIR.region_stmts(ir, homer)
+        idx = findfirst(==(anchor), members)
+        idx === nothing && continue
+        idx < length(members) || continue
+        UnifiedIR.insert_before!(ir, members[idx + 1], K"call", fo, objo; type = Any)
+        UnifiedIR.replace_stmt!(ir, s, K"refine", objo;
+                                type = UnifiedIR.stmt_type(ir, s))
+        n += 1
+    end
+    return n
+end
+
+# ---------------------------------------------------------------------------
 # The cell-promotion mem2reg suite lives in the substrate now
 # (UnifiedIR/src/promote.jl) so lowering's capture analysis runs the SAME
 # machinery. Bind the names this module's passes, tests, and harnesses use;

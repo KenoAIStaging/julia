@@ -351,6 +351,7 @@ function optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
             changed += c
         end
         changed += selectify!(ir)
+        changed += resolve_finalizers!(ir, state)
         changed += sroa_mutables!(ir)
         changed += adce_region_ops!(ir)
         if inline

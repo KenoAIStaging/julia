@@ -61,6 +61,23 @@ op_call_cov(x) = op_split_cov(x)
 op_call_fb(x) = op_split_fb(x)
 op_call_one(x) = op_split_one(x)
 
+@noinline op_fin_effect(x) =
+    Base.@assume_effects :total !:effect_free @ccall jl_(x::Any)::Cvoid
+mutable struct OPAllocNoEscape
+    function OPAllocNoEscape()
+        finalizer(new()) do this
+            op_fin_effect(nothing)
+        end
+    end
+end
+function op_useless_finalizer()
+    x = Ref(1)
+    finalizer(x) do x
+        nothing
+    end
+    return x
+end
+
 @testset "optimizer parity: wave-4 pass fixes" begin
     saved = Base.REFLECTION_COMPILER[]
     try
@@ -105,6 +122,17 @@ op_call_one(x) = op_split_one(x)
             @test count(_isnew, src.code) == 0
             @test !any(x -> _iscall(src, getfield, x), src.code)
             @test !any(x -> _iscall(src, setfield!, x), src.code)
+        end
+
+        @testset "finalizer resolution" begin
+            # non-escaping allocation with an inlineable finalizer: both go
+            src = _code_typed1(() -> (for i = 1:100; OPAllocNoEscape(); end), ())
+            @test count(_isnew, src.code) == 0
+            # a finalizer that can do no observable work is erased even
+            # though the object escapes (returned)
+            src = _code_typed1(op_useless_finalizer, ())
+            @test !any(x -> _iscall(src, Core.finalizer, x), src.code)
+            @test length(src.code) == 2
         end
 
         @testset "match-based union split: covered pair" begin
