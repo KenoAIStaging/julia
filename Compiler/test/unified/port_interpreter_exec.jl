@@ -198,17 +198,16 @@ end
         @test Core.eval(B3AIMin, b3a_thunk(irc)) === want
         @test Core.eval(B3AIDef, b3a_thunk(irc)) === want
     end
-    # exit_lowered leg: KNOWN MISCOMPILE — its `continue` lowering binds the
-    # carried slots sequentially, so a parallel move whose values name other
-    # carried args of the same loop reads already-overwritten slots (this
-    # program yields (:b, :b, :b, :b)). Pinned until the converter performs
-    # a real parallel move (Compiler/src/unified/exit_lowered.jl,
-    # K"continue" emission).
+    # exit_lowered leg: the `continue` lowering performs a real parallel
+    # move (F1 fixed — sources naming carried slots of the same loop are
+    # snapshotted before any slot is written; exit_lowered.jl
+    # `emit_parallel_binds!`), so the swap/rotation chain executes as φ
+    # semantics on the slot-form path too.
     b3a_setflag!(true)
     glow = UnifiedCompiler.define_ir_method!(B3AIDef, gensym(:p2low), 1, ir)
-    @test_broken Base.invokelatest(glow) === (:b, :a, :c, :c)
+    @test Base.invokelatest(glow) === (:b, :a, :c, :c)
     glowmin = UnifiedCompiler.define_ir_method!(B3AIMin, gensym(:p2low), 1, ir)
-    @test_broken Base.invokelatest(glowmin) === (:b, :a, :c, :c)
+    @test Base.invokelatest(glowmin) === (:b, :a, :c, :c)
 end
 
 # ---------------------------------------------------------------------------

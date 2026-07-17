@@ -195,6 +195,48 @@ function bind_result_slots!(cx::ExitCtx, s::StmtId, vals::Vector{Any}, slots::Ve
     end
 end
 
+"""
+    emit_parallel_binds!(cx, dests, vals, reads=Any[]) -> reads′
+
+Bind `dests[i] = vals[i]` with φ (parallel-move) semantics: every source is
+read before any destination slot is written. A backedge's carried values (and
+a cfg edge's block args) are simultaneous by definition — assigning the slots
+sequentially mis-executes swaps/rotations among them (#29262: later
+assignments read already-overwritten slots). Sources naming a written
+destination slot are snapshotted into fresh temps first; self-moves
+(`slot = slot`) are elided (and their slots never written). `reads` are
+additional values (the branch condition) that must also observe pre-move
+state; they are returned rewritten.
+"""
+function emit_parallel_binds!(cx::ExitCtx, dests::Vector{Int}, vals::Vector{Any},
+                              reads::Vector{Any} = Any[])
+    written = Int[]
+    for (i, sl) in enumerate(dests)
+        v = vals[i]
+        (v isa Core.SlotNumber && v.id == sl) || push!(written, sl)
+    end
+    snap = Dict{Int,Any}()
+    function protect(@nospecialize(v))
+        (v isa Core.SlotNumber && v.id in written) || return v
+        return get!(snap, v.id) do
+            tmp = newslot!(cx, :pmove)
+            emitstmt!(cx, Expr(:(=), Core.SlotNumber(tmp), v))
+            Core.SlotNumber(tmp)
+        end
+    end
+    reads = Any[protect(v) for v in reads]
+    staged = Tuple{Int,Any}[]
+    for (i, sl) in enumerate(dests)
+        v = vals[i]
+        (v isa Core.SlotNumber && v.id == sl) && continue   # self-move
+        push!(staged, (sl, protect(v)))
+    end
+    for (sl, v) in staged
+        emitstmt!(cx, Expr(:(=), Core.SlotNumber(sl), v))
+    end
+    return reads
+end
+
 function emit_stmt!(cx::ExitCtx, s::StmtId, k::UnifiedIR.Kind, loopctxs)
     ir = cx.ir
     if k === K"if"
@@ -242,10 +284,10 @@ function emit_stmt!(cx::ExitCtx, s::StmtId, k::UnifiedIR.Kind, loopctxs)
         emit_leaves!(cx, trydepth)
         cond = exit_value(cx, UnifiedIR.getop(ir, s, 2))
         vals = exit_values(cx, s, 3)
-        # both paths need the new carried values bound
-        for (i, sl) in enumerate(carried)
-            emitstmt!(cx, Expr(:(=), Core.SlotNumber(sl), vals[i]))
-        end
+        # both paths need the new carried values bound — as a PARALLEL move
+        # (the values and the condition are all reads of the pre-continue
+        # state; carried slots may permute each other, #29262/F1)
+        cond = emit_parallel_binds!(cx, carried, vals, Any[cond])[1]
         contkey = (:cont, s.id)
         emitgotoifnot!(cx, cond, contkey)
         emitgoto!(cx, headkey)
@@ -497,9 +539,11 @@ end
 
 function emit_edge_transfer!(cx::ExitCtx, dest::RegionId, args::Vector{UnifiedIR.Operand})
     blk = UnifiedIR.getregion(cx.ir, dest)
-    for (i, a) in enumerate(blk.args)
-        emitstmt!(cx, Expr(:(=), Core.SlotNumber(cx.slotof[a.id]), exit_value(cx, args[i])))
-    end
+    dests = Int[cx.slotof[a.id] for a in blk.args]
+    vals = Any[exit_value(cx, args[i]) for i in 1:length(blk.args)]
+    # block args are φ semantics: bind as a parallel move (a self-edge may
+    # permute its own args, #29262/F1)
+    emit_parallel_binds!(cx, dests, vals)
     # a goto to an ancestor island's block leaves the try/catch scopes in
     # between: synthesize their pop_exception/:leave actions (§5.9)
     d = get(cx.block_depth, dest.id, nothing)
