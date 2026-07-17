@@ -191,13 +191,21 @@ function canonicalize_getfields!(ir::UnifiedIR.IR)
         (nop == 3 || nop == 4) || continue
         callee = static_operand_value(ir, UnifiedIR.getop(ir, s, 1))
         callee === Core.getfield || callee === Base.getfield || continue
+        need_inbounds_proof = false
         if nop == 4
             # the trailing operand (boundscheck flag or memory order) is
-            # dropped by the conversion: only legal when it provably does not
-            # change behavior — a Bool literal or :not_atomic (an INVALID
-            # order symbol makes the original getfield throw)
+            # dropped by the conversion: legal for a Bool literal or
+            # :not_atomic (an INVALID order symbol makes the original
+            # getfield throw). A DYNAMIC Bool (an `Expr(:boundscheck)`
+            # carried through inlining) only selects whether an
+            # out-of-bounds index raises BoundsError, so dropping it is
+            # additionally legal when the index is provably in bounds —
+            # then no execution can distinguish the two.
             extra = static_operand_value(ir, UnifiedIR.getop(ir, s, 4))
-            (extra === true || extra === false || extra === :not_atomic) || continue
+            if !(extra === true || extra === false || extra === :not_atomic)
+                CC.widenconst(stmt_lattice(ir, UnifiedIR.getop(ir, s, 4))) === Bool || continue
+                need_inbounds_proof = true
+            end
         end
         vo = UnifiedIR.getop(ir, s, 2)
         UnifiedIR.optag(vo) == UnifiedIR.TAG_STMT || continue
@@ -212,6 +220,15 @@ function canonicalize_getfields!(ir::UnifiedIR.IR)
         idx isa Int || continue
         idx >= 1 || continue
         idx < (1 << 23) || continue
+        if need_inbounds_proof
+            xt = CC.widenconst(stmt_lattice(ir, vo))
+            xt isa DataType || continue
+            nf = CC.datatype_fieldcount(xt)
+            (nf isa Int && idx <= nf) || continue
+            # atomic fields reject a plain (non-order) access; dropping a
+            # Bool boundscheck must not legalize an atomics violation
+            Base.isfieldatomic(xt, idx) && continue
+        end
         UnifiedIR.replace_stmt!(ir, s, K"extract", vo, UnifiedIR.op_inline(idx);
                                 type = UnifiedIR.stmt_type(ir, s))
         n += 1
