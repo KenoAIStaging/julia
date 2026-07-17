@@ -62,6 +62,14 @@ op_call_fb(x) = op_split_fb(x)
 op_call_one(x) = op_split_one(x)
 op_call_none() = op_split_one(nothing)
 
+let b = Expr(:block, (:(y += sin($x)) for x in randn(300))...)
+    @eval function op_sin_chain()
+        y = 0.0
+        $b
+        y
+    end
+end
+
 @noinline op_fin_effect(x) =
     Base.@assume_effects :total !:effect_free @ccall jl_(x::Any)::Cvoid
 mutable struct OPAllocNoEscape
@@ -123,6 +131,12 @@ end
             @test count(_isnew, src.code) == 0
             @test !any(x -> _iscall(src, getfield, x), src.code)
             @test !any(x -> _iscall(src, setfield!, x), src.code)
+        end
+
+        @testset "large const-foldable chain folds completely" begin
+            # the round budget must not strand folded-but-unswept const calls
+            src = _code_typed1(op_sin_chain, ())
+            @test length(src.code) == 1 && _isreturn(src.code[1])
         end
 
         @testset "finalizer resolution" begin

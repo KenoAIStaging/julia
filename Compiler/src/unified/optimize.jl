@@ -371,6 +371,15 @@ function optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
     UnifiedIR.dce!(ir)
     ir = compact_carry_names!(ir)
     infer_ir!(ir, argtypes; state)
+    # post-final-inference constant sweep: when the round budget ends on a
+    # still-changing body (large const-foldable chains), the last inference
+    # can leave freshly-proven Consts unmaterialized; one more
+    # refine+materialize+DCE round makes the fold visible to the exit
+    if refine_effects!(ir) + materialize_consts!(ir) > 0
+        UnifiedIR.dce!(ir)
+        ir = compact_carry_names!(ir)
+        infer_ir!(ir, argtypes; state)
+    end
     UnifiedIR.verify_ir(ir; level = 1)
     return ir
 end
