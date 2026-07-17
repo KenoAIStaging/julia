@@ -203,6 +203,45 @@ function resolve_inline_target(ir::UnifiedIR.IR, s::StmtId, k::UnifiedIR.Kind, s
     end
 end
 
+"""A splice-able value for one `sparam_vals` entry. Plain values pass
+through. An unresolved `TypeVar` or a constrained-TypeVar marker
+(`svec(tv, flag)`) is only bakeable when the var's bounds PIN it
+(`lb === ub` — the intersection admits exactly one binding, e.g. the
+invariant `Ref{Any}` position that produces `svec(T>:Any, true)`); those
+bake to the pinned bound. Anything else returns the `_unbakeable` sentinel
+(stock handles the general case with a runtime `Core._compute_sparams`;
+this port declines those splices instead)."""
+struct _Unbakeable end
+const _unbakeable = _Unbakeable()
+function bakeable_sparam(@nospecialize(v))
+    tv = v
+    if v isa Core.SimpleVector
+        (length(v) == 2 && v[1] isa TypeVar) || return _unbakeable
+        tv = v[1]
+    end
+    if tv isa TypeVar
+        tv.lb === tv.ub && return tv.ub
+        return _unbakeable
+    end
+    return v
+end
+
+"""Does the callee body read (`TAG_SPARAM` operand) a static parameter whose
+baked value is `_unbakeable`? Unused parameters do not block inlining
+(their values are never materialized by `splice_body!`)."""
+function reads_unbakeable_sparam(callee::UnifiedIR.IR, spvals::Vector{Any})
+    for s in UnifiedIR.each_stmt(callee)
+        for j in 1:UnifiedIR.nops(callee, s)
+            o = UnifiedIR.getop(callee, s, j)
+            UnifiedIR.optag(o) == UnifiedIR.TAG_SPARAM || continue
+            idx = Int(UnifiedIR.payload(o))
+            idx <= length(spvals) || return true
+            spvals[idx] === _unbakeable && return true
+        end
+    end
+    return false
+end
+
 """The effects-side half of stock `adjust_boundscheck!`: a callee inlined at
 an `@inbounds`-flagged site enters an elided-boundscheck context, so every
 spliced statement is marked FLAG_INBOUNDS — the post-optimization effects
@@ -252,9 +291,6 @@ function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
         m.isva && continue
         Int(m.nargs) == UnifiedIR.nops(ir, s) - argofs || continue
         caller_m === m && continue                        # direct self-recursion
-        # unresolved TypeVars and constrained-TypeVar markers (svec(tv, flag))
-        # cannot be baked into the splice as plain sparam values
-        any(v -> v isa TypeVar || v isa Core.SimpleVector, mi.sparam_vals) && continue
         src = try
             Base.uncompressed_ir(m)
         catch
@@ -272,6 +308,14 @@ function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
             nothing
         end
         callee_ir === nothing && continue
+        # unresolved TypeVars and constrained-TypeVar markers (svec(tv, flag))
+        # cannot be baked into the splice as plain sparam values — but that
+        # only matters when the body actually READS the parameter (stock keys
+        # the same decision off spvals_ssa/_compute_sparams; constructors of
+        # diagonal-typevar methods are the common never-reads case), and
+        # pinned markers (lb === ub) still have a unique bakeable value
+        spvals = Any[bakeable_sparam(v) for v in mi.sparam_vals]
+        reads_unbakeable_sparam(callee_ir, spvals) && continue
         UnifiedIR.nstmts(callee_ir) - Int(m.nargs) <= limit || continue
         # handler-bearing callees: stock declines these by default; admit them
         # only under an explicit @inline / FLAG_INLINE request (they exercise
@@ -288,8 +332,7 @@ function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
         end
         argmap = UnifiedIR.Operand[UnifiedIR.getop(ir, s, i)
                                    for i in (argofs + 1):UnifiedIR.nops(ir, s)]
-        UnifiedIR.splice_body!(ir, s, callee_ir; argmap,
-                               sparams = Any[t for t in mi.sparam_vals])
+        UnifiedIR.splice_body!(ir, s, callee_ir; argmap, sparams = spvals)
         inlined += 1
     end
     return inlined
