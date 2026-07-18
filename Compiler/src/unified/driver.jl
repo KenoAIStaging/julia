@@ -216,13 +216,19 @@ const DRIVER_REENTRY_LIMIT = Base.RefValue(8)
 "Per-session admission budget for REENTRANT passes (requests arriving while
 this task is already inside the driver — the self-hosting burn-in). Every
 pass re-infers its callee tree with fresh state (the pre-A6 soundness
-basis), so unbounded admission makes first activation re-derive the
-compiler's own call graph body by body — an hour-class burn-in. Admit up to
-this many reentrant bodies through the pipeline per session (unified,
-cached), then decline precisely (`:reentrant_budget` — stock compiles and
-caches those, so a repeated workload is reentrant-quiet either way). A6's
-cross-body memoization removes the need for this valve."
-const DRIVER_REENTRANT_BUDGET = Base.RefValue(1_000)
+basis), AND its own execution raises further reentrant requests (each
+dynamic dispatch in not-yet-compiled driver code is a compile request), so
+admissions CASCADE — a tower of nested fresh-state passes per admitted
+body. Measured on the driver demo's first post-flip compile: a budget of
+1000 spends ~30s in the cascade where a budget of 32 spends ~2s, with the
+same ledger semantics. Admit a small representative sample through the
+pipeline per session (unified, cached), then decline precisely
+(`:reentrant_budget` — stock compiles and caches those, so the burn-in
+completes at stock speed and a repeated workload is reentrant-quiet either
+way; this is also stock's shape: the compiler under test does not compile
+its own code). A6's cross-body memoization removes the need for this
+valve."
+const DRIVER_REENTRANT_BUDGET = Base.RefValue(32)
 const REENTRANT_ADMITTED = Base.Threads.Atomic{Int}(0)
 
 ":invoke emission switch (devirtualize_calls!)."
