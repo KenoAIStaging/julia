@@ -225,6 +225,68 @@ function sroa_mutables!(ir::UnifiedIR.IR)
 end
 
 # ---------------------------------------------------------------------------
+# isdefined folding over local allocations
+# ---------------------------------------------------------------------------
+
+"""
+    fold_isdefineds!(ir) -> Int
+
+`isdefined(x, fld)` where `x` traces to a local `new` folds to `true`
+when the field was supplied at construction or SOME `setfield!` of that
+field dominates the query (stock's isdefined elimination). Definedness is
+MONOTONE — stores only add it — so the fold is sound even when the
+object escapes (unknown code can only store more). The indeterminate and
+never-stored cases are left for the full SROA analysis (which knows the
+complete use set). Editable state.
+"""
+function fold_isdefineds!(ir::UnifiedIR.IR)
+    UnifiedIR.check_state(ir, UnifiedIR.LAYOUT_EDITABLE, "fold_isdefineds!")
+    n = 0
+    for s in collect(UnifiedIR.each_stmt(ir))
+        UnifiedIR.is_tombstone(ir, s) && continue
+        UnifiedIR.stmt_kind(ir, s) === K"call" || continue
+        nop = UnifiedIR.nops(ir, s)
+        (nop == 3 || nop == 4) || continue
+        callee = static_operand_value(ir, UnifiedIR.getop(ir, s, 1))
+        (callee === Core.isdefined || callee === Base.isdefined) || continue
+        if nop == 4
+            static_operand_value(ir, UnifiedIR.getop(ir, s, 4)) === :not_atomic || continue
+        end
+        xo = UnifiedIR.getop(ir, s, 2)
+        UnifiedIR.optag(xo) == UnifiedIR.TAG_STMT || continue
+        obj = skip_refines(ir, UnifiedIR.asstmt(xo))
+        UnifiedIR.stmt_kind(ir, obj) === K"new" || continue
+        T = concrete_datatype(stmt_lattice(ir, UnifiedIR.getop(ir, obj, 1)))
+        T isa DataType || continue
+        fld = field_index_of(T, static_operand_value(ir, UnifiedIR.getop(ir, s, 3)))
+        fld === nothing && continue
+        proven = fld <= UnifiedIR.nops(ir, obj) - 1
+        if !proven
+            for u in collect(UnifiedIR.each_stmt(ir))
+                UnifiedIR.is_tombstone(ir, u) && continue
+                UnifiedIR.stmt_kind(ir, u) === K"call" || continue
+                UnifiedIR.nops(ir, u) == 4 || continue
+                c2 = static_operand_value(ir, UnifiedIR.getop(ir, u, 1))
+                (c2 === Core.setfield! || c2 === Base.setfield!) || continue
+                so = UnifiedIR.getop(ir, u, 2)
+                UnifiedIR.optag(so) == UnifiedIR.TAG_STMT || continue
+                skip_refines(ir, UnifiedIR.asstmt(so)) == obj || continue
+                field_index_of(T, static_operand_value(ir, UnifiedIR.getop(ir, u, 3))) == fld || continue
+                (UnifiedIR.comes_before(ir, u, s) &&
+                 UnifiedIR._cell_dominates_ed(ir, u, s)) || continue
+                proven = true
+                break
+            end
+        end
+        proven || continue
+        UnifiedIR.replace_stmt!(ir, s, K"refine", UnifiedIR.vop(ir, true);
+                                type = CC.Const(true))
+        n += 1
+    end
+    return n
+end
+
+# ---------------------------------------------------------------------------
 # Finalizer resolution (stock `try_resolve_finalizer!` cases)
 # ---------------------------------------------------------------------------
 

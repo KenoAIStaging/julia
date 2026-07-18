@@ -637,6 +637,7 @@ function optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
         end
         changed += fold_uniform_block_args!(ir)
         changed += selectify!(ir)
+        changed += fold_isdefineds!(ir)
         changed += resolve_finalizers!(ir, state)
         changed += sroa_mutables!(ir)
         changed += adce_region_ops!(ir)

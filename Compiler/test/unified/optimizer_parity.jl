@@ -62,6 +62,19 @@ op_call_fb(x) = op_split_fb(x)
 op_call_one(x) = op_split_one(x)
 op_call_none() = op_split_one(nothing)
 
+op_isassigned_sroa(a) = begin
+    r = Ref{Any}()
+    r[] = a
+    isassigned(r) ? r[] : nothing
+end
+function op_isdefined_dominated()
+    a = Ref{Any}()
+    setfield!(a, :x, 2)
+    invokelatest(identity, a)
+    isdefined(a, :x) && return 1.0
+    a[]
+end
+
 op_identity_splat(t) = (t...,)
 function op_apply_type_svec()
     A = (Tuple, Float32)
@@ -216,6 +229,18 @@ end
             @test !any(x -> _iscall(src, typeassert, x), src.code)
             # ...and preservation when it does not
             @test_throws TypeError op_typeassert_keep("nope")
+        end
+
+        @testset "isdefined folding over local allocations" begin
+            src = _code_typed1(op_isassigned_sroa, (Any,))
+            @test count(_isnew, src.code) == 0
+            @test !any(x -> _iscall(src, isdefined, x), src.code)
+            @test op_isassigned_sroa(7) === 7
+            # dominating setfield! decides the query even though the object
+            # escapes (definedness is monotone)
+            src = _code_typed1(op_isdefined_dominated, ())
+            @test !any(x -> _iscall(src, isdefined, x), src.code)
+            @test op_isdefined_dominated() === 1.0
         end
 
         @testset "match-based union split: covered pair" begin
