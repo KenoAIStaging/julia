@@ -405,6 +405,76 @@ function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
 end
 
 # ---------------------------------------------------------------------------
+# _apply_iterate flattening (stock rewrite_apply_exprargs! — the CASES)
+# ---------------------------------------------------------------------------
+
+"""
+    fold_apply_iterates!(ir) -> Int
+
+`Core._apply_iterate(Base.iterate, f, containers...)` where every
+container is a Const `Tuple`/`SimpleVector` or has a fixed-arity `Tuple`
+type becomes the direct `f(elements...)` — Const containers contribute
+constants, typed tuples contribute `extract` projections (pure loads,
+inserted before the site). `Base.iterate` on those containers is the
+identity protocol, so the rewrite preserves semantics exactly; anything
+else (arrays, generators, unknown arity) is left alone. Editable state;
+the direct call then resolves/inlines on later rounds.
+"""
+function fold_apply_iterates!(ir::UnifiedIR.IR)
+    UnifiedIR.check_state(ir, UnifiedIR.LAYOUT_EDITABLE, "fold_apply_iterates!")
+    n = 0
+    for s in collect(UnifiedIR.each_stmt(ir))
+        UnifiedIR.is_tombstone(ir, s) && continue
+        UnifiedIR.stmt_kind(ir, s) === K"call" || continue
+        nop = UnifiedIR.nops(ir, s)
+        nop >= 3 || continue
+        static_operand_value(ir, UnifiedIR.getop(ir, s, 1)) === Core._apply_iterate || continue
+        static_operand_value(ir, UnifiedIR.getop(ir, s, 2)) === Base.iterate || continue
+        newops = UnifiedIR.Operand[UnifiedIR.getop(ir, s, 3)]
+        elems = Vector{Union{UnifiedIR.Operand,Tuple{UnifiedIR.Operand,Int,Any}}}()
+        ok = true
+        total = 0
+        for i in 4:nop
+            o = UnifiedIR.getop(ir, s, i)
+            lat = stmt_lattice(ir, o)
+            v = lat isa CC.Const ? lat.val : nothing
+            if v isa Core.SimpleVector || v isa Tuple
+                for j in 1:length(v)
+                    push!(elems, UnifiedIR.vop(ir, v[j]))
+                end
+                total += length(v)
+            else
+                wt = CC.widenconst(lat)
+                (wt isa DataType && wt <: Tuple && wt !== Tuple) || (ok = false; break)
+                ps = wt.parameters
+                Base.any(p -> CC.isvarargtype(p), ps) && (ok = false; break)
+                for j in 1:length(ps)
+                    p = ps[j]
+                    push!(elems, (o, j, p isa Type ? p : Any))
+                end
+                total += length(ps)
+            end
+            total <= 512 || (ok = false; break)
+        end
+        ok || continue
+        for e in elems
+            if e isa UnifiedIR.Operand
+                push!(newops, e)
+            else
+                (o, j, pt) = e
+                ex = UnifiedIR.insert_before!(ir, s, K"extract", o,
+                                              UnifiedIR.op_inline(j); type = pt)
+                push!(newops, UnifiedIR.op_stmt(ex))
+            end
+        end
+        UnifiedIR.replace_stmt!(ir, s, K"call", newops...;
+                                type = UnifiedIR.stmt_type(ir, s))
+        n += 1
+    end
+    return n
+end
+
+# ---------------------------------------------------------------------------
 # Union-split inlining (deliverable 2c)
 # ---------------------------------------------------------------------------
 

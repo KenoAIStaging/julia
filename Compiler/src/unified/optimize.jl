@@ -66,6 +66,28 @@ function refine_effects!(ir::UnifiedIR.IR; interp = CC.NativeInterpreter())
         CC.is_effect_free(effects) && (flags |= UnifiedIR.FLAG_EFFECT_FREE)
         CC.is_nothrow(effects) && (flags |= UnifiedIR.FLAG_NOTHROW)
         CC.is_terminates(effects) && (flags |= UnifiedIR.FLAG_TERMINATES)
+        if flags & UnifiedIR.FLAG_NOTHROW == 0 &&
+           (fl === Core.getfield || fl === Base.getfield) && length(argl) >= 2
+            # the tfuncs refuse Const-of-mutable subjects, but definedness
+            # is MONOTONE (a defined field never becomes undefined), so a
+            # field observed defined now cannot throw later; the remaining
+            # throw conditions are all statically checkable
+            v = argl[1] isa CC.Const ? (argl[1]::CC.Const).val : nothing
+            fld = argl[2] isa CC.Const ? (argl[2]::CC.Const).val : nothing
+            extra_ok = true
+            for k2 in 3:length(argl)
+                e = argl[k2] isa CC.Const ? (argl[k2]::CC.Const).val : missing
+                (e === true || e === false || e === :not_atomic) || (extra_ok = false; break)
+            end
+            if v !== nothing && extra_ok && length(argl) <= 4
+                # note: not_atomic READS of atomic fields are legal (only
+                # writes require an ordering), so no isfieldatomic guard
+                fi = field_index_of(typeof(v), fld)
+                if fi isa Int && isdefined(v, fi)
+                    flags |= UnifiedIR.FLAG_NOTHROW
+                end
+            end
+        end
         # inference's transfer results (just published into the flag column)
         # can be strictly more precise than the builtin recompute
         # (apply_type_nothrow with Const args, e.g.); never downgrade — the
@@ -455,6 +477,53 @@ function fold_pure_queries!(ir::UnifiedIR.IR)
 end
 
 """
+    fold_retuples!(ir) -> Int
+
+Tuple identity: `Core.tuple(extract(x, 1), …, extract(x, n))` over the
+SAME `x` whose fixed-arity tuple type has exactly `n` components is `x`
+itself (stock SROA's re-tupling case). The result forwards through a
+`refine`.
+"""
+function fold_retuples!(ir::UnifiedIR.IR)
+    n = 0
+    for s in UnifiedIR.each_stmt(ir)
+        UnifiedIR.stmt_kind(ir, s) === K"call" || continue
+        nop = UnifiedIR.nops(ir, s)
+        nop >= 2 || continue
+        static_operand_value(ir, UnifiedIR.getop(ir, s, 1)) === Core.tuple || continue
+        local xo::UnifiedIR.Operand
+        ok = true
+        for i in 2:nop
+            o = UnifiedIR.getop(ir, s, i)
+            UnifiedIR.optag(o) == UnifiedIR.TAG_STMT || (ok = false; break)
+            d = skip_refines(ir, UnifiedIR.asstmt(o))
+            UnifiedIR.stmt_kind(ir, d) === K"extract" || (ok = false; break)
+            Int(UnifiedIR.imm_value(UnifiedIR.getop(ir, d, 2))::Int64) == i - 1 ||
+                (ok = false; break)
+            b = UnifiedIR.getop(ir, d, 1)
+            if i == 2
+                xo = b
+            else
+                b == xo || (ok = false; break)
+            end
+        end
+        ok || continue
+        xt = CC.widenconst(stmt_lattice(ir, xo))
+        (xt isa DataType && xt <: Tuple && xt !== Tuple) || continue
+        ps = xt.parameters
+        length(ps) == nop - 1 || continue
+        Base.any(p -> CC.isvarargtype(p), ps) && continue
+        if UnifiedIR.optag(xo) == UnifiedIR.TAG_STMT
+            UnifiedIR.visible(ir, UnifiedIR.asstmt(xo), s) || continue
+        end
+        UnifiedIR.replace_stmt!(ir, s, K"refine", xo;
+                                type = UnifiedIR.stmt_type(ir, s))
+        n += 1
+    end
+    return n
+end
+
+"""
     fold_splatnews!(ir) -> Int
 
 Stock `inline_splatnew`: a `splatnew(T, t)` whose result type has a known
@@ -536,6 +605,7 @@ function optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
         changed += materialize_consts!(ir)
         changed += canonicalize_getfields!(ir)
         changed += forward_extracts!(ir)
+        changed += fold_retuples!(ir)
         changed += fold_splatnews!(ir)
         changed += fold_pure_queries!(ir)
         changed += forward_refines!(ir)
@@ -571,6 +641,7 @@ function optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
         changed += sroa_mutables!(ir)
         changed += adce_region_ops!(ir)
         if inline
+            changed += fold_apply_iterates!(ir)
             changed += inline_calls2!(ir, state; params)
             changed += union_split_calls!(ir, state; params)
         end

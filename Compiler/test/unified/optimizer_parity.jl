@@ -62,6 +62,13 @@ op_call_fb(x) = op_split_fb(x)
 op_call_one(x) = op_split_one(x)
 op_call_none() = op_split_one(nothing)
 
+op_identity_splat(t) = (t...,)
+function op_apply_type_svec()
+    A = (Tuple, Float32)
+    B = Tuple{Float32, Float32}
+    Core.apply_type(A..., B.types...)
+end
+
 @eval op_construct_splatnew(T, fields) = $(Expr(:splatnew, :T, :fields))
 op_invoke34900(x::Int, y) = x
 op_invoke34900(x, y::Int) = y
@@ -164,6 +171,16 @@ end
             @test length(src.code) == 1 && _isreturn(src.code[1]) &&
                   src.code[1].val == Core.Argument(2)
             @test op_invoke34900(3, 4) === 3
+        end
+
+        @testset "_apply_iterate flattening and tuple identity" begin
+            src = _code_typed1(op_identity_splat, (Tuple{Int, Int},))
+            @test length(src.code) == 1 && _isreturn(src.code[1]) &&
+                  src.code[1].val == Core.Argument(2)
+            @test op_identity_splat((1, 2)) === (1, 2)
+            src = _code_typed1(op_apply_type_svec, ())
+            @test length(src.code) == 1 && _isreturn(src.code[1])
+            @test op_apply_type_svec() === NTuple{3, Float32}
         end
 
         @testset "finalizer resolution" begin
