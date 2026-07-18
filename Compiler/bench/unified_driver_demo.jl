@@ -154,7 +154,9 @@ function run_pass(n)
     mod = Module(Symbol(:UnifiedZoo, n))
     t0 = time()
     Base.include_string(mod, ZOO, "zoo.jl")
-    got = Any[outcome(() -> run(mod)) for (_, run) in CASES]
+    # the zoo methods are newer than this frame's world (include_string just
+    # defined them): each case must run at the latest world
+    got = Any[outcome(() -> Base.invokelatest(run, mod)) for (_, run) in CASES]
     println("workload pass ", n, " under unified runtime: ",
             round(time() - t0; digits = 1), "s")
     return got, U.pipeline_stats()
