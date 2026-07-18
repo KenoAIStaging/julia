@@ -312,7 +312,7 @@ let # FIXME: some nested example
         Ref(Ref(x))[][]
     end
     # the UnifiedIR pipeline scalarizes the nested Ref chain; stock does not
-    if isdefined(Main, :__unified_pipeline_active)
+    if (isdefined(Compiler, :UNIFIED_HOOKS) && Compiler.UNIFIED_HOOKS[] !== nothing)
         @test is_scalar_replaced(src)
     else
         @test_broken is_scalar_replaced(src)
@@ -330,7 +330,7 @@ let src = code_typed1((Any,Any,Any)) do x, y, z
         outer = MutableOuter(xyz, xyz, xyz)
         outer.x.x, outer.y.y, outer.z.z
     end
-    if isdefined(Main, :__unified_pipeline_active)
+    if (isdefined(Compiler, :UNIFIED_HOOKS) && Compiler.UNIFIED_HOOKS[] !== nothing)
         @test !any(isnew, src.code)
     else
         @test_broken !any(isnew, src.code)
@@ -342,7 +342,7 @@ let src = code_typed1((Any,Any,Any)) do x, y, z
         outer = MutableOuter(xyz, xyz, xyz)
         outer.x.x, outer.y.y, outer.z.z
     end
-    if isdefined(Main, :__unified_pipeline_active)
+    if (isdefined(Compiler, :UNIFIED_HOOKS) && Compiler.UNIFIED_HOOKS[] !== nothing)
         @test !any(isnew, src.code)
     else
         @test_broken !any(isnew, src.code)
