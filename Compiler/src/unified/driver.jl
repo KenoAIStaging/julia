@@ -53,19 +53,85 @@ mutable struct PipelineLedger
     last_error::Any               # (reason, mi, exception) of the last error-class fallback
 end
 const PIPELINE_STATS = PipelineLedger(0, Dict{Symbol,Int}(), nothing)
-# requests run concurrently (no global driver lock): ledger writes take this
+# Ledger locking discipline. Once the driver IS the runtime's compiler, any
+# call boundary inside a locked region can demand a first-time compile, and
+# that compile's own serve/decline paths write this ledger. A plain
+# non-reentrant lock therefore self-deadlocks: the nested writer spins
+# forever on the lock its own parked outer frame holds (the demo's wedge —
+# `reset_pipeline_stats!` executing `empty!` inside the locked region raised
+# the compile of an inner target, whose pipeline pass hit a `count_fallback!`
+# and spun on STATS_LOCK for the rest of the session). Rules:
+#   - SAME-TASK reentry runs the update WITHOUT re-acquiring: the outer
+#     frame is parked at a call boundary (its structures are between
+#     mutations) and it already holds the lock, so cross-thread exclusion
+#     still stands while the nested update runs;
+#   - compile-path writers (`count_fallback!`/`note_unified!`) never spin
+#     unboundedly on CROSS-task contention either — a holder can be parked
+#     mid-compile for seconds, and an unbounded spin can deadlock against
+#     an engine-reservation cycle. After a bounded spin the write is
+#     dropped and counted (`STATS_DROPPED`, surfaced as `ledger_dropped`);
+#   - user-context entries (`pipeline_stats`/`reset_pipeline_stats!`) block
+#     normally (with the same same-task reentry escape).
 const STATS_LOCK = Base.Threads.SpinLock()
+const STATS_OWNER = Base.RefValue{Any}(nothing)     # task currently holding STATS_LOCK
+const STATS_DROPPED = Base.Threads.Atomic{Int}(0)   # contended-away ledger writes
 
-function count_fallback!(reason::Symbol, @nospecialize(mi = nothing), @nospecialize(err = nothing))
-    Base.@lock STATS_LOCK begin
-        d = PIPELINE_STATS.fallbacks
-        d[reason] = get(d, reason, 0) + 1
-        err === nothing || (PIPELINE_STATS.last_error = (reason, mi, err))
+# acquire states: 0x0 locked here (must unlock), 0x1 same-task reentry
+# (already held up-stack: proceed unlocked), 0x2 contended away (drop)
+function _stats_acquire(bounded::Bool)
+    ct = ccall(:jl_get_current_task, Any, ())
+    STATS_OWNER[] === ct && return 0x1
+    if bounded
+        spins = 0
+        while !Base.trylock(STATS_LOCK)
+            spins += 1
+            spins >= 1_000_000 && return 0x2
+            ccall(:jl_cpu_suspend, Cvoid, ())
+            ccall(:jl_gc_safepoint, Cvoid, ())
+        end
+    else
+        Base.lock(STATS_LOCK)
+    end
+    STATS_OWNER[] = ct
+    return 0x0
+end
+function _stats_release(state::UInt8)
+    if state == 0x0
+        STATS_OWNER[] = nothing
+        Base.unlock(STATS_LOCK)
     end
     return nothing
 end
 
-note_unified!() = (Base.@lock STATS_LOCK PIPELINE_STATS.unified += 1; nothing)
+function count_fallback!(reason::Symbol, @nospecialize(mi = nothing), @nospecialize(err = nothing))
+    st = _stats_acquire(true)
+    if st == 0x2
+        Base.Threads.atomic_add!(STATS_DROPPED, 1)
+        return nothing
+    end
+    try
+        d = PIPELINE_STATS.fallbacks
+        d[reason] = get(d, reason, 0) + 1
+        err === nothing || (PIPELINE_STATS.last_error = (reason, mi, err))
+    finally
+        _stats_release(st)
+    end
+    return nothing
+end
+
+function note_unified!()
+    st = _stats_acquire(true)
+    if st == 0x2
+        Base.Threads.atomic_add!(STATS_DROPPED, 1)
+        return nothing
+    end
+    try
+        PIPELINE_STATS.unified += 1
+    finally
+        _stats_release(st)
+    end
+    return nothing
+end
 
 """
     pipeline_stats() -> NamedTuple
@@ -75,15 +141,30 @@ unified pipeline, `fallbacks` maps fallback reason to count (those bodies
 were handled by the stock compiler), `last_error` retains the most recent
 `(reason, mi, exception)` for error-class fallbacks.
 """
-pipeline_stats() = Base.@lock STATS_LOCK (; unified = PIPELINE_STATS.unified,
-                    fallbacks = copy(PIPELINE_STATS.fallbacks),
-                    last_error = PIPELINE_STATS.last_error)
+function pipeline_stats()
+    st = _stats_acquire(false)
+    try
+        fallbacks = copy(PIPELINE_STATS.fallbacks)
+        # keep the ledger honest: writes contended away by a parked holder
+        # (see the locking discipline above) surface as their own reason
+        STATS_DROPPED[] == 0 || (fallbacks[:ledger_dropped] = STATS_DROPPED[])
+        return (; unified = PIPELINE_STATS.unified,
+                  fallbacks,
+                  last_error = PIPELINE_STATS.last_error)
+    finally
+        _stats_release(st)
+    end
+end
 
 function reset_pipeline_stats!()
-    Base.@lock STATS_LOCK begin
+    st = _stats_acquire(false)
+    try
         PIPELINE_STATS.unified = 0
         empty!(PIPELINE_STATS.fallbacks)
         PIPELINE_STATS.last_error = nothing
+        STATS_DROPPED[] = 0
+    finally
+        _stats_release(st)
     end
     return nothing
 end
