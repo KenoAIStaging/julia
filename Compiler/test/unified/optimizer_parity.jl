@@ -62,6 +62,18 @@ op_call_fb(x) = op_split_fb(x)
 op_call_one(x) = op_split_one(x)
 op_call_none() = op_split_one(nothing)
 
+struct OPImmutArms
+    x::Union{Nothing, Int, Float64}
+end
+function op_immut_arms(b, x, y)
+    z = b ? OPImmutArms(x) : OPImmutArms(y)
+    z.x::Union{Float64, Int}
+end
+function op_union_tuple_arms(c, x1, x2)
+    t = c ? (x1,) : (x2,)
+    getfield(t, 1)
+end
+
 op_isassigned_sroa(a) = begin
     r = Ref{Any}()
     r[] = a
@@ -229,6 +241,17 @@ end
             @test !any(x -> _iscall(src, typeassert, x), src.code)
             # ...and preservation when it does not
             @test_throws TypeError op_typeassert_keep("nope")
+        end
+
+        @testset "load forwarding through if-arm constructions" begin
+            src = _code_typed1(op_immut_arms, (Bool, Int, Float64))
+            @test count(_isnew, src.code) == 0
+            @test !any(x -> _iscall(src, typeassert, x), src.code)
+            @test op_immut_arms(true, 1, 2.0) === 1
+            @test op_immut_arms(false, 1, 2.0) === 2.0
+            src = _code_typed1(op_union_tuple_arms, (Bool, Int, Float64))
+            @test !any(x -> _iscall(src, getfield, x), src.code)
+            @test op_union_tuple_arms(false, 1, 2.0) === 2.0
         end
 
         @testset "isdefined folding over local allocations" begin

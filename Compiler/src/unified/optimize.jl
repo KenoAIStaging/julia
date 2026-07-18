@@ -239,9 +239,24 @@ function canonicalize_getfields!(ir::UnifiedIR.IR)
         idx = static_operand_value(ir, io)
         if idx isa Symbol
             xt = CC.widenconst(stmt_lattice(ir, vo))
-            xt isa DataType && isconcretetype(xt) || continue
-            idx = field_index_of(xt, idx)
-            idx === nothing && continue
+            if xt isa DataType && isconcretetype(xt)
+                idx = field_index_of(xt, idx)
+                idx === nothing && continue
+            elseif xt isa Union
+                # every union component must agree on the field's index
+                # (the union-split struct corpus: same field, same slot)
+                i0 = nothing
+                for c in Base.uniontypes(xt)
+                    (c isa DataType && isconcretetype(c)) || (i0 = nothing; break)
+                    fi = field_index_of(c, idx)
+                    fi === nothing && (i0 = nothing; break)
+                    i0 === nothing ? (i0 = fi) : (fi == i0 || (i0 = nothing; break))
+                end
+                i0 isa Int || continue
+                idx = i0
+            else
+                continue
+            end
         end
         idx isa Int || continue
         idx >= 1 || continue
@@ -282,6 +297,53 @@ function result_arms(ir::UnifiedIR.IR, def::StmtId)
     return arms
 end
 
+"Rewrite the field-`fidx` load `s` over per-arm constructed values
+(`armpairs` = (result stmt, value operand) per live arm of `ifop`) to
+`select`/`refine` when every arm value is an arm-local immutable
+new/`Core.tuple` whose element operand is visible at `s`. True on success."
+function forward_arm_elements!(ir::UnifiedIR.IR, s::StmtId, ifop::StmtId,
+                               armpairs::Vector{Tuple{StmtId,UnifiedIR.Operand}},
+                               fidx::Int)
+    els = UnifiedIR.Operand[]
+    for (_, ro) in armpairs
+        UnifiedIR.optag(ro) == UnifiedIR.TAG_STMT || return false
+        ad = skip_refines(ir, UnifiedIR.asstmt(ro))
+        adk = UnifiedIR.stmt_kind(ir, ad)
+        local el::UnifiedIR.Operand
+        if adk === K"call" &&
+           static_operand_value(ir, UnifiedIR.getop(ir, ad, 1)) === Core.tuple
+            1 + fidx <= UnifiedIR.nops(ir, ad) || return false
+            el = UnifiedIR.getop(ir, ad, fidx + 1)
+        elseif adk === K"new"
+            Ta = concrete_datatype(stmt_lattice(ir, UnifiedIR.getop(ir, ad, 1)))
+            (Ta isa DataType && !ismutabletype(Ta)) || return false
+            fidx <= UnifiedIR.nops(ir, ad) - 1 || return false
+            el = UnifiedIR.getop(ir, ad, fidx + 1)
+        else
+            return false
+        end
+        if UnifiedIR.optag(el) == UnifiedIR.TAG_STMT
+            UnifiedIR.visible(ir, UnifiedIR.asstmt(el), s) || return false
+        end
+        push!(els, el)
+    end
+    isempty(els) && return false
+    if length(els) == 1
+        UnifiedIR.replace_stmt!(ir, s, K"refine", els[1];
+                                type = UnifiedIR.stmt_type(ir, s))
+        return true
+    end
+    length(els) == 2 || return false
+    co = UnifiedIR.getop(ir, ifop, 1)
+    CC.widenconst(stmt_lattice(ir, co)) === Bool || return false
+    if UnifiedIR.optag(co) == UnifiedIR.TAG_STMT
+        UnifiedIR.visible(ir, UnifiedIR.asstmt(co), s) || return false
+    end
+    UnifiedIR.replace_stmt!(ir, s, K"select", co, els[1], els[2];
+                            type = UnifiedIR.stmt_type(ir, s))
+    return true
+end
+
 """
     forward_extracts!(ir) -> Int
 
@@ -307,6 +369,7 @@ function forward_extracts!(ir::UnifiedIR.IR)
         if dk === K"if"
             arms = result_arms(ir, def)
             (arms === nothing || isempty(arms)) && continue
+            # uniform-constant position: fold outright
             v0 = nothing
             uniform = true
             for (_, t) in arms
@@ -317,10 +380,44 @@ function forward_extracts!(ir::UnifiedIR.IR)
                     (uniform = false; break)
                 v0 === nothing ? (v0 = v) : (v === v0 || (uniform = false; break))
             end
-            (uniform && v0 !== nothing) || continue
-            UnifiedIR.replace_stmt!(ir, s, K"refine", UnifiedIR.vop(ir, v0);
-                                    type = UnifiedIR.stmt_type(ir, s))
-            n += 1
+            if uniform && v0 !== nothing
+                UnifiedIR.replace_stmt!(ir, s, K"refine", UnifiedIR.vop(ir, v0);
+                                        type = UnifiedIR.stmt_type(ir, s))
+                n += 1
+                continue
+            end
+            # per-arm construction (stock's phi-of-news load forwarding):
+            # every result arm yields an arm-local immutable new/tuple whose
+            # field `idx` operand is visible outside the arm — the load
+            # becomes select(cond, el₁, el₂) (or the sole arm's element)
+            armpairs = Tuple{StmtId,UnifiedIR.Operand}[]
+            armok = true
+            for (_, t) in arms
+                UnifiedIR.nops(ir, t) == 1 || (armok = false; break)
+                push!(armpairs, (t, UnifiedIR.getop(ir, t, 1)))
+            end
+            armok || continue
+            forward_arm_elements!(ir, s, def, armpairs, idx) && (n += 1)
+            continue
+        elseif dk === K"extract"
+            # extract-of-extract chain: the base projects result position k
+            # of a multi-result if; this extract loads field `idx` of that
+            # per-arm value
+            bo = UnifiedIR.getop(ir, def, 1)
+            UnifiedIR.optag(bo) == UnifiedIR.TAG_STMT || continue
+            if2 = skip_refines(ir, UnifiedIR.asstmt(bo))
+            UnifiedIR.stmt_kind(ir, if2) === K"if" || continue
+            k = Int(UnifiedIR.imm_value(UnifiedIR.getop(ir, def, 2))::Int64)
+            arms = result_arms(ir, if2)
+            (arms === nothing || isempty(arms)) && continue
+            armpairs = Tuple{StmtId,UnifiedIR.Operand}[]
+            armok = true
+            for (_, t) in arms
+                k <= UnifiedIR.nops(ir, t) || (armok = false; break)
+                push!(armpairs, (t, UnifiedIR.getop(ir, t, k)))
+            end
+            armok || continue
+            forward_arm_elements!(ir, s, if2, armpairs, idx) && (n += 1)
             continue
         elseif dk === K"call"
             callee = static_operand_value(ir, UnifiedIR.getop(ir, def, 1))
