@@ -673,6 +673,16 @@ function match_split_call!(ir::UnifiedIR.IR, s::StmtId, st::UInferState,
         mi2 isa Core.MethodInstance || return false
         tgt = ccall(:jl_normalize_to_compilable_mi, Any, (Any,), mi2)
         tgt isa Core.MethodInstance || return false
+        # stock's :invoke legality (compileable_specialization; the same rule
+        # devirtualize_calls! applies): the target's static parameters must
+        # be fully determined by the compilable signature — an
+        # under-constrained environment makes the runtime's per-call sparam
+        # re-derivation throw `UndefVarError: T ... in static parameter
+        # matching` (the demo's zoo7/comprehension class). Such sites keep
+        # the dynamic :call.
+        sparams2 = tgt.sparam_vals
+        (CC.unionall_depth((match2.method).sig) == length(sparams2) &&
+         CC.validate_sparams(sparams2)) || return false
         (ci, _) = driver_ci_for_invoke(interp, tgt, true)
         if ci isa Core.CodeInstance && col isa UEdges
             clamp_world!(col, ci.min_world, ci.max_world) || (ci = nothing)
