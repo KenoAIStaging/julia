@@ -69,7 +69,11 @@ function inline2_cost(st::UInferState, mi::Core.MethodInstance, src::Core.CodeIn
         end
         if r !== nothing
             ci = r[1]
-            ci isa Core.CodeInstance && return Int(ci.inlining_cost)
+            if ci isa Core.CodeInstance
+                # the cost rides the (possibly compressed) inferred source
+                # (stock's inlining_cost accessor; MAX when there is none)
+                return Int(Compiler.inlining_cost(@atomic :monotonic ci.inferred))
+            end
         end
     end
     world = st.cfg.world

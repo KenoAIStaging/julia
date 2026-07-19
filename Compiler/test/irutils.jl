@@ -40,7 +40,11 @@ end
 # check if `x` is a statically-resolved call of a function whose name is `sym`
 isinvoke(y) = @nospecialize(x) -> isinvoke(y, x)
 isinvoke(sym::Symbol, @nospecialize(x)) = isinvoke(mi->mi.def.name===sym, x)
-isinvoke(pred::Function, @nospecialize(x)) = isexpr(x, :invoke) && pred((x.args[1]::CodeInstance).def)
+isinvoke(pred::Function, @nospecialize(x)) = isexpr(x, :invoke) && pred(invoke_mi(x.args[1]))
+# an :invoke/:invoke_modify target is a CodeInstance when it was eagerly
+# compiled and a MethodInstance otherwise (the unified driver materializes
+# uncompiled targets lazily); tests match on the MethodInstance either way
+invoke_mi(@nospecialize x) = (x isa CodeInstance ? x.def : x)::Core.MethodInstance
 
 fully_eliminated(@nospecialize args...; retval=(@__FILE__), kwargs...) =
     fully_eliminated(code_typed1(args...; kwargs...); retval)
