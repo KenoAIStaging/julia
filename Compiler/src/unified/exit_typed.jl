@@ -1154,11 +1154,23 @@ function assemble_ircode(cx::TCtx, ir::UnifiedIR.IR, argmap::Dict{Int32,Int}, ro
         return false
     end
 
+    # devirtualized modify-op targets (devirtualize_modifyops!): stmt id =>
+    # CodeInstance/MethodInstance to splice as `Expr(:invoke_modify, tgt, ...)`
+    modmap = get(ir.meta, :invoke_modify, nothing)
+
     function translate_stmt(s::StmtId)
         k = UnifiedIR.stmt_kind(ir, s)
         n = UnifiedIR.nops(ir, s)
         ops = Any[tval(UnifiedIR.getop(ir, s, i)) for i in 1:n]
-        k === K"call" && return Expr(:call, ops...)
+        if k === K"call"
+            if modmap !== nothing
+                tgt = get(modmap::Dict{Int32,Any}, s.id, nothing)
+                # stock's handle_modifyop!_call! shape: the resolved op target
+                # is prepended, the original builtin call kept verbatim
+                tgt === nothing || return Expr(:invoke_modify, tgt, ops...)
+            end
+            return Expr(:call, ops...)
+        end
         k === K"invoke" && return Expr(:invoke, ops...)
         k === K"new" && return Expr(:new, ops...)
         k === K"splatnew" && return Expr(:splatnew, ops...)
@@ -1364,4 +1376,122 @@ function assemble_ircode(cx::TCtx, ir::UnifiedIR.IR, argmap::Dict{Int32,Int}, ro
     # the emitted CodeInfo's bounds with its edge collector's window)
     worlds = CC.WorldRange(Base.get_world_counter(), typemax(UInt))
     return CC.IRCode(is, cfg, di, argtypes, Expr[], sptypes, worlds)
+end
+
+# ---------------------------------------------------------------------------
+# `Expr(:invoke_modify)` emission for the atomic modify builtins
+# ---------------------------------------------------------------------------
+
+"""Argument positions of stock's `abstract_modifyop!` convention, indexed
+like its `argtypes` (1 = the builtin itself): `(minargs, maxargs, op_argi,
+v_argi)`, or `nothing` when `f` is not a modify builtin."""
+function modifyop_positions(@nospecialize f)
+    f === Core.modifyfield! && return (5, 6, 4, 5)
+    f === Core.modifyglobal! && return (5, 6, 4, 5)
+    f === Core.memoryrefmodify! && return (6, 6, 3, 4)
+    f === Core.Intrinsics.atomic_pointermodify && return (5, 5, 3, 4)
+    return nothing
+end
+
+"""
+    devirtualize_modifyops!(uir, st, interp) -> Int
+
+Stock's `handle_modifyop!_call!` relocated to the exit boundary (the unified
+pipeline records no `ModifyOpInfo` — the op call `op(current, v)` is
+re-derived here from the final inferred operand types, like
+`devirtualize_calls!` re-derives its signatures): for each residual call of
+an atomic modify builtin (`modifyfield!` / `modifyglobal!` /
+`memoryrefmodify!` / `atomic_pointermodify`) whose op signature — argtypes
+per stock's `abstract_modifyop!` — resolves to a SINGLE, FULLY-COVERING
+method match in a world-clamped, edge-recorded query, store the compileable
+target (CodeInstance when available, MethodInstance otherwise — stock's
+`compileable_specialization` degradation) in `uir.meta[:invoke_modify]`;
+`ir_to_ircode` then emits the site as `Expr(:invoke_modify, target, f,
+args...)` (stock's `stmt.head = :invoke_modify` + `pushfirst!` of the
+invoke case), which codegen lowers to the atomic-RMW fast path. Every skip
+is sound — the site simply stays a dynamic builtin call.
+
+Runs between `optimize_ir!` and `ir_to_ircode`, next to
+`devirtualize_calls!` (driver adoption point).
+"""
+function devirtualize_modifyops!(uir, st, interp::Compiler.AbstractInterpreter)
+    n = 0
+    produced = 0
+    col = st.edges
+    𝕃 = CC.fallback_lattice
+    modmap = nothing
+    for s in UnifiedIR.each_stmt(uir)
+        UnifiedIR.is_tombstone(uir, s) && continue
+        UnifiedIR.stmt_kind(uir, s) === K"call" || continue
+        nop = UnifiedIR.nops(uir, s)
+        nop >= 1 || continue
+        f = CC.singleton_type(stmt_lattice(uir, UnifiedIR.getop(uir, s, 1)))
+        pos = modifyop_positions(f)
+        pos === nothing && continue
+        (minargs, maxargs, op_argi, v_argi) = pos
+        (minargs <= nop <= maxargs) || continue
+        args = Any[stmt_lattice(uir, UnifiedIR.getop(uir, s, i)) for i in 1:nop]
+        # the current value's lattice type, per stock's abstract_modifyop!
+        local TF
+        if f === Core.modifyfield!
+            TF = CC.getfield_tfunc(𝕃, args[2], args[3])
+        elseif f === Core.modifyglobal!
+            gm = CC.singleton_type(args[2])
+            gs = CC.singleton_type(args[3])
+            (gm isa Module && gs isa Symbol) || continue
+            rte = global_rte(st, gm, gs)
+            # a defined-const binding cannot be modified (runtime error);
+            # leave such sites (and guard partitions, rt === Any) dynamic
+            rte.rt isa CC.Const && continue
+            TF = rte.rt
+        elseif f === Core.memoryrefmodify!
+            TF = CC.memoryrefget_tfunc(𝕃, args[2], Symbol, Bool)
+        else # Core.Intrinsics.atomic_pointermodify
+            TF = CC.atomic_pointerref_tfunc(𝕃, args[2], Symbol)
+        end
+        opft = CC.widenconst(args[op_argi])
+        TFw = CC.widenconst(TF)
+        vw = CC.widenconst(args[v_argi])
+        ok = true
+        for t in (opft, TFw, vw)
+            (t isa Type && t !== Union{} && !CC.has_free_typevars(t)) || (ok = false)
+        end
+        ok || continue
+        sig = try
+            Tuple{opft, TFw, vw}
+        catch
+            continue
+        end
+        # single fully-covering unambiguous match, edge-recorded (stock's
+        # `length(info.edges) == length(info.results) == 1` + fully_covers)
+        match = resolve_single_match(st, sig)
+        match === nothing && continue
+        mi = try
+            CC.specialize_method(match)
+        catch
+            continue
+        end
+        mi isa Core.MethodInstance || continue
+        target = ccall(:jl_normalize_to_compilable_mi, Any, (Any,), mi)
+        target isa Core.MethodInstance || continue
+        # stock's :invoke legality (compileable_specialization): fully
+        # determined static parameters only
+        sparams = target.sparam_vals
+        (CC.unionall_depth((match.method).sig) == length(sparams) &&
+         CC.validate_sparams(sparams)) || continue
+        (ci, did_produce) = driver_ci_for_invoke(interp, target,
+                                                 produced < DEVIRT_PRODUCTION_BUDGET[])
+        did_produce && (produced += 1)
+        if ci isa Core.CodeInstance && col isa UEdges
+            # the embedded CI must cover every world this body claims
+            clamp_world!(col, ci.min_world, ci.max_world) || continue
+        end
+        if modmap === nothing
+            modmap = Dict{Int32,Any}()
+            uir.meta[:invoke_modify] = modmap
+        end
+        modmap[s.id] = ci === nothing ? target : ci
+        n += 1
+    end
+    return n
 end
