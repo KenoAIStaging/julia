@@ -466,3 +466,74 @@ end
     @test Base.invokelatest(f, true) == 1
     @test Base.invokelatest(f, false) == 2
 end
+
+@testset "unreachable self-looping island blocks (folded iterate-loop shape)" begin
+    # code_lowered-kw regression: a comprehension loop over a
+    # constant-empty range folds its island entry edge away, leaving the
+    # loop block as `bb -> bb` — its own backedge kept it alive under
+    # in-degree pruning, and the promotion passes then refused every cell
+    # the dead block touches (:island residuals). drop_unreachable_blocks!
+    # must prune by reachability from the entry, not by in-degree.
+    function deadloopir()
+        b = Builder(name = :deadloopisland)
+        append_stmt!(b, K"region_arg"; type = Any)             # #self#
+        x = append_stmt!(b, K"region_arg"; type = Int64)
+        c = append_stmt!(b, K"cell", Int64; type = Any)
+        append_stmt!(b, K"cell_set", c, UnifiedIR.op_inline(Int64(0)))
+        cfg = append_stmt!(b, K"cfg"; type = Int64)
+        rs = UnifiedIR.RegionId[]
+        for _ in 1:3
+            push!(b.ir.regions,
+                  UnifiedIR.Region(UnifiedIR.REGION_BLOCK, cfg, UnifiedIR.stmt_region(b.ir, cfg)))
+            push!(rs, UnifiedIR.RegionId(Int32(length(b.ir.regions))))
+        end
+        rs2 = copy(rs)
+        function block!(fill)
+            rid = popfirst!(rs2)
+            reg = UnifiedIR.getregion(b.ir, rid)
+            reg.first = StmtId(Int32(Int(b.ir.body.len) + 1))
+            push!(b.open, rid)
+            fill()
+            reg.last = StmtId(Int32(Int(b.ir.body.len)))
+            pop!(b.open)
+        end
+        block!() do   # entry: store, jump straight past the loop block
+            append_stmt!(b, K"cell_set", c, UnifiedIR.op_stmt(x))
+            append_stmt!(b, K"goto", UnifiedIR.op_block(rs[3]), UnifiedIR.op_inline(Int64(0)))
+        end
+        block!() do   # unreachable: only kept alive by its own backedge
+            g = append_stmt!(b, K"cell_get", UnifiedIR.op_stmt(c); type = Any)
+            g2 = append_stmt!(b, K"call", GlobalRef(Base, :add_int), g,
+                              UnifiedIR.op_inline(Int64(1)); type = Any)
+            append_stmt!(b, K"cell_set", c, g2)
+            cnd = append_stmt!(b, K"call", GlobalRef(Base, :slt_int), g2,
+                               UnifiedIR.op_inline(Int64(10)); type = Any)
+            append_stmt!(b, K"br_if", UnifiedIR.op_stmt(cnd),
+                         UnifiedIR.op_block(rs[2]), UnifiedIR.op_inline(Int64(0)),
+                         UnifiedIR.op_block(rs[3]), UnifiedIR.op_inline(Int64(0)))
+        end
+        block!() do   # exit: read the cell
+            g3 = append_stmt!(b, K"cell_get", UnifiedIR.op_stmt(c); type = Any)
+            append_stmt!(b, K"result", g3)
+        end
+        append_stmt!(b, K"return", UnifiedIR.op_stmt(cfg))
+        UnifiedIR.finish!(b)
+    end
+    # unit: the pass itself prunes the self-keeping cycle
+    ir0 = deadloopir()
+    @test UnifiedIR.verify_ir(ir0; level = 1)
+    UnifiedIR.editable(ir0)
+    @test UC.drop_unreachable_blocks!(ir0) == 1
+    UnifiedIR.compact!(ir0)
+    @test UnifiedIR.verify_ir(ir0; level = 1)
+    # end-to-end: the optimizer leaves no bug-class residual and keeps
+    # the semantics of the reachable path
+    ir = deadloopir()
+    st = UnifiedCompiler.UInferState()
+    ir = UnifiedCompiler.optimize_ir!(ir, Any[Any, Int64]; state = st)
+    @test UnifiedIR.verify_ir(ir; level = 1)
+    @test count_cellops(ir) == 0
+    @test isempty(UC.classify_residual_cells(ir))
+    f = UnifiedCompiler.define_ir_method!(@__MODULE__, gensym(:deadloopisland), 2, ir)
+    @test Base.invokelatest(f, 7) == 7
+end

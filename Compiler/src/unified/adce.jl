@@ -66,11 +66,34 @@ function block_in_edges(ir::UnifiedIR.IR)
     return tgt
 end
 
+# Containing block of statement `s` among the blocks in `own`
+# (region id -> block index), walking the region ancestry through owner
+# statements; 0 when `s` is not nested inside one of those blocks.
+function _containing_block(ir::UnifiedIR.IR, own::Dict{Int32,Int}, s::StmtId)
+    cur = s
+    while true
+        r = UnifiedIR.stmt_region(ir, cur)
+        UnifiedIR.isnull(r) && return 0
+        haskey(own, r.id) && return own[r.id]
+        reg = UnifiedIR.getregion(ir, r)
+        UnifiedIR.isnull(reg.owner) && return 0
+        cur = reg.owner
+    end
+end
+
 """
     drop_unreachable_blocks!(ir) -> Int
 
-Kill island blocks with no predecessors that are not their island's entry
-(first live owned region), to a fixpoint. Editable state.
+Kill island blocks that are unreachable: not the island's entry (first live
+owned region), not entered from outside the island (sealed cross-island
+entries stay conservative seeds), and not reachable from any seed through
+edges whose source lies inside a reachable block. In-degree alone is not
+enough — an unreachable single-block cycle keeps itself alive through its
+own backedge (the folded-away iterate-loop shape: once the entry edge
+folds, `bb → bb` survives an in-degree check forever, and cell promotion
+then refuses every cell the dead block touches). To a fixpoint (killing a
+dead island region erases edges that kept OTHER islands' blocks alive).
+Editable state.
 """
 function drop_unreachable_blocks!(ir::UnifiedIR.IR)
     UnifiedIR.check_state(ir, UnifiedIR.LAYOUT_EDITABLE, "drop_unreachable_blocks!")
@@ -78,15 +101,40 @@ function drop_unreachable_blocks!(ir::UnifiedIR.IR)
     changed = true
     while changed
         changed = false
-        tgt = block_in_edges(ir)
         for s in collect(UnifiedIR.each_stmt(ir))
             UnifiedIR.is_tombstone(ir, s) && continue
             UnifiedIR.stmt_kind(ir, s) === K"cfg" || continue
             rs = UnifiedIR.live_owned_regions(ir, s)
-            for (i, rid) in enumerate(rs)
-                i == 1 && continue                    # entry block
-                get(tgt, rid.id, 0) == 0 || continue
-                UnifiedIR.kill_region!(ir, rid)
+            n = length(rs)
+            n == 0 && continue
+            own = Dict{Int32,Int}(r.id => i for (i, r) in enumerate(rs))
+            succs = [Int[] for _ in 1:n]
+            seen = falses(n)
+            stack = Int[1]
+            seen[1] = true                            # entry block
+            for e in UnifiedIR.each_stmt(ir)
+                UnifiedIR.is_tombstone(ir, e) && continue
+                is_edge_kind(UnifiedIR.stmt_kind(ir, e)) || continue
+                for (dest, _) in UnifiedIR.edge_bundles(ir, e)
+                    j = get(own, dest.id, 0)
+                    j == 0 && continue
+                    i = _containing_block(ir, own, e)
+                    if i == 0                         # entry from outside
+                        seen[j] || (seen[j] = true; push!(stack, j))
+                    else
+                        push!(succs[i], j)
+                    end
+                end
+            end
+            while !isempty(stack)
+                b = pop!(stack)
+                for c in succs[b]
+                    seen[c] || (seen[c] = true; push!(stack, c))
+                end
+            end
+            for j in 1:n
+                seen[j] && continue
+                UnifiedIR.kill_region!(ir, rs[j])
                 removed += 1
                 changed = true
             end
