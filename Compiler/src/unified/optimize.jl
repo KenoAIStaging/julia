@@ -135,6 +135,20 @@ function stmt_lattice(ir::UnifiedIR.IR, o::UnifiedIR.Operand)
         (isconst(g.mod, g.name) && isdefined(g.mod, g.name)) &&
             return CC.Const(getglobal(g.mod, g.name))
         return Any
+    elseif t == UnifiedIR.TAG_SPARAM
+        # the lattice channel inference publishes (Const for pinned values,
+        # Type{_} bounds for constrained TypeVars); raw sparam_vals fallback
+        idx = Int(UnifiedIR.payload(o))
+        lat = get(ir.meta, :sptypes_lat, nothing)
+        if lat isa Vector{Any} && 1 <= idx <= length(lat)
+            return lat[idx]
+        end
+        sp = ir.sptypes
+        if 1 <= idx <= length(sp)
+            v = sp[idx]
+            (v isa Core.SimpleVector || v isa TypeVar) || return CC.Const(v)
+        end
+        return Any
     end
     return Any
 end
@@ -790,13 +804,30 @@ function ea_resolve_residual_call(ir::UnifiedIR.IR, st::UInferState, s::StmtId)
             (p isa Type && !CC.has_free_typevars(p)) && (f = p)
         end
     end
-    (f === nothing || f isa Core.Builtin || f isa Core.IntrinsicFunction) &&
-        return nothing
+    f isa Core.Builtin && return nothing
+    f isa Core.IntrinsicFunction && return nothing
     f isa Core.TypeofVararg && return nothing
+    local ftt
+    if f === nothing
+        # non-singleton concrete callee (closure objects): dispatch on the
+        # concrete type; K"closure" activations stay with their machinery
+        fo2 = UnifiedIR.getop(ir, s, 1)
+        if UnifiedIR.optag(fo2) == UnifiedIR.TAG_STMT &&
+           UnifiedIR.stmt_kind(ir, skip_refines(ir, UnifiedIR.asstmt(fo2))) === K"closure"
+            return nothing
+        end
+        ft1 = CC.widenconst(args[1])
+        (ft1 isa DataType && isconcretetype(ft1) && !(ft1 <: Type) &&
+         !(ft1 <: Core.Builtin) && !(ft1 <: Core.IntrinsicFunction) &&
+         !(ft1 <: Core.OpaqueClosure)) || return nothing
+        ftt = ft1
+    else
+        ftt = f isa Type ? Type{f} : typeof(f)
+    end
     argts = Any[CC.widenconst(a) for a in args[2:end]]
     Base.any(t -> !(t isa Type) || t === Union{}, argts) && return nothing
     fsig = try
-        Tuple{f isa Type ? Type{f} : typeof(f), argts...}
+        Tuple{ftt, argts...}
     catch
         return nothing
     end
@@ -957,6 +988,16 @@ throws would be caught — inference already models that channel).
 function refine_frame_nothrow!(ir::UnifiedIR.IR)
     eff = frame_effects_meta(ir)
     CC.is_nothrow(eff) && return 0
+    # statement-position static-parameter reads are ELIDED by the entry
+    # converter (meta[:sparam_reads]) — their UndefVarError potential is a
+    # frame-level fact with no statement to carry a flag
+    let reads = get(ir.meta, :sparam_reads, nothing)
+        if reads isa Vector{Int}
+            for n in reads
+                sparam_maybe_undef(ir, n) && return 0
+            end
+        end
+    end
     for s in UnifiedIR.each_stmt(ir)
         UnifiedIR.stmt_flag(ir, s) & UnifiedIR.FLAG_NOTHROW != 0 && continue
         k = UnifiedIR.stmt_kind(ir, s)
@@ -967,11 +1008,12 @@ function refine_frame_nothrow!(ir::UnifiedIR.IR)
         elseif k === K"return" || k === K"result" || k === K"break" ||
                k === K"goto" || k === K"unreachable" || k === K"region_arg" ||
                k === K"refine" || k === K"loop" || k === K"cfg" ||
-               k === K"cell" || k === K"cell_shared" || k === K"cell_get" ||
-               k === K"cell_new" || k === K"cell_set" || k === K"cell_isdefined"
-            # terminators/structure never throw; frame-local cell machinery
-            # reads/writes defined slots (undef reads go through the guarded
-            # `throw_undef_if_not` form, which is not in this list)
+               k === K"cell" || k === K"cell_shared" ||
+               k === K"cell_new" || k === K"cell_set"
+            # terminators/structure never throw; cell allocation/writes are
+            # frame-local and total (`cell_get` is NOT here: a read of a
+            # maybe-undefined residual cell can throw, so it must carry the
+            # flag column's proof)
             continue
         else
             return 0
@@ -1147,8 +1189,13 @@ function optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
     # post-opt refinements (stock ipo_dataflow_analysis! analogs): frame
     # nothrow from the statement flag column, and the EA-backed
     # :effect_free upgrade for argmem-only writes on provably
-    # non-escaping local allocations
+    # non-escaping local allocations. The flag column is re-established
+    # first: every infer_ir! pass republishes inference's projection,
+    # dropping refine_effects!'s statement-level carve-outs (e.g. the
+    # Const-of-mutable getfield definedness fact) that the frame-level
+    # scans consume.
     try
+        refine_effects!(ir)
         refine_frame_nothrow!(ir)
         ea_refine_effect_free!(ir, state)
     catch

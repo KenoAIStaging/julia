@@ -62,20 +62,14 @@ statement-count heuristic.
 function inline2_cost(st::UInferState, mi::Core.MethodInstance, src::Core.CodeInfo)
     interp = st.cfg.interp
     interp isa Compiler.AbstractInterpreter || return nothing
-    let r = try
-            driver_ci_for_invoke(interp, mi, false)
-        catch
-            nothing
-        end
-        if r !== nothing
-            ci = r[1]
-            if ci isa Core.CodeInstance
-                # the cost rides the (possibly compressed) inferred source
-                # (stock's inlining_cost accessor; MAX when there is none)
-                return Int(Compiler.inlining_cost(@atomic :monotonic ci.inferred))
-            end
-        end
-    end
+    # NOTE deliberately no cached-CodeInstance fast path: the driver's
+    # stored inlining_cost is measured over a body whose residual
+    # resolvable calls may have stayed dynamic (its devirtualizer resolves
+    # less than this pipeline — the A6 seam), so consulting it makes
+    # admission depend on cache warmth (cold/warm nondeterminism across a
+    # test group). The memoized computation below is deterministic per
+    # (mi, world) and uses stock's model over this pipeline's own
+    # optimized body.
     world = st.cfg.world
     # same-task reentry succeeds (ReentrantLock); a cross-thread race skips
     # the memo and yields no verdict rather than blocking a compile path
@@ -385,10 +379,32 @@ function resolve_inline_target(ir::UnifiedIR.IR, s::StmtId, k::UnifiedIR.Kind, s
             match === nothing && return nothing
             return (match.method, CC.specialize_method(match), true)
         end
-        (f === nothing || f isa Core.Builtin || f isa Core.IntrinsicFunction) && return nothing
+        f isa Core.Builtin && return nothing
+        f isa Core.IntrinsicFunction && return nothing
+        local ftt
+        if f === nothing
+            # non-singleton concrete callee: closure objects and other
+            # callable structs dispatch on their concrete TYPE (the callee
+            # value is callee parameter 1, so the ordinary argmap applies).
+            # Values built by the unified closure machinery (K"closure")
+            # are region activations, not callable structs — those stay
+            # with their own machinery.
+            fo2 = UnifiedIR.getop(ir, s, 1)
+            if UnifiedIR.optag(fo2) == UnifiedIR.TAG_STMT &&
+               UnifiedIR.stmt_kind(ir, skip_refines(ir, UnifiedIR.asstmt(fo2))) === K"closure"
+                return nothing
+            end
+            ft0 = CC.widenconst(args[1])
+            (ft0 isa DataType && isconcretetype(ft0) && !(ft0 <: Type) &&
+             !(ft0 <: Core.Builtin) && !(ft0 <: Core.IntrinsicFunction) &&
+             !(ft0 <: Core.OpaqueClosure)) || return nothing
+            ftt = ft0
+        else
+            ftt = f isa Type ? Type{f} : typeof(f)
+        end
         argts = Any[CC.widenconst(a) for a in args[2:end]]
         any(t -> t === Union{}, argts) && return nothing
-        sig = Tuple{f isa Type ? Type{f} : typeof(f), argts...}
+        sig = Tuple{ftt, argts...}
         match = resolve_single_match(st, sig)
         match === nothing && return nothing
         return (match.method, CC.specialize_method(match), false)
