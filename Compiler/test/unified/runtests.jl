@@ -309,6 +309,7 @@ end
 end
 
 include("typed_exit.jl")
+include("exit_shape.jl")
 include("completeness.jl")
 include("structurize.jl")
 
