@@ -473,6 +473,12 @@ function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInsta
                 devirtualize_calls!(uir, st, interp)
             catch
             end
+            # exit-shape adoption (wave 6): Expr(:invoke_modify) targets for
+            # statically-resolved atomic modify builtins (exit_typed.jl)
+            try
+                devirtualize_modifyops!(uir, st, interp)
+            catch
+            end
         end
         local ircode
         try
