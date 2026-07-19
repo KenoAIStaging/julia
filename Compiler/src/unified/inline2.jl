@@ -27,17 +27,25 @@ InlineParams(; size_limit = 32, inline_size_limit = 128, max_union_split = 3,
     InlineParams(size_limit, inline_size_limit, max_union_split, split_budget)
 
 # A "single match" is only the dispatch outcome when it also FULLY COVERS
-# the queried signature: a non-covering match means some argument tuples in
-# `sig` dispatch to a MethodError, and baking the method's body in (or
-# invoking it directly) would run it for those too.
+# the queried signature AND dispatch is unambiguous: a non-covering match
+# means some argument tuples in `sig` dispatch to a MethodError, and baking
+# the method's body in (or invoking it directly) would run it for those too.
+# Ambiguity is the same soundness class — `_methods_by_ftype`/`ml_matches`
+# can report ONE fully-covering match while dispatch is ambiguous on a
+# subset of `sig` (two methods, neither more specific, applicable
+# intersection); devirtualizing such a site drops the runtime MethodError.
+# `CC.findall`'s `.ambig` flag is the authority — every resolution goes
+# through it.
 function resolve_single_match(@nospecialize(sig), world::UInt)
-    matches = try
-        Base._methods_by_ftype(sig, 1, world)
+    result = try
+        CC.findall(sig, CC.InternalMethodTable(world); limit = 1)
     catch
         nothing
     end
-    (matches === nothing || matches === false || length(matches) != 1) && return nothing
-    match = matches[1]::Core.MethodMatch
+    result === nothing && return nothing        # >1 methods or failed query
+    result.ambig && return nothing              # ambiguous dispatch: stay dynamic
+    length(result.matches) == 1 || return nothing
+    match = result.matches[1]::Core.MethodMatch
     match.fully_covers || return nothing
     return match
 end
@@ -55,6 +63,7 @@ function resolve_single_match(st::UInferState, @nospecialize(sig))
     end
     result === nothing && return nothing        # >1 methods or failed query
     record_call!(col, sig, result)
+    result.ambig && return nothing              # ambiguous dispatch: stay dynamic
     length(result.matches) == 1 || return nothing
     match = result.matches[1]::Core.MethodMatch
     match.fully_covers || return nothing

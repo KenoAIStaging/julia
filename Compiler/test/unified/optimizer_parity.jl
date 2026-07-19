@@ -94,6 +94,11 @@ function op_apply_type_svec()
     Core.apply_type(A..., B.types...)
 end
 
+struct OPAmbigSR{T}; x::T; end
+op_ambf(a::OPAmbigSR, b) = 1
+op_ambf(a, b::OPAmbigSR) = 2
+op_call_ambig(a::OPAmbigSR{String}, @nospecialize(b)) = op_ambf(a, b)
+
 @eval op_construct_splatnew(T, fields) = $(Expr(:splatnew, :T, :fields))
 op_invoke34900(x::Int, y) = x
 op_invoke34900(x, y::Int) = y
@@ -288,6 +293,18 @@ end
             @test count(x -> _iscall(src, Core.throw_methoderror, x), src.code) == 1
             @test !any(x -> _iscall(src, op_split_one, x), src.code)
             @test_throws MethodError op_call_none()
+        end
+
+        @testset "ambiguous single-match devirtualization refused" begin
+            # `ml_matches` reports ONE fully-covering match for this
+            # signature while dispatch is ambiguous on the
+            # (OPAmbigSR, OPAmbigSR) argument intersection — inlining or
+            # devirtualizing the site would drop the runtime MethodError
+            src = _code_typed1(op_call_ambig, (OPAmbigSR{String}, Any))
+            @test any(x -> _iscall(src, op_ambf, x), src.code)
+            @test !any(x -> Meta.isexpr(x, :invoke), src.code)
+            @test op_call_ambig(OPAmbigSR("x"), 1) === 1
+            @test_throws MethodError op_call_ambig(OPAmbigSR("x"), OPAmbigSR(1))
         end
 
         @testset "match-based union split: single non-covering match" begin
