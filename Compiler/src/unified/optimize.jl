@@ -658,6 +658,385 @@ function fold_splatnews!(ir::UnifiedIR.IR)
     return n
 end
 
+# ---------------------------------------------------------------------------
+# Post-optimization escape-analysis consumption (stock `ipo_dataflow_analysis!`
+# / `refine_effects!`'s EA half, optimize.jl:699-803): `:effect_free`
+# refinement for bodies whose only remaining taints are argmem-only writes
+# (`EFFECT_FREE_IF_INACCESSIBLEMEMONLY` callees / setfield!) on provably
+# non-escaping local allocations. Runs on the optimized dense IR, after the
+# final inference pass (`FLAG_NOTHROW`/`FLAG_EFFECT_FREE` columns fresh),
+# consuming `analyze_escapes` (escape.jl, the B4 API) with
+#   * `EAOptSummarizer` — the `get_escape_cache` seam: recursive, memoized
+#     per-MethodInstance argument-escape summaries (world-stamped module
+#     memo; the driver-level CodeInstance-keyed cache is the A6 seam — see
+#     the note at EA_OPT_SUMMARIES);
+#   * a `resolve_call` hook — unified declined-inline candidates are still
+#     `call`s at this point (stock's inliner has rewritten them to
+#     `:invoke`), so statically-resolved residual calls get the same
+#     interprocedural treatment without rewriting the IR.
+# ---------------------------------------------------------------------------
+
+# Per-MethodInstance argument-escape summaries for the optimizer's EA runs.
+# World-stamped: any method (re)definition bumps the world counter, so a
+# stamp mismatch empties the memo — conservative but sound (the summary of a
+# body depends on facts that a redefinition can invalidate). ACTIVE guards
+# cycles and recursion depth. A6 SEAM: the durable home for these summaries
+# is the driver's CodeInstance cache (`stack_analysis_result!`-style, edges
+# decay them precisely, cross-session reuse); this module-level memo is the
+# self-contained interim, keyed the same way stock's protocol expects
+# (`get_escape_cache(codeinst) -> Union{Bool,UArgEscapeCache}`).
+const EA_OPT_LOCK = Base.ReentrantLock()
+const EA_OPT_SUMMARIES = IdDict{Core.MethodInstance,Any}()
+const EA_OPT_WORLD = Base.RefValue{UInt}(0)
+const EA_OPT_ACTIVE = Base.IdSet{Core.MethodInstance}()
+const EA_OPT_MAX_ACTIVE = 4
+const EA_OPT_MAX_SRC_STMTS = 200
+const EA_OPT_MAX_BODY_STMTS = 2048
+
+"`get_escape_cache` for optimizer-integrated EA (stock GetNativeEscapeCache
+shape): CodeInstance ipo-effects fast path, then the recursive summarizer."
+struct EAOptSummarizer
+    st::UInferState
+end
+
+function (S::EAOptSummarizer)(@nospecialize codeinst)
+    if codeinst isa Core.CodeInstance
+        effects = CC.decode_effects(codeinst.ipo_purity_bits)
+        if CC.is_effect_free(effects) && CC.is_inaccessiblememonly(effects)
+            # nothing escapes through a fully effect-free, memory-inaccessible
+            # callee (stock's simple-frame fast path)
+            return true
+        end
+    end
+    mi = codeinst isa Core.CodeInstance ? codeinst.def :
+         codeinst isa Core.MethodInstance ? codeinst : nothing
+    mi isa Core.MethodInstance || return false
+    return ea_opt_summary(S.st, mi)
+end
+
+function ea_opt_summary(st::UInferState, mi::Core.MethodInstance)
+    world = st.cfg.world
+    # trylock: same-task reentry succeeds (ReentrantLock); a cross-thread
+    # race conservatively skips the cache AND the computation (false =
+    # unknown callee) rather than risking a lock cycle on a compile path
+    trylock(EA_OPT_LOCK) || return false
+    try
+        if EA_OPT_WORLD[] != world
+            empty!(EA_OPT_SUMMARIES)
+            EA_OPT_WORLD[] = world
+        end
+        haskey(EA_OPT_SUMMARIES, mi) && return EA_OPT_SUMMARIES[mi]
+        (mi in EA_OPT_ACTIVE || length(EA_OPT_ACTIVE) >= EA_OPT_MAX_ACTIVE) &&
+            return false
+        push!(EA_OPT_ACTIVE, mi)
+        r = try
+            ea_opt_summary_uncached(st, mi)
+        catch
+            false
+        finally
+            delete!(EA_OPT_ACTIVE, mi)
+        end
+        EA_OPT_SUMMARIES[mi] = r
+        return r
+    finally
+        unlock(EA_OPT_LOCK)
+    end
+end
+
+function ea_opt_summary_uncached(st::UInferState, mi::Core.MethodInstance)
+    m = mi.def
+    m isa Method || return false
+    (m.isva || isdefined(m, :generator)) && return false
+    sig = mi.specTypes
+    sig isa DataType || return false
+    ps = collect(Any, sig.parameters)
+    length(ps) == Int(m.nargs) || return false
+    Base.any(p -> CC.isvarargtype(p), ps) && return false
+    src = Base.uncompressed_ir(m)
+    length(src.code) <= EA_OPT_MAX_SRC_STMTS || return false
+    ir = codeinfo_to_ir(src; nargs = Int(m.nargs), name = m.name)
+    ir.meta[:method_instance] = mi
+    ir.meta[:slotnames] = src.slotnames
+    ir.sptypes = Any[t for t in mi.sparam_vals]
+    ir.meta[:sptypes_lat] = sptypes_lattice(mi)
+    # the full optimizer (inlining included): accessor wrappers
+    # (setindex!/setproperty!/convert chains) must dissolve to raw
+    # setfield!/getfield for the field-precise summary — a raw lowered body
+    # keeps the field symbol behind a dynamic argument and the analysis
+    # collapses to ⊤ (the same reason EAUtils analyzes post-inlining IR)
+    ir = optimize_ir!(ir, ps; state = st, inline = true)
+    nargs = length(UnifiedIR.getregion(ir, UnifiedIR.root_region(ir)).args)
+    res = analyze_escapes(ir, nargs; get_escape_cache = EAOptSummarizer(st),
+                          resolve_call = ea_opt_resolver(ir, st))
+    return UArgEscapeCache(res.state)
+end
+
+"""Resolve a residual generic `call` statement to its unique dispatch target
+(single, unambiguous, fully-covering match — `resolve_single_match`'s
+soundness gate; the lookup is edge-recorded through `st`), or nothing.
+`Type`-valued callee operands whose `singleton_type` declines (TypeEq
+`Type{X}` for non-singleton `X`) resolve through `CC.type_parameter` — the
+constructor-through-Type-argument case."""
+function ea_resolve_residual_call(ir::UnifiedIR.IR, st::UInferState, s::StmtId)
+    UnifiedIR.stmt_kind(ir, s) === K"call" || return nothing
+    nop = UnifiedIR.nops(ir, s)
+    args = Any[stmt_lattice(ir, UnifiedIR.getop(ir, s, i)) for i in 1:nop]
+    f = CC.singleton_type(args[1])
+    f === nothing && args[1] isa CC.Const && (f = (args[1]::CC.Const).val)
+    if f === nothing
+        ft0 = CC.widenconst(args[1])
+        if (ft0 isa DataType && CC.isType(ft0)) || CC.isTypeEq(ft0)
+            p = CC.type_parameter(ft0)
+            (p isa Type && !CC.has_free_typevars(p)) && (f = p)
+        end
+    end
+    (f === nothing || f isa Core.Builtin || f isa Core.IntrinsicFunction) &&
+        return nothing
+    f isa Core.TypeofVararg && return nothing
+    argts = Any[CC.widenconst(a) for a in args[2:end]]
+    Base.any(t -> !(t isa Type) || t === Union{}, argts) && return nothing
+    fsig = try
+        Tuple{f isa Type ? Type{f} : typeof(f), argts...}
+    catch
+        return nothing
+    end
+    match = resolve_single_match(st, fsig)
+    match === nothing && return nothing
+    mi = try
+        CC.specialize_method(match)
+    catch
+        return nothing
+    end
+    mi isa Core.MethodInstance || return nothing
+    return mi
+end
+
+"Per-site-memoized `resolve_call` hook (the EA fixpoint revisits statements)."
+function ea_opt_resolver(ir::UnifiedIR.IR, st::UInferState)
+    memo = Dict{Int32,Any}()
+    return function (s::StmtId)
+        r = get!(memo, s.id) do
+            ea_resolve_residual_call(ir, st, s)
+        end
+        return r isa Core.MethodInstance ? r : nothing
+    end
+end
+
+# Kinds that never taint frame `:effect_free` on their own: values/reads,
+# structure, terminators/control (region owners' observable work is their
+# contained statements, scanned individually), frame-local cell machinery,
+# and GC bookkeeping. `cell_set`/`cell_new` are handled separately (frame-
+# local for plain `cell`s only), `try` bodies give the whole scan up
+# (stock's EnterNode rule), everything else must carry FLAG_EFFECT_FREE or
+# classify as an EA-refinable site.
+function ea_scan_inert_kind(k::UnifiedIR.Kind)
+    UnifiedIR.is_terminator(k) && return true
+    return k === K"region_arg" || k === K"extract" || k === K"refine" ||
+           k === K"value" || k === K"select" || k === K"globalref" ||
+           k === K"isdefined_global" || k === K"copyast" || k === K"boundscheck" ||
+           k === K"cell" || k === K"cell_shared" || k === K"cell_get" ||
+           k === K"cell_isdefined" || k === K"throw_undef_if_not" ||
+           k === K"gc_preserve_begin" || k === K"gc_preserve_end" ||
+           k === K"if" || k === K"loop" || k === K"cfg" || k === K"closure"
+end
+
+"Is `s` a plain frame-local cell (not `cell_shared`)?"
+function ea_plain_cell_target(ir::UnifiedIR.IR, s::StmtId)
+    o = UnifiedIR.getop(ir, s, 1)
+    UnifiedIR.optag(o) == UnifiedIR.TAG_STMT || return false
+    return UnifiedIR.stmt_kind(ir, UnifiedIR.asstmt(o)) === K"cell"
+end
+
+"""Classify one statement for the post-opt `:effect_free` scan. Returns
+`true` (cannot taint), `false` (refuses the whole refinement), or pushes an
+EA-validation site onto `pending` (an argmem-only-write site: an `invoke`
+or a resolved residual `call` whose callee effects are
+`EFFECT_FREE_IF_INACCESSIBLEMEMONLY`)."""
+function ea_scan_stmt!(ir::UnifiedIR.IR, st::UInferState, s::StmtId,
+                       k::UnifiedIR.Kind, pending::Vector{StmtId},
+                       resolver)
+    UnifiedIR.stmt_flag(ir, s) & UnifiedIR.FLAG_EFFECT_FREE != 0 && return true
+    ea_scan_inert_kind(k) && return true
+    if k === K"cell_set" || k === K"cell_new"
+        return ea_plain_cell_target(ir, s)
+    end
+    local effects::CC.Effects
+    if k === K"invoke"
+        tgt = static_operand_value(ir, UnifiedIR.getop(ir, s, 1))
+        if tgt isa Core.CodeInstance
+            effects = CC.decode_effects(tgt.ipo_purity_bits)
+        elseif tgt isa Core.MethodInstance
+            # target effects through the inference cache (memoized per st)
+            r = try
+                fr = Frame(UnifiedIR.Builder().ir, st, Any[])
+                argl = Any[stmt_lattice(ir, UnifiedIR.getop(ir, s, i))
+                           for i in 2:UnifiedIR.nops(ir, s)]
+                infer_call(fr, argl)
+            catch
+                nothing
+            end
+            r isa UResult || return false
+            effects = r.effects
+        else
+            return false
+        end
+    elseif k === K"call"
+        resolver(s) isa Core.MethodInstance || return false
+        r = try
+            fr = Frame(UnifiedIR.Builder().ir, st, Any[])
+            argl = Any[stmt_lattice(ir, UnifiedIR.getop(ir, s, i))
+                       for i in 1:UnifiedIR.nops(ir, s)]
+            infer_call(fr, argl)
+        catch
+            nothing
+        end
+        r isa UResult || return false
+        effects = r.effects
+    else
+        return false
+    end
+    CC.is_effect_free(effects) && return true
+    CC.is_effect_free_if_inaccessiblememonly(effects) || return false
+    push!(pending, s)
+    return true
+end
+
+"""Stock `check_all_args_noescape!` on unified IR: every mutable-typed value
+operand of `s` must be (a) a caller argument with no escape — the refinement
+then caps at `EFFECT_FREE_IF_INACCESSIBLEMEMONLY` (`:argmem`) — or (b) a
+non-escaping local allocation chain (`new`/`splatnew`/`invoke`/resolved
+`call` defs, recursively). Returns `:ok`, `:argmem`, or `:fail`."""
+function ea_check_args_noescape(ir::UnifiedIR.IR, estate, # ::UEscapeState (escape.jl loads after this file)
+                                argset::Base.IdSet{StmtId}, resolver,
+                                s::StmtId, depth::Int)
+    depth > 16 && return :fail
+    k = UnifiedIR.stmt_kind(ir, s)
+    first_idx = (k === K"invoke" || k === K"new" || k === K"splatnew") ? 2 : 1
+    res = :ok
+    for i in first_idx:UnifiedIR.nops(ir, s)
+        o = UnifiedIR.getop(ir, s, i)
+        lat = stmt_lattice(ir, o)
+        CC.is_mutation_free_argtype(lat) && continue
+        UnifiedIR.optag(o) == UnifiedIR.TAG_STMT || return :fail
+        d = skip_refines(ir, UnifiedIR.asstmt(o))
+        info = ignore_argescape(estate[d])
+        has_no_escape(info) || return :fail
+        if d in argset
+            # a caller argument: even with everything else effect-free the
+            # best claim is effect-free-if-argmem-only (stock's rule)
+            res = :argmem
+            continue
+        end
+        dk = UnifiedIR.stmt_kind(ir, d)
+        if dk === K"new" || dk === K"splatnew" || dk === K"invoke" ||
+           (dk === K"call" && resolver(d) isa Core.MethodInstance)
+            r = ea_check_args_noescape(ir, estate, argset, resolver, d, depth + 1)
+            r === :fail && return :fail
+            r === :argmem && (res = :argmem)
+        else
+            return :fail
+        end
+    end
+    return res
+end
+
+"""
+    refine_frame_nothrow!(ir) -> Int
+
+Post-optimization `:nothrow` refinement from the statement flag column:
+when every live statement is individually FLAG_NOTHROW (which includes
+`refine_effects!`'s statement-level facts inference's transfer rules do
+not carry, e.g. the definedness-monotonicity carve-out for `getfield` on
+Const-of-mutable subjects) — or is a terminator/control statement whose
+only throw condition (a non-Bool branch condition) is excluded by its
+operand type — the frame cannot throw. Upgrades `ir.meta[:effects]` and
+zeroes `ir.meta[:exct]`. Conservative: any unflagged computational
+statement refuses (statements inside `try` bodies included, though their
+throws would be caught — inference already models that channel).
+"""
+function refine_frame_nothrow!(ir::UnifiedIR.IR)
+    eff = frame_effects_meta(ir)
+    CC.is_nothrow(eff) && return 0
+    for s in UnifiedIR.each_stmt(ir)
+        UnifiedIR.stmt_flag(ir, s) & UnifiedIR.FLAG_NOTHROW != 0 && continue
+        k = UnifiedIR.stmt_kind(ir, s)
+        if k === K"br_if" || k === K"continue" || k === K"if"
+            co = UnifiedIR.getop(ir, s, k === K"continue" ? 2 : 1)
+            t = CC.widenconst(stmt_lattice(ir, co))
+            (t isa Type && t <: Bool) || return 0
+        elseif k === K"return" || k === K"result" || k === K"break" ||
+               k === K"goto" || k === K"unreachable" || k === K"region_arg" ||
+               k === K"refine" || k === K"loop" || k === K"cfg" ||
+               k === K"cell" || k === K"cell_shared" || k === K"cell_get" ||
+               k === K"cell_new" || k === K"cell_set" || k === K"cell_isdefined"
+            # terminators/structure never throw; frame-local cell machinery
+            # reads/writes defined slots (undef reads go through the guarded
+            # `throw_undef_if_not` form, which is not in this list)
+            continue
+        else
+            return 0
+        end
+    end
+    ir.meta[:effects] = eff = CC.Effects(eff; nothrow = true)
+    ir.meta[:effects_mask] = effects_mask(eff)
+    ir.meta[:exct] = Union{}
+    return 1
+end
+
+"""
+    ea_refine_effect_free!(ir, st) -> Int
+
+The post-optimization EA consumer (stock `refine_effects!`'s
+`validate_mutable_arg_escapes!` half): when the frame's remaining
+`:effect_free` taints are exactly argmem-only-write sites on provably
+non-escaping local allocations, upgrade `ir.meta[:effects]`'s
+`effect_free` to `ALWAYS_TRUE` (or `EFFECT_FREE_IF_INACCESSIBLEMEMONLY`
+when an argument's memory is written). Dense state, after the final
+inference pass. Returns 1 when the meta effects were upgraded.
+
+NOTE (driver seam): `refine_post_opt` currently forwards the post-opt
+`effect_free` axis only when it is `ALWAYS_TRUE`; the `:argmem` outcome
+(`EFFECT_FREE_IF_INACCESSIBLEMEMONLY` over an `ALWAYS_FALSE` base) needs
+the same per-axis upgrade there to become IPO-visible.
+"""
+function ea_refine_effect_free!(ir::UnifiedIR.IR, st::UInferState)
+    eff = frame_effects_meta(ir)
+    CC.is_effect_free(eff) && return 0
+    UnifiedIR.nstmts(ir) <= EA_OPT_MAX_BODY_STMTS || return 0
+    resolver = ea_opt_resolver(ir, st)
+    pending = StmtId[]
+    for s in UnifiedIR.each_stmt(ir)
+        k = UnifiedIR.stmt_kind(ir, s)
+        k === K"try" && return 0     # exception paths not modeled (stock rule)
+        ea_scan_stmt!(ir, st, s, k, pending, resolver) || return 0
+    end
+    isempty(pending) && return 0
+    root = UnifiedIR.getregion(ir, UnifiedIR.root_region(ir))
+    nargs = length(root.args)
+    res = try
+        analyze_escapes(ir, nargs; get_escape_cache = EAOptSummarizer(st),
+                        resolve_call = resolver)
+    catch
+        return 0
+    end
+    estate = res.state
+    argset = Base.IdSet{StmtId}()
+    for a in root.args
+        push!(argset, a)
+    end
+    argmem = false
+    for s in pending
+        r = ea_check_args_noescape(ir, estate, argset, resolver, s, 0)
+        r === :fail && return 0
+        r === :argmem && (argmem = true)
+    end
+    effect_free = argmem ? CC.EFFECT_FREE_IF_INACCESSIBLEMEMONLY : CC.ALWAYS_TRUE
+    (argmem && eff.effect_free != CC.ALWAYS_FALSE) && return 0   # no upgrade
+    ir.meta[:effects] = eff = CC.Effects(eff; effect_free)
+    ir.meta[:effects_mask] = effects_mask(eff)
+    return 1
+end
+
 "compact!, carrying the cell-name channel (meta[:cell_names], the undef-guard
 variable names) across the statement renumbering."
 function compact_carry_names!(ir::UnifiedIR.IR)
@@ -764,6 +1143,15 @@ function optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
         UnifiedIR.dce!(ir)
         ir = compact_carry_names!(ir)
         infer_ir!(ir, argtypes; state)
+    end
+    # post-opt refinements (stock ipo_dataflow_analysis! analogs): frame
+    # nothrow from the statement flag column, and the EA-backed
+    # :effect_free upgrade for argmem-only writes on provably
+    # non-escaping local allocations
+    try
+        refine_frame_nothrow!(ir)
+        ea_refine_effect_free!(ir, state)
+    catch
     end
     UnifiedIR.verify_ir(ir; level = 1)
     return ir
