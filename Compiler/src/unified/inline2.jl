@@ -62,6 +62,11 @@ statement-count heuristic.
 function inline2_cost(st::UInferState, mi::Core.MethodInstance, src::Core.CodeInfo)
     interp = st.cfg.interp
     interp isa Compiler.AbstractInterpreter || return nothing
+    # narrow-budget states are the driver's reentrant/self-hosting passes:
+    # optimizing callee bodies for cost there multiplies the burn-in
+    # quadratically (the world advances between passes, restamping the
+    # memo) — those passes keep the cheap statement-count fallback
+    st.cfg.frame_budget >= 1000 || return nothing
     # NOTE deliberately no cached-CodeInstance fast path: the driver's
     # stored inlining_cost is measured over a body whose residual
     # resolvable calls may have stayed dynamic (its devirtualizer resolves
@@ -82,6 +87,7 @@ function inline2_cost(st::UInferState, mi::Core.MethodInstance, src::Core.CodeIn
         haskey(INLINE_COST_MEMO, mi) && return INLINE_COST_MEMO[mi]
         (mi in INLINE_COST_ACTIVE || length(INLINE_COST_ACTIVE) >= INLINE_COST_MAX_ACTIVE) &&
             return nothing
+        opt_work_take!() || return nothing
         push!(INLINE_COST_ACTIVE, mi)
         r = try
             inline2_cost_uncached(st, mi, src)

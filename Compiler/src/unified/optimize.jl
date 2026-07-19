@@ -729,6 +729,7 @@ function (S::EAOptSummarizer)(@nospecialize codeinst)
 end
 
 function ea_opt_summary(st::UInferState, mi::Core.MethodInstance)
+    st.cfg.frame_budget >= 1000 || return false
     world = st.cfg.world
     # trylock: same-task reentry succeeds (ReentrantLock); a cross-thread
     # race conservatively skips the cache AND the computation (false =
@@ -742,6 +743,7 @@ function ea_opt_summary(st::UInferState, mi::Core.MethodInstance)
         haskey(EA_OPT_SUMMARIES, mi) && return EA_OPT_SUMMARIES[mi]
         (mi in EA_OPT_ACTIVE || length(EA_OPT_ACTIVE) >= EA_OPT_MAX_ACTIVE) &&
             return false
+        opt_work_take!() || return false
         push!(EA_OPT_ACTIVE, mi)
         r = try
             ea_opt_summary_uncached(st, mi)
@@ -989,6 +991,9 @@ pipeline (whose tail applies the post-opt refinements, recursively through
 this helper), with the method's `@assume_effects` override applied.
 """
 function opt_callee_effects(st::UInferState, mi::Core.MethodInstance)
+    # reentrant/self-hosting passes skip the driver-grade recompute (see
+    # inline2_cost's budget gate)
+    st.cfg.frame_budget >= 1000 || return nothing
     trylock(EA_OPT_LOCK) || return nothing
     try
         world = st.cfg.world
@@ -999,6 +1004,7 @@ function opt_callee_effects(st::UInferState, mi::Core.MethodInstance)
         haskey(OPT_FX_MEMO, mi) && return OPT_FX_MEMO[mi]
         (mi in OPT_FX_ACTIVE || length(OPT_FX_ACTIVE) >= EA_OPT_MAX_ACTIVE) &&
             return nothing
+        opt_work_take!() || return nothing
         push!(OPT_FX_ACTIVE, mi)
         r = try
             opt_callee_effects_uncached(st, mi)
@@ -1137,6 +1143,7 @@ NOTE (driver seam): `refine_post_opt` currently forwards the post-opt
 the same per-axis upgrade there to become IPO-visible.
 """
 function ea_refine_effect_free!(ir::UnifiedIR.IR, st::UInferState)
+    st.cfg.frame_budget >= 1000 || return 0
     eff = frame_effects_meta(ir)
     CC.is_effect_free(eff) && return 0
     UnifiedIR.nstmts(ir) <= EA_OPT_MAX_BODY_STMTS || return 0
@@ -1208,9 +1215,44 @@ The pipeline (§10.4), iterated to quiescence. Per round:
             splitting
   compact! + verify (level 1)
 """
+# Per-top-level-optimization work budget for the driver-grade callee
+# machinery (cost model / post-opt effects / EA summaries): each memo MISS
+# optimizes one callee body, and an unbounded transitive walk of a large
+# callee graph (escape_string/print-family bodies) wedges a single query
+# for minutes. The budget replenishes at every OUTERMOST optimize_ir! entry
+# (nested entries are exactly those callee optimizations), so any one
+# top-level body bounds its uncached exploration; memo hits are free, so
+# warm sessions converge to full precision. Task-local soundness only —
+# these are admission heuristics, a miscount under thread races just
+# shifts where the fallback heuristic takes over.
+const OPT_NEST_DEPTH = Base.RefValue(0)
+const OPT_WORK_LEFT = Base.RefValue(0)
+const OPT_WORK_BUDGET = Base.RefValue(250)
+
+"Take one unit of callee-optimization budget (false = exhausted).
+Unbudgeted outside a pipeline invocation (direct tool/test queries)."
+function opt_work_take!()
+    OPT_NEST_DEPTH[] == 0 && return true
+    OPT_WORK_LEFT[] > 0 || return false
+    OPT_WORK_LEFT[] -= 1
+    return true
+end
+
 function optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
                       state::UInferState = UInferState(), inline::Bool = true,
                       rounds::Int = 8, params::InlineParams = InlineParams())
+    OPT_NEST_DEPTH[] == 0 && (OPT_WORK_LEFT[] = OPT_WORK_BUDGET[])
+    OPT_NEST_DEPTH[] += 1
+    try
+        return _optimize_ir!(ir, argtypes; state, inline, rounds, params)
+    finally
+        OPT_NEST_DEPTH[] -= 1
+    end
+end
+
+function _optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
+                       state::UInferState = UInferState(), inline::Bool = true,
+                       rounds::Int = 8, params::InlineParams = InlineParams())
     for round in 1:rounds
         changed = 0
         infer_ir!(ir, argtypes; state)
