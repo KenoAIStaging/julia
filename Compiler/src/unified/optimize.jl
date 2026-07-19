@@ -1227,7 +1227,7 @@ The pipeline (§10.4), iterated to quiescence. Per round:
 # shifts where the fallback heuristic takes over.
 const OPT_NEST_DEPTH = Base.RefValue(0)
 const OPT_WORK_LEFT = Base.RefValue(0)
-const OPT_WORK_BUDGET = Base.RefValue(250)
+const OPT_WORK_BUDGET = Base.RefValue(64)
 
 "Take one unit of callee-optimization budget (false = exhausted).
 Unbudgeted outside a pipeline invocation (direct tool/test queries)."
@@ -1253,6 +1253,7 @@ end
 function _optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
                        state::UInferState = UInferState(), inline::Bool = true,
                        rounds::Int = 8, params::InlineParams = InlineParams())
+    lastspliced = 0
     for round in 1:rounds
         changed = 0
         infer_ir!(ir, argtypes; state)
@@ -1296,14 +1297,23 @@ function _optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
         changed += resolve_finalizers!(ir, state)
         changed += sroa_mutables!(ir)
         changed += adce_region_ops!(ir)
+        lastspliced = 0
         if inline
-            changed += fold_apply_iterates!(ir)
-            changed += inline_calls2!(ir, state; params)
-            changed += union_split_calls!(ir, state; params)
+            lastspliced += fold_apply_iterates!(ir)
+            lastspliced += inline_calls2!(ir, state; params)
+            lastspliced += union_split_calls!(ir, state; params)
+            changed += lastspliced
         end
         ir = compact_carry_names!(ir)
         UnifiedIR.verify_ir(ir; level = 1)
         changed == 0 && break
+    end
+    if lastspliced > 0
+        # a final round that spliced callee bodies never saw the cleanup
+        # passes (raw entry-converted bodies arrive as cfg islands; leaving
+        # them undissolved strands island cells the promotion suite refuses)
+        # — run the pipeline without inlining until the shapes settle
+        ir = _optimize_ir!(ir, argtypes; state, inline = false, rounds = 3, params)
     end
     # the round budget is shared with inlining, so callee cells spliced by a
     # late round may never have seen the promotion passes: give promotion its
