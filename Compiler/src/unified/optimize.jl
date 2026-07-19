@@ -1268,6 +1268,13 @@ function _optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
         changed += forward_if_results!(ir)
         changed += UnifiedIR.promote_cells!(ir)
         changed += promote_block_cells!(ir)
+        # never-observed cells (no get/isdefined/escape) are dead wherever
+        # they sit — including island blocks, where every promotion pass
+        # refuses store-only/declaration-only cells and `dce!` structurally
+        # cannot reach them (`cell_set`/`cell_new` have no result, and the
+        # declaration keeps a use). Raw late-round callee splices strand
+        # exactly this shape once folding deletes the slot's reads.
+        changed += drop_dead_cells!(ir)
         changed += UnifiedIR.dce!(ir)
         UnifiedIR.editable(ir)
         _, folded = UnifiedIR.fold_constant_branches!(ir)
@@ -1321,6 +1328,7 @@ function _optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
     # the stores it strands. This is the substrate's shared driver — the same
     # entry lowering's closure-capture analysis runs.
     UnifiedIR.promote_fixpoint!(ir; stmt_value = _stmt_const_value)
+    drop_dead_cells!(ir)
     UnifiedIR.dce!(ir)
     ir = compact_carry_names!(ir)
     infer_ir!(ir, argtypes; state)

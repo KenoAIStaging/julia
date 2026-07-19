@@ -411,3 +411,58 @@ end
         @test post == pre
     end
 end
+
+@testset "declaration-only dead cells inside islands (optimizer pipeline)" begin
+    # The wave-6 late-splice shape: a raw entry-converted callee body arrives
+    # as a cfg island carrying slot declarations (cell + cell_new); once
+    # folding deletes every read and store, the declaration-only cell is
+    # unobservable — but every promotion pass refuses it (no stores, no
+    # reads) and `dce!` structurally cannot reach it (`cell_new` has no
+    # result and the declaration keeps a use), so unified_fresh.jl reported
+    # them as bug-class residuals. The optimizer pipeline must run the
+    # dead-cell sweep (`drop_dead_cells!`) itself.
+    b = Builder(name = :deadcellisland)
+    append_stmt!(b, K"region_arg"; type = Any)                 # #self#
+    x = append_stmt!(b, K"region_arg"; type = Bool)
+    cfg = append_stmt!(b, K"cfg"; type = Int64)
+    rs = UnifiedIR.RegionId[]
+    for _ in 1:3
+        push!(b.ir.regions,
+              UnifiedIR.Region(UnifiedIR.REGION_BLOCK, cfg, UnifiedIR.stmt_region(b.ir, cfg)))
+        push!(rs, UnifiedIR.RegionId(Int32(length(b.ir.regions))))
+    end
+    function block!(fill)
+        rid = popfirst!(rs2)
+        reg = UnifiedIR.getregion(b.ir, rid)
+        reg.first = StmtId(Int32(Int(b.ir.body.len) + 1))
+        push!(b.open, rid)
+        fill()
+        reg.last = StmtId(Int32(Int(b.ir.body.len)))
+        pop!(b.open)
+    end
+    rs2 = copy(rs)
+    block!() do   # entry: the dead declaration + a conditional branch
+        c = append_stmt!(b, K"cell", Any; type = Any)
+        append_stmt!(b, K"cell_new", UnifiedIR.op_stmt(c))
+        append_stmt!(b, K"br_if", UnifiedIR.op_stmt(x),
+                     UnifiedIR.op_block(rs[2]), UnifiedIR.op_inline(Int64(0)),
+                     UnifiedIR.op_block(rs[3]), UnifiedIR.op_inline(Int64(0)))
+    end
+    block!() do
+        append_stmt!(b, K"result", UnifiedIR.op_inline(Int64(1)))
+    end
+    block!() do
+        append_stmt!(b, K"result", UnifiedIR.op_inline(Int64(2)))
+    end
+    append_stmt!(b, K"return", UnifiedIR.op_stmt(cfg))
+    ir = UnifiedIR.finish!(b)
+    @test UnifiedIR.verify_ir(ir; level = 1)
+    st = UnifiedCompiler.UInferState()
+    ir = UnifiedCompiler.optimize_ir!(ir, Any[Any, Bool]; state = st)
+    @test UnifiedIR.verify_ir(ir; level = 1)
+    @test count_cellops(ir) == 0
+    @test isempty(UC.classify_residual_cells(ir))
+    f = UnifiedCompiler.define_ir_method!(@__MODULE__, gensym(:deadcellisland), 2, ir)
+    @test Base.invokelatest(f, true) == 1
+    @test Base.invokelatest(f, false) == 2
+end
