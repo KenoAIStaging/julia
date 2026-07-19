@@ -603,6 +603,9 @@ end
         ir = UnifiedCompiler.typed_ir(f, Any[Int])
         irc = UnifiedCompiler.ir_to_ircode(ir)
         Compiler.verify_ir(irc)
+        # the exit emits stock's argtypes convention (self = `Const(f)`);
+        # OpaqueClosure construction needs the env slot to be typeof(())
+        irc.argtypes[1] = Tuple{}
         oc = Core.OpaqueClosure(irc)
         for inp in inputs
             @test isequal(tx_outcome(f, inp...), tx_outcome(oc, inp...))

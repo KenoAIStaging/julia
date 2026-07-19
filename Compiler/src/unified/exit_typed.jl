@@ -210,7 +210,7 @@ function ir_to_ircode(ir::UnifiedIR.IR)
         bb.term === nothing && (bb.term = (:unreachable,))
     end
     havecell && cell_mem2reg!(cx)
-    return assemble_ircode(cx, ir, argmap, length(root.args))
+    return assemble_ircode(cx, ir, argmap, root.args)
 end
 
 # ---- use analysis ----------------------------------------------------------
@@ -1027,7 +1027,7 @@ end
 
 # ---- assembly --------------------------------------------------------------
 
-function assemble_ircode(cx::TCtx, ir::UnifiedIR.IR, argmap::Dict{Int32,Int}, nargs::Int)
+function assemble_ircode(cx::TCtx, ir::UnifiedIR.IR, argmap::Dict{Int32,Int}, rootargs)
     bbs = cx.placed
     ssaof = Dict{Int32,Int}()
     nst = 0
@@ -1338,8 +1338,21 @@ function assemble_ircode(cx::TCtx, ir::UnifiedIR.IR, argmap::Dict{Int32,Int}, na
 
     is = CC.InstructionStream(stmts, types, infos, lines, flags)
     di = CC.DebugInfoStream(lines)
-    argtypes = Any[t for t in ir.argtypes]
-    length(argtypes) == nargs || (argtypes = Any[Any for _ in 1:nargs])
+    # stock argtypes/slottypes convention: the inferred lattice element of
+    # each root region arg (published by infer_ir!'s type-column writeback;
+    # covers the isva packed-tuple form), with singleton-typed positions
+    # refined to `Const` (stock's matching_cache_argtypes shape — the
+    # function slot comes out as `Const(f)`). Untyped args (pure conversion,
+    # no inference pass) fall back to the entry's declared argtypes.
+    argtypes = Any[]
+    for (i, a) in enumerate(rootargs)
+        t = UnifiedIR.stmt_type(ir, a)
+        t === nothing && (t = i <= length(ir.argtypes) ? ir.argtypes[i] : Any)
+        if t isa DataType && isdefined(t, :instance)
+            t = CC.Const(t.instance)
+        end
+        push!(argtypes, t)
+    end
     splat = get(ir.meta, :sptypes_lat, nothing)
     sptypes = CC.VarState[]
     for (i, sp) in enumerate(ir.sptypes)
