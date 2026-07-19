@@ -15,8 +15,15 @@ function _iscall(src::Core.CodeInfo, @nospecialize(f), @nospecialize(x))
     Meta.isexpr(x, :call) || return false
     OPCC.singleton_type(OPCC.argextype(x.args[1], src, OPCC.VarState[])) === f
 end
-_isinvoke(sym::Symbol, @nospecialize(x)) =
-    Meta.isexpr(x, :invoke) && (x.args[1]::Core.CodeInstance).def.def.name === sym
+# :invoke targets are CodeInstances when the driver's per-pass production
+# budget reaches them, MethodInstances otherwise (compiled lazily) — both
+# are the same devirtualized shape
+function _isinvoke(sym::Symbol, @nospecialize(x))
+    Meta.isexpr(x, :invoke) || return false
+    t = x.args[1]
+    mi = t isa Core.CodeInstance ? t.def : t
+    return mi isa Core.MethodInstance && mi.def.name === sym
+end
 
 function _code_typed1(f, at)
     (src, _) = only(Base.code_typed(f, at))

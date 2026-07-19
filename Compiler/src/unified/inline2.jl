@@ -26,6 +26,128 @@ InlineParams(; size_limit = 32, inline_size_limit = 128, max_union_split = 3,
              split_budget = 4) =
     InlineParams(size_limit, inline_size_limit, max_union_split, split_budget)
 
+# ---------------------------------------------------------------------------
+# Stock-shaped inlining cost (policy parity)
+# ---------------------------------------------------------------------------
+#
+# Stock admission consults the callee CodeInstance's `inlining_cost` — the
+# `inline_cost_model` verdict over the OPTIMIZED callee body, where accessor
+# and constructor wrappers have folded to a handful of cheap statements and
+# residual dynamic calls carry the nonleaf penalty. A raw-statement count
+# over the unoptimized lowered body mismeasures both directions (a 58-stmt
+# ctor body that optimizes to 3 statements; a 2-stmt body around one
+# dynamic call). This port: cached CodeInstance cost when available
+# (stock's exact input), otherwise compute it — entry-convert, optimize
+# through this pipeline, exit to IRCode, and run stock's
+# `inline_cost_model`. Memoized per MethodInstance, world-stamped (any
+# redefinition bumps the world counter), cycle/depth-guarded (the callee
+# optimization recursively costs ITS callees).
+const INLINE_COST_LOCK = Base.ReentrantLock()
+const INLINE_COST_MEMO = IdDict{Core.MethodInstance,Any}()   # -> Int | nothing
+const INLINE_COST_WORLD = Base.RefValue{UInt}(0)
+const INLINE_COST_ACTIVE = Base.IdSet{Core.MethodInstance}()
+const INLINE_COST_MAX_ACTIVE = 4
+const INLINE_COST_MAX_SRC_STMTS = 1000
+
+"""
+    inline2_cost(st, mi, src) -> Union{Int,Nothing}
+
+Stock `inlining_cost` for `mi`: the cached CodeInstance's value when the
+interpreter's cache has one (stock's exact policy input, including
+stock-produced entries when pipelines mix), else computed through the
+unified pipeline + `Compiler.inline_cost_model`. `nothing` = no verdict
+(cycle, budget, unconvertible body) — the caller falls back to the
+statement-count heuristic.
+"""
+function inline2_cost(st::UInferState, mi::Core.MethodInstance, src::Core.CodeInfo)
+    interp = st.cfg.interp
+    interp isa Compiler.AbstractInterpreter || return nothing
+    let r = try
+            driver_ci_for_invoke(interp, mi, false)
+        catch
+            nothing
+        end
+        if r !== nothing
+            ci = r[1]
+            ci isa Core.CodeInstance && return Int(ci.inlining_cost)
+        end
+    end
+    world = st.cfg.world
+    # same-task reentry succeeds (ReentrantLock); a cross-thread race skips
+    # the memo and yields no verdict rather than blocking a compile path
+    trylock(INLINE_COST_LOCK) || return nothing
+    try
+        if INLINE_COST_WORLD[] != world
+            empty!(INLINE_COST_MEMO)
+            INLINE_COST_WORLD[] = world
+        end
+        haskey(INLINE_COST_MEMO, mi) && return INLINE_COST_MEMO[mi]
+        (mi in INLINE_COST_ACTIVE || length(INLINE_COST_ACTIVE) >= INLINE_COST_MAX_ACTIVE) &&
+            return nothing
+        push!(INLINE_COST_ACTIVE, mi)
+        r = try
+            inline2_cost_uncached(st, mi, src)
+        catch
+            nothing
+        finally
+            delete!(INLINE_COST_ACTIVE, mi)
+        end
+        INLINE_COST_MEMO[mi] = r
+        return r
+    finally
+        unlock(INLINE_COST_LOCK)
+    end
+end
+
+function inline2_cost_uncached(st::UInferState, mi::Core.MethodInstance,
+                               src::Core.CodeInfo)
+    m = mi.def
+    m isa Method || return nothing
+    length(src.code) <= INLINE_COST_MAX_SRC_STMTS || return nothing
+    sig = mi.specTypes
+    sig isa DataType || return nothing
+    ps = collect(Any, sig.parameters)
+    nargs = Int(m.nargs)
+    if m.isva
+        nargs >= 1 || return nothing
+        length(ps) >= nargs - 1 || return nothing
+        vat = try
+            Tuple{ps[nargs:end]...}
+        catch
+            Tuple
+        end
+        ps = Any[ps[1:(nargs - 1)]; vat]
+    end
+    length(ps) == nargs || return nothing
+    Base.any(p -> CC.isvarargtype(p), ps) && return nothing
+    ir = codeinfo_to_ir(src; nargs, name = m.name)
+    ir.meta[:method_instance] = mi
+    ir.meta[:slotnames] = src.slotnames
+    ir.sptypes = Any[t for t in mi.sparam_vals]
+    ir.meta[:sptypes_lat] = sptypes_lattice(mi)
+    ir = optimize_ir!(ir, ps; state = st, inline = true)
+    # statically-resolvable residual calls must be measured as `:invoke`
+    # (stock's inliner has rewritten declined candidates before its cost
+    # model sees them: UNKNOWN_CALL_COST, not the dynamic nonleaf penalty)
+    UnifiedIR.editable(ir)
+    for s in collect(UnifiedIR.each_stmt(ir))
+        UnifiedIR.is_tombstone(ir, s) && continue
+        UnifiedIR.stmt_kind(ir, s) === K"call" || continue
+        cmi = ea_resolve_residual_call(ir, st, s)
+        cmi isa Core.MethodInstance || continue
+        UnifiedIR.replace_stmt!(ir, s, K"invoke", UnifiedIR.vop(ir, cmi),
+                                UnifiedIR.operands(ir, s)...;
+                                type = UnifiedIR.stmt_type(ir, s))
+    end
+    ir = compact_carry_names!(ir)
+    ircode = ir_to_ircode(ir)
+    params = Compiler.OptimizationParams(st.cfg.interp)
+    # cost capped at the widest threshold any caller applies (declared/
+    # callsite @inline = 20x); beyond it the model returns MAX_INLINE_COST
+    cap = 20 * params.inline_cost_threshold
+    return Int(Compiler.inline_cost_model(ircode, params, Int(cap)))
+end
+
 # A "single match" is only the dispatch outcome when it also FULLY COVERS
 # the queried signature AND dispatch is unambiguous: a non-covering match
 # means some argument tuples in `sig` dispatch to a MethodError, and baking
@@ -219,6 +341,17 @@ function resolve_inline_target(ir::UnifiedIR.IR, s::StmtId, k::UnifiedIR.Kind, s
         args = Any[stmt_lattice(ir, UnifiedIR.getop(ir, s, i)) for i in 1:nop]
         f = CC.singleton_type(args[1])
         f === nothing && args[1] isa CC.Const && (f = args[1].val)
+        if f === nothing
+            # `singleton_type` returns nothing for `Type{X}` with
+            # non-singleton `X` (TypeEq on this nightly) — a `T(args...)`
+            # constructor call through a Type-valued argument still has a
+            # unique callee (the B4 ctor-resolution finding)
+            ft0 = CC.widenconst(args[1])
+            if (ft0 isa DataType && CC.isType(ft0)) || CC.isTypeEq(ft0)
+                p = CC.type_parameter(ft0)
+                (p isa Type && !CC.has_free_typevars(p)) && (f = p)
+            end
+        end
         if f === Core.invoke && nop >= 3
             # Core.invoke(f2, types::Type{<:Tuple}, args...): the target
             # method is looked up on the DECLARED signature. Inlining drops
@@ -350,9 +483,15 @@ function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
         # `uncompressed_ir(m)` below is not it — never inline those
         isdefined(m, :generator) && continue
         argofs = k === K"invoke" ? 1 : 0
-        m.isva && continue
         if invoke_call
+            m.isva && continue
             Int(m.nargs) == UnifiedIR.nops(ir, s) - 2 || continue
+        elseif m.isva
+            # vararg callee: params 1..nargs-1 map positionally, the trailing
+            # param receives a synthesized `Core.tuple` of the rest (the
+            # body's packed-tuple convention — stock's va-handling)
+            Int(m.nargs) >= 1 || continue
+            UnifiedIR.nops(ir, s) - argofs >= Int(m.nargs) - 1 || continue
         else
             Int(m.nargs) == UnifiedIR.nops(ir, s) - argofs || continue
         end
@@ -363,10 +502,13 @@ function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
             nothing
         end
         src === nothing && continue
-        src.inlining == 0x02 && continue                  # @noinline callee
-        limit = (src.inlining == 0x01 ||
-                 UnifiedIR.stmt_flag(ir, s) & UnifiedIR.FLAG_INLINE != 0) ?
-                params.inline_size_limit : params.size_limit
+        site_inline = UnifiedIR.stmt_flag(ir, s) & UnifiedIR.FLAG_INLINE != 0
+        # stock: a callsite `@inline` overrides the callee's declared
+        # `@noinline` (the force_inline_explicit/f42078 family) and admits
+        # without a cost check; the callsite `@noinline` (FLAG_NOINLINE,
+        # checked above) symmetrically overrides a declared `@inline`
+        src.inlining == 0x02 && !site_inline && continue  # @noinline callee
+        declared_inline = src.inlining == 0x01
         callee_ir = try
             normalize_single_return!(codeinfo_to_ir(src; nargs = Int(m.nargs), name = m.name))
         catch e
@@ -382,11 +524,32 @@ function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
         # pinned markers (lb === ub) still have a unique bakeable value
         spvals = Any[bakeable_sparam(v) for v in mi.sparam_vals]
         reads_unbakeable_sparam(callee_ir, spvals) && continue
-        UnifiedIR.nstmts(callee_ir) - Int(m.nargs) <= limit || continue
+        if !site_inline
+            # stock: never inline error paths — a Union{}-returning callee
+            # keeps its (cold) call unless explicitly inline-annotated
+            # (inline_cost_model's `!declared_inline && rt === Union{}` rule)
+            if !declared_inline
+                sitet = UnifiedIR.stmt_type(ir, s)
+                (sitet isa Type && sitet === Union{}) && continue
+            end
+            # stock cost-model admission: the cached CodeInstance's
+            # inlining_cost, or the same model computed over the optimized
+            # callee body; the raw statement-count limits remain the
+            # no-verdict fallback
+            cost = inline2_cost(state, mi, src)
+            if cost isa Int
+                threshold = Compiler.OptimizationParams(state.cfg.interp).inline_cost_threshold
+                declared_inline && (threshold += 19 * threshold)
+                cost <= threshold || continue
+            else
+                limit = declared_inline ? params.inline_size_limit : params.size_limit
+                UnifiedIR.nstmts(callee_ir) - Int(m.nargs) <= limit || continue
+            end
+        end
         # handler-bearing callees: stock declines these by default; admit them
         # only under an explicit @inline / FLAG_INLINE request (they exercise
         # the multi-return loop-wrapper normalization)
-        if limit == params.size_limit &&
+        if !(site_inline || declared_inline) &&
            any(i -> callee_ir.body.kind[i] === K"try", 1:UnifiedIR.nstmts(callee_ir))
             continue
         end
@@ -402,6 +565,23 @@ function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
             for i in 4:UnifiedIR.nops(ir, s)
                 push!(ops, UnifiedIR.getop(ir, s, i))
             end
+            ops
+        elseif m.isva
+            nfixed = Int(m.nargs) - 1
+            ops = UnifiedIR.Operand[UnifiedIR.getop(ir, s, argofs + i)
+                                    for i in 1:nfixed]
+            extras = UnifiedIR.Operand[UnifiedIR.getop(ir, s, i)
+                                       for i in (argofs + nfixed + 1):UnifiedIR.nops(ir, s)]
+            vat = try
+                Tuple{Any[CC.widenconst(stmt_lattice(ir, o)) for o in extras]...}
+            catch
+                Tuple
+            end
+            tup = UnifiedIR.insert_before!(ir, s, K"call",
+                                           UnifiedIR.vop(ir, Core.tuple), extras...;
+                                           type = vat, flag = UnifiedIR.FLAG_REMOVABLE |
+                                                             UnifiedIR.FLAG_NOUB)
+            push!(ops, UnifiedIR.op_stmt(tup))
             ops
         else
             UnifiedIR.Operand[UnifiedIR.getop(ir, s, i)
