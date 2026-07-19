@@ -445,6 +445,12 @@ mutable struct EAAnalysisState{GetEscapeCache}
     const caught::Vector{Bool}       # region id -> lies inside some try BODY
     const actroot::Vector{Int32}     # region id -> activation root region id
     const hastry::Bool
+    # optional consumer hook (the optimizer integration): resolve a
+    # statically-devirtualizable residual `call` to its MethodInstance so
+    # the interprocedural summary machinery applies without rewriting the
+    # IR (stock reaches the same states because its inliner has already
+    # rewritten declined candidates to `:invoke`). `nothing` = no hook.
+    const resolve_call::Any
 end
 
 function ea_propagate_changes!(estate::UEscapeState, changes::Vector{EAChange})
@@ -631,17 +637,25 @@ ea_no_cache(@nospecialize codeinst) = false
 
 """
     analyze_escapes(ir::UnifiedIR.IR, nargs::Int;
-                    get_escape_cache = ea_no_cache) -> UEscapeResult
+                    get_escape_cache = ea_no_cache,
+                    resolve_call = nothing) -> UEscapeResult
 
 Analyze escape information in typed unified IR. `nargs` is the number of
 parameters (leading `region_arg`s of the root region, position 1 = the
 function itself). `get_escape_cache(codeinst) ->
 Union{Bool,UArgEscapeCache}` supplies interprocedural argument-escape
 summaries for `invoke` sites (stock protocol: `true` = effect-free callee,
-only ret-arg aliasing; `false` = unknown, conservative).
+only ret-arg aliasing; `false` = unknown, conservative). `resolve_call(s) ->
+Union{Nothing,MethodInstance}` optionally resolves a residual generic
+`call` statement to a single (unambiguous, fully-covering) target so the
+same summary machinery applies to it; on unified IR statically-resolved
+declined-inline candidates are still `call`s at this point (stock's inliner
+has rewritten them to `:invoke`), and without the hook they are analyzed
+conservatively.
 """
 function analyze_escapes(ir::UnifiedIR.IR, nargs::Int;
-                         get_escape_cache = ea_no_cache)
+                         get_escape_cache = ea_no_cache,
+                         resolve_call = nothing)
     UnifiedIR.check_state(ir, UnifiedIR.LAYOUT_DENSE, "analyze_escapes")
     n = UnifiedIR.nstmts(ir)
     root = UnifiedIR.getregion(ir, UnifiedIR.root_region(ir))
@@ -681,7 +695,7 @@ function analyze_escapes(ir::UnifiedIR.IR, nargs::Int;
     end
 
     astate = EAAnalysisState(ir, estate, EAChange[], get_escape_cache,
-                             caught, actroot, hastry)
+                             caught, actroot, hastry, resolve_call)
 
     while true
         local anyupdate = false
@@ -1187,6 +1201,14 @@ function escape_call!(astate::EAAnalysisState, s::StmtId)
         end
         return nothing
     end
+    # statically-resolvable residual call (consumer hook): interprocedural
+    # treatment — callee param i is ops[i] (ops[1] = the function itself)
+    if astate.resolve_call !== nothing
+        mi = astate.resolve_call(s)
+        if mi isa Core.MethodInstance
+            return escape_invoke_target!(astate, s, ops, mi, 1)
+        end
+    end
     # unknown or dynamic callee: conservative
     add_conservative_changes!(astate, s, ops)
     return nothing
@@ -1312,7 +1334,17 @@ function escape_invoke!(astate::EAAnalysisState, s::StmtId)
     ir = astate.ir
     ops = UnifiedIR.operands(ir, s)
     codeinst = static_operand_value(ir, ops[1])
-    first_idx, last_idx = 2, length(ops)
+    return escape_invoke_target!(astate, s, ops, codeinst, 2)
+end
+
+"Interprocedural site treatment shared by `invoke` statements (`first_idx =
+2`: ops[1] is the CodeInstance/MethodInstance, callee param i = ops[i+1])
+and hook-resolved residual `call`s (`first_idx = 1`: callee param i =
+ops[i], the function itself included)."
+function escape_invoke_target!(astate::EAAnalysisState, s::StmtId,
+                               ops::Vector{UnifiedIR.Operand},
+                               @nospecialize(codeinst), first_idx::Int)
+    last_idx = length(ops)
     add_liveness_changes!(astate, s, ops, first_idx, last_idx)
     mi = codeinst isa Core.CodeInstance ? codeinst.def :
          codeinst isa Core.MethodInstance ? codeinst : nothing
@@ -1328,7 +1360,7 @@ function escape_invoke!(astate::EAAnalysisState, s::StmtId)
             end
             return nothing
         else
-            return add_conservative_changes!(astate, s, ops, 2)
+            return add_conservative_changes!(astate, s, ops, first_idx)
         end
     end
     cache = cache::UArgEscapeCache
