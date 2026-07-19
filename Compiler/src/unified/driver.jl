@@ -545,9 +545,15 @@ pre-A6 pass re-inferred its callee tree with fresh state, so admissions
 CASCADED (a tower of nested fresh-state passes per admitted body) and the
 valve had to stay tiny (32; 431a7d4e82 measured a budget of 1000 spending
 ~30s in the cascade where 32 spent ~2s). The A6 cross-request memo
-amortizes the inference share of each admission; the valve widens in the
-follow-up commit with the measured numbers."
-const DRIVER_REENTRANT_BUDGET = Base.RefValue(32)
+amortizes the inference share of each admission (callee trees replay from
+recorded facts), which reopens the valve to its pre-wedge width — and
+makes it a net WIN: `activate!` at budget 1000 measures 58.7s against the
+budget-32 baseline's 70.6s, with 990 unified bodies against 35. Full
+admission stays closed: entry-convert + optimizer + typed exit are
+per-body and un-memoized, and an uncapped valve pushes `activate!` beyond
+12 minutes; those per-body costs need their own amortization before the
+valve can come out entirely."
+const DRIVER_REENTRANT_BUDGET = Base.RefValue(1000)
 const REENTRANT_ADMITTED = Base.Threads.Atomic{Int}(0)
 
 ":invoke emission switch (devirtualize_calls!)."
