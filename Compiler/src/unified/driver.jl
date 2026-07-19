@@ -77,31 +77,35 @@ const STATS_OWNER = Base.RefValue{Any}(nothing)     # task currently holding STA
 const STATS_DROPPED = Base.Threads.Atomic{Int}(0)   # contended-away ledger writes
 
 # acquire states: 0x0 locked here (must unlock), 0x1 same-task reentry
-# (already held up-stack: proceed unlocked), 0x2 contended away (drop)
-function _stats_acquire(bounded::Bool)
+# (already held up-stack: proceed unlocked), 0x2 contended away (drop).
+# Shared by every driver-global structure touched from compile paths (the
+# ledger, the cross-request memo): the wave-5 P1 design rule.
+function _guarded_acquire(lck::Base.Threads.SpinLock, owner::Base.RefValue{Any}, bounded::Bool)
     ct = ccall(:jl_get_current_task, Any, ())
-    STATS_OWNER[] === ct && return 0x1
+    owner[] === ct && return 0x1
     if bounded
         spins = 0
-        while !Base.trylock(STATS_LOCK)
+        while !Base.trylock(lck)
             spins += 1
             spins >= 1_000_000 && return 0x2
             ccall(:jl_cpu_suspend, Cvoid, ())
             ccall(:jl_gc_safepoint, Cvoid, ())
         end
     else
-        Base.lock(STATS_LOCK)
+        Base.lock(lck)
     end
-    STATS_OWNER[] = ct
+    owner[] = ct
     return 0x0
 end
-function _stats_release(state::UInt8)
+function _guarded_release(lck::Base.Threads.SpinLock, owner::Base.RefValue{Any}, state::UInt8)
     if state == 0x0
-        STATS_OWNER[] = nothing
-        Base.unlock(STATS_LOCK)
+        owner[] = nothing
+        Base.unlock(lck)
     end
     return nothing
 end
+_stats_acquire(bounded::Bool) = _guarded_acquire(STATS_LOCK, STATS_OWNER, bounded)
+_stats_release(state::UInt8) = _guarded_release(STATS_LOCK, STATS_OWNER, state)
 
 function count_fallback!(reason::Symbol, @nospecialize(mi = nothing), @nospecialize(err = nothing))
     st = _stats_acquire(true)
@@ -139,7 +143,12 @@ end
 The driver's ledger: `unified` counts bodies compiled end-to-end by the
 unified pipeline, `fallbacks` maps fallback reason to count (those bodies
 were handled by the stock compiler), `last_error` retains the most recent
-`(reason, mi, exception)` for error-class fallbacks.
+`(reason, mi, exception)` for error-class fallbacks, and `memo` reports the
+cross-request memo's honesty counters — `hits` (frames served by replaying
+a stored entry's facts), `misses` (no entry), `stale` (entries dropped at
+world revalidation), `stores` (entries recorded), `replayed` (facts
+replayed into collectors), `dropped` (memo operations contended away), and
+`entries` (current table size).
 """
 function pipeline_stats()
     st = _stats_acquire(false)
@@ -150,7 +159,11 @@ function pipeline_stats()
         STATS_DROPPED[] == 0 || (fallbacks[:ledger_dropped] = STATS_DROPPED[])
         return (; unified = PIPELINE_STATS.unified,
                   fallbacks,
-                  last_error = PIPELINE_STATS.last_error)
+                  last_error = PIPELINE_STATS.last_error,
+                  memo = (; hits = MEMO_HITS[], misses = MEMO_MISSES[],
+                            stale = MEMO_STALE[], stores = MEMO_STORES[],
+                            replayed = MEMO_REPLAYED[], dropped = MEMO_DROPPED[],
+                            entries = length(DRIVER_MEMO)))
     finally
         _stats_release(st)
     end
@@ -163,6 +176,12 @@ function reset_pipeline_stats!()
         empty!(PIPELINE_STATS.fallbacks)
         PIPELINE_STATS.last_error = nothing
         STATS_DROPPED[] = 0
+        MEMO_HITS[] = 0
+        MEMO_MISSES[] = 0
+        MEMO_STALE[] = 0
+        MEMO_STORES[] = 0
+        MEMO_REPLAYED[] = 0
+        MEMO_DROPPED[] = 0
     finally
         _stats_release(st)
     end
@@ -177,6 +196,313 @@ function print_pipeline_stats(io::IO = Base.stdout)
     for (reason, n) in sort!(collect(stats.fallbacks); by = last, rev = true)
         println(io, "  fallback ", rpad(String(reason), 22), " ", n)
     end
+    m = stats.memo
+    println(io, "  memo hits ", m.hits, " misses ", m.misses, " stale ", m.stale,
+            " stores ", m.stores, " entries ", m.entries)
+    return nothing
+end
+
+# ---------------------------------------------------------------------------
+# Cross-request memoization with per-result edge replay (A6)
+# ---------------------------------------------------------------------------
+#
+# Every driver request runs a fresh UInferState/UEdges pair, so before this
+# section each request re-inferred its whole callee tree from scratch (the
+# single-collector soundness basis). The global memo removes the
+# re-inference WITHOUT weakening that basis: a clean callee frame's result
+# is stored TOGETHER WITH the fact set it consumed (its window of the
+# request's fact trace, `UEdges.trace`, flattened across span references),
+# and a consuming request REPLAYS those facts into its own collector — the
+# entry CodeInstance's edges and world bounds come out exactly as if the
+# callee had been re-inferred, minus the walk.
+#
+# Keying: per-MethodInstance for widened frames, per-const-key (the
+# `const_key` encoding, whose egal semantics IdDict matches exactly) for
+# const-seeded frames and concrete evaluations.
+#
+# World validation (invalidation correctness): an entry stores the world its
+# facts were last validated at plus the world COUNTER observed at that
+# frame's start. A lookup at the same (world, counter) replays the stored
+# fact objects directly — nothing can have been redefined without bumping
+# the counter. Any other (world, counter) re-executes every fact query at
+# the consuming world and compares answers — method-match sets, binding-
+# partition loads, CodeInstance world cover, oracle answers: all equal ⇒
+# the entry revalidates (fact objects refresh, so replayed world ranges are
+# current); any difference ⇒ the entry is stale and dropped. Facts the
+# trace cannot encode (staged expansions, mi-invoke edges, assignment-kind
+# partition facts) POISON their windows: such frames are never stored.
+# Mid-request counter movement is backstopped by the driver's finish
+# protocol exactly as for live facts (`valid_worlds` must reach the
+# validation world, else the result is declined, never published).
+#
+# Reentry discipline (the wave-5 P1 design rule): memo-table accesses use
+# the ledger's owner-tracked bounded acquisition — same-task reentry
+# proceeds unlocked, cross-task contention drops the memo operation (the
+# memo is only ever an optimization). Fact revalidation and replay, which
+# can demand compiles, run OUTSIDE the lock.
+
+mutable struct MemoEntry
+    const result::UResult
+    facts::Vector{Any}     # flattened fact events (tags 0x1..0x4; see UEdges)
+    world::UInt            # the world `facts` were last validated at
+    counter::UInt          # world counter observed at the recording frame's start
+end
+
+const DRIVER_MEMO_ENABLED = Base.RefValue(true)
+const DRIVER_MEMO = Base.IdDict{Any,Any}()     # (mi | const key) -> MemoEntry
+const MEMO_LOCK = Base.Threads.SpinLock()
+const MEMO_OWNER = Base.RefValue{Any}(nothing)
+const MEMO_HITS = Base.Threads.Atomic{Int}(0)
+const MEMO_MISSES = Base.Threads.Atomic{Int}(0)
+const MEMO_STALE = Base.Threads.Atomic{Int}(0)
+const MEMO_STORES = Base.Threads.Atomic{Int}(0)
+const MEMO_REPLAYED = Base.Threads.Atomic{Int}(0)
+const MEMO_DROPPED = Base.Threads.Atomic{Int}(0)
+
+_memo_acquire() = _guarded_acquire(MEMO_LOCK, MEMO_OWNER, true)
+_memo_release(state::UInt8) = _guarded_release(MEMO_LOCK, MEMO_OWNER, state)
+
+"Drop every memo entry (tests/benchmarks; never required for correctness —
+entries self-invalidate through world revalidation)."
+function reset_driver_memo!()
+    lk = _memo_acquire()
+    lk == 0x2 && return nothing
+    try
+        empty!(DRIVER_MEMO)
+    finally
+        _memo_release(lk)
+    end
+    return nothing
+end
+
+"Match-set equality for revalidation: the same methods, coverage and
+ambiguity answer the consuming world's query."
+function same_lookup(a::Compiler.MethodLookupResult, b::Compiler.MethodLookupResult)
+    a.ambig == b.ambig || return false
+    length(a.matches) == length(b.matches) || return false
+    for i in 1:length(a.matches)
+        ma = a.matches[i]::Core.MethodMatch
+        mb = b.matches[i]::Core.MethodMatch
+        ma.method === mb.method || return false
+        ma.fully_covers == mb.fully_covers || return false
+        ma.spec_types === mb.spec_types || ma.spec_types == mb.spec_types || return false
+    end
+    return true
+end
+
+"Partition-load equality for revalidation (rt/exct/effects of the read)."
+same_rte(a::CC.RTEffects, b::CC.RTEffects) =
+    lat_eq(a.rt, b.rt) && a.exct == b.exct && a.effects == b.effects
+
+"The binding-partition load at `world`, as a pure query (no collector)."
+function memo_partition_probe(world::UInt, mod::Module, name::Symbol)
+    return try
+        b = convert(Core.Binding, GlobalRef(mod, name))
+        partition = CC.lookup_binding_partition(world, b)
+        _, (leaf_b, leaf_partition) = CC.walk_binding_partition(b, partition, world)
+        CC.abstract_eval_partition_load(nothing, leaf_b, leaf_partition)
+    catch
+        nothing
+    end
+end
+
+"""Re-execute every recorded fact query at `world` and compare answers.
+Returns the refreshed fact vector (query results carry current world
+ranges), or `nothing` when any fact no longer reproduces — the entry is
+stale. Pure with respect to the consuming collector."""
+function memo_revalidate(facts::Vector{Any}, world::UInt)
+    out = Vector{Any}(undef, length(facts))
+    for (i, f) in enumerate(facts)
+        tag = f[1]::UInt8
+        if tag == 0x1
+            res = try
+                CC.findall(f[2], CC.InternalMethodTable(world); limit = f[4]::Int)
+            catch
+                nothing
+            end
+            res isa Compiler.MethodLookupResult || return nothing
+            same_lookup(f[3]::Compiler.MethodLookupResult, res) || return nothing
+            out[i] = (0x1, f[2], res, f[4])
+        elseif tag == 0x2
+            rte = memo_partition_probe(world, f[2]::Module, f[3]::Symbol)
+            rte isa CC.RTEffects || return nothing
+            same_rte(f[4]::CC.RTEffects, rte) || return nothing
+            out[i] = f    # replay re-derives the partition read at its world
+        elseif tag == 0x3
+            ci = f[2]::Core.CodeInstance
+            (ci.min_world <= world <= ci.max_world) || return nothing
+            out[i] = f
+        elseif tag == 0x4
+            rt = try
+                Core.Compiler.return_type(f[2], world)
+            catch
+                nothing
+            end
+            rt === f[3] || return nothing
+            out[i] = f
+        else
+            return nothing    # unknown fact class: never serve it
+        end
+    end
+    return out
+end
+
+"""Replay validated facts into the consuming request's collector: the same
+record/clamp calls the original inference performed, so the entry
+CodeInstance's edges and world bounds stay complete. Every replayed fact
+also re-enters the trace (enclosing frame windows depend on it)."""
+function memo_replay!(st::UInferState, facts::Vector{Any})
+    col = st.edges::UEdges
+    for f in facts
+        tag = f[1]::UInt8
+        if tag == 0x1
+            record_call!(col, f[2], f[3]::Compiler.MethodLookupResult)
+            trace!(col, f)
+        elseif tag == 0x2
+            # partition re-read at this request's world (globmemo-deduped;
+            # answers were compared at validation): records edge + clamps +
+            # trace event itself
+            global_partition_rte(col, f[2]::Module, f[3]::Symbol)
+        elseif tag == 0x3
+            ci = f[2]::Core.CodeInstance
+            clamp_world!(col, ci.min_world, ci.max_world)
+            record_invoke!(col, nothing, ci)
+            trace!(col, f)
+        else # 0x4: oracle answers carry no edge of their own (the enclosing
+             # match edge is a separate fact); trace only
+            trace!(col, f)
+        end
+    end
+    Base.Threads.atomic_add!(MEMO_REPLAYED, length(facts))
+    return nothing
+end
+
+"""
+    global_memo_lookup(st, key) -> Union{Nothing,UResult}
+
+Serve a cross-request memo entry for `key` (mi or const key) into the
+consuming request: validate the entry's facts at this request's world,
+replay them into the collector, and record the replayed span so enclosing
+frame windows stay fact-complete. `nothing` on miss/stale/contention (the
+caller infers fresh)."""
+function global_memo_lookup(st::UInferState, @nospecialize(key))
+    DRIVER_MEMO_ENABLED[] || return nothing
+    col = st.edges
+    col === nothing && return nothing
+    world = st.cfg.world
+    lk = _memo_acquire()
+    if lk == 0x2
+        Base.Threads.atomic_add!(MEMO_DROPPED, 1)
+        return nothing
+    end
+    local entry
+    try
+        entry = get(DRIVER_MEMO, key, nothing)
+    finally
+        _memo_release(lk)
+    end
+    if entry === nothing
+        Base.Threads.atomic_add!(MEMO_MISSES, 1)
+        return nothing
+    end
+    entry = entry::MemoEntry
+    facts = entry.facts
+    if !(entry.world == world && entry.counter == Base.get_world_counter())
+        # something may have been redefined since the facts were recorded:
+        # re-execute every fact query at this world (outside the lock)
+        newfacts = memo_revalidate(facts, world)
+        if newfacts === nothing
+            Base.Threads.atomic_add!(MEMO_STALE, 1)
+            lk = _memo_acquire()
+            if lk == 0x2
+                Base.Threads.atomic_add!(MEMO_DROPPED, 1)
+            else
+                try
+                    # drop only OUR generation: a concurrent revalidation may
+                    # have already refreshed the entry
+                    get(DRIVER_MEMO, key, nothing) === entry && delete!(DRIVER_MEMO, key)
+                finally
+                    _memo_release(lk)
+                end
+            end
+            return nothing
+        end
+        facts = newfacts
+        counter = Base.get_world_counter()
+        lk = _memo_acquire()
+        if lk == 0x2
+            Base.Threads.atomic_add!(MEMO_DROPPED, 1)
+        else
+            try
+                entry.facts = newfacts
+                entry.world = world
+                entry.counter = counter
+            finally
+                _memo_release(lk)
+            end
+        end
+    end
+    lo = length(col.trace)
+    memo_replay!(st, facts)
+    col.spans[key] = (lo + 1, length(col.trace))
+    Base.Threads.atomic_add!(MEMO_HITS, 1)
+    return entry.result
+end
+
+"Flatten a trace window into a self-contained fact vector: span references
+resolve recursively (order is irrelevant — record/clamp calls commute), and
+duplicate events dedup by identity."
+function memo_collect_facts(col::UEdges, lo::Int, hi::Int)
+    trace = col.trace
+    out = Any[]
+    seen_spans = Set{Tuple{Int,Int}}()
+    seen = Base.IdSet{Any}()
+    work = Tuple{Int,Int}[(lo, hi)]
+    while !isempty(work)
+        (l, h) = pop!(work)
+        (l, h) in seen_spans && continue
+        push!(seen_spans, (l, h))
+        for i in l:h
+            ev = trace[i]
+            if (ev[1]::UInt8) == 0x5
+                push!(work, (ev[2]::Int, ev[3]::Int))
+            elseif !(ev in seen)
+                push!(seen, ev)
+                push!(out, ev)
+            end
+        end
+    end
+    return out
+end
+
+"""
+    memo_frame_store!(st, key, r, tlo, tpo, tco)
+
+Record a cleanly-completed frame's result in the cross-request memo: `tlo`/
+`tpo`/`tco` are the frame-entry trace length, poison count and world
+counter. Sets the per-request span for `key` (fact-completeness for
+enclosing windows) and, when the window is clean, publishes the entry."""
+function memo_frame_store!(st::UInferState, @nospecialize(key), r::UResult,
+                           tlo::Int, tpo::Int, tco::UInt)
+    col = st.edges
+    col === nothing && return nothing
+    (col.poison == tpo && col.ok) || return nothing
+    hi = length(col.trace)
+    col.spans[key] = (tlo + 1, hi)
+    DRIVER_MEMO_ENABLED[] || return nothing
+    facts = memo_collect_facts(col, tlo + 1, hi)
+    entry = MemoEntry(r, facts, st.cfg.world, tco)
+    lk = _memo_acquire()
+    if lk == 0x2
+        Base.Threads.atomic_add!(MEMO_DROPPED, 1)
+        return nothing
+    end
+    try
+        DRIVER_MEMO[key] = entry
+    finally
+        _memo_release(lk)
+    end
+    Base.Threads.atomic_add!(MEMO_STORES, 1)
     return nothing
 end
 
@@ -215,19 +541,12 @@ const DRIVER_REENTRY_LIMIT = Base.RefValue(8)
 
 "Per-session admission budget for REENTRANT passes (requests arriving while
 this task is already inside the driver — the self-hosting burn-in). Every
-pass re-infers its callee tree with fresh state (the pre-A6 soundness
-basis), AND its own execution raises further reentrant requests (each
-dynamic dispatch in not-yet-compiled driver code is a compile request), so
-admissions CASCADE — a tower of nested fresh-state passes per admitted
-body. Measured on the driver demo's first post-flip compile: a budget of
-1000 spends ~30s in the cascade where a budget of 32 spends ~2s, with the
-same ledger semantics. Admit a small representative sample through the
-pipeline per session (unified, cached), then decline precisely
-(`:reentrant_budget` — stock compiles and caches those, so the burn-in
-completes at stock speed and a repeated workload is reentrant-quiet either
-way; this is also stock's shape: the compiler under test does not compile
-its own code). A6's cross-body memoization removes the need for this
-valve."
+pre-A6 pass re-inferred its callee tree with fresh state, so admissions
+CASCADED (a tower of nested fresh-state passes per admitted body) and the
+valve had to stay tiny (32; 431a7d4e82 measured a budget of 1000 spending
+~30s in the cascade where 32 spent ~2s). The A6 cross-request memo
+amortizes the inference share of each admission; the valve widens in the
+follow-up commit with the measured numbers."
 const DRIVER_REENTRANT_BUDGET = Base.RefValue(32)
 const REENTRANT_ADMITTED = Base.Threads.Atomic{Int}(0)
 
@@ -242,20 +561,22 @@ dozens of resolved callees (collect/print chains) must not multiply its
 own compile time by that fan-out."
 const DEVIRT_PRODUCTION_BUDGET = Base.RefValue(4)
 
-# Per-body inference budgets (v0): the driver re-infers each body's callee
-# tree with a fresh state — the edge collector's soundness requires every
-# consumed method-table/binding fact to be observed within this body's pass —
-# so the budgets are deliberately tight. Depth/frame cutoffs resolve through
-# the stock return_type oracle (fast, cached, and covered by the recorded
-# match edge), trading callee-type precision for bounded per-body cost.
-# Cross-body memoization with per-result edge replay is the A6 upgrade path.
+# Per-body inference budgets: each request runs a fresh state — the edge
+# collector's soundness requires every consumed method-table/binding fact to
+# be observed within (or replayed into, via the A6 memo) this body's pass —
+# so the budgets stay deliberately tight. Depth/frame cutoffs resolve
+# through the stock return_type oracle (fast, cached, and covered by the
+# recorded match edge + the traced oracle fact), trading callee-type
+# precision for bounded per-body cost; memo hits consume no frames, so a
+# warm session sees the cutoffs progressively less.
 const DRIVER_MAX_DEPTH = Base.RefValue(16)
 const DRIVER_FRAME_BUDGET = Base.RefValue(3_000)
 # Reentrant passes (nested driver work: the runtime compiling the driver's
 # own code mid-pass, and devirtualization targets) run with narrower budgets:
 # the same soundness protocol at lower callee-type precision, so the
 # self-hosting burn-in costs a fraction of a root pass. Cutoffs stay sound
-# (return_type oracle + recorded edges); A6's memoization removes the need.
+# (return_type oracle + recorded edges), and the memo restores precision as
+# leaves complete cleanly across requests.
 const DRIVER_REENTRANT_MAX_DEPTH = Base.RefValue(4)
 const DRIVER_REENTRANT_FRAME_BUDGET = Base.RefValue(400)
 

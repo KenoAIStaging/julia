@@ -71,11 +71,30 @@ mutable struct UEdges
                                               # sound: a partition change bumps the
                                               # world counter, which the driver's
                                               # finish protocol detects)
+    # Cross-request memo support (driver.jl's global memo, A6): an append-only
+    # per-request FACT TRACE — one event per consulted mutable-global-state
+    # fact, INCLUDING re-consults the edge storage dedups away — so a callee
+    # frame's trace window is exactly the fact set its result depends on.
+    # Event encodings (tuples):
+    #   (0x1, atype, result::MethodLookupResult, limit)   method-table lookup
+    #   (0x2, mod, name, rte::RTEffects)                  binding-partition read
+    #   (0x3, ci::CodeInstance)                           CodeInstance result read
+    #   (0x4, sig, rt)                                    stock return_type oracle answer
+    #   (0x5, lo, hi)                                     span reference: this request's
+    #                                                     trace events lo..hi (a
+    #                                                     per-request cache hit)
+    # `spans` maps a per-request cache key (mi or const key) to the trace
+    # window that justifies its cached result; `poison` counts consulted facts
+    # the trace CANNOT represent (frames whose window saw one are excluded
+    # from the global memo — the per-request collector still handles them).
+    trace::Vector{Any}
+    spans::Dict{Any,Tuple{Int,Int}}
+    poison::Int
 end
 UEdges(world::UInt) =
     UEdges(world, CC.WorldRange(UInt(1), Base.get_world_counter()), true,
            Any[], Dict{Any,Int}(), Any[], Core.Binding[], Base.IdSet{Core.Binding}(),
-           Dict{Tuple{Module,Symbol},Any}())
+           Dict{Tuple{Module,Symbol},Any}(), Any[], Dict{Any,Tuple{Int,Int}}(), 0)
 
 "Intersect the collector's valid range with `[minw, maxw]`; a disjoint range
 or one that no longer covers the inference world marks the collector unsound."
@@ -113,6 +132,16 @@ function record_binding!(col::UEdges, b::Core.Binding)
     return nothing
 end
 
+# --- cross-request memo fact-trace helpers (see the UEdges field comment) ---
+
+@inline trace!(col::UEdges, @nospecialize(ev)) = (push!(col.trace, ev); nothing)
+@inline trace!(::Nothing, @nospecialize(ev)) = nothing
+
+"Mark the current frame windows as containing a fact the trace cannot
+represent: every enclosing frame becomes ineligible for the global memo."
+@inline memo_poison!(col::UEdges) = (col.poison += 1; nothing)
+@inline memo_poison!(::Nothing) = nothing
+
 mutable struct UInferState
     cfg::UInferConfig
     cache::Dict{Core.MethodInstance,Any}        # mi -> UResult (rettype + effects)
@@ -147,6 +176,18 @@ UInferState(cfg::UInferConfig = UInferConfig()) =
                 Set{Core.MethodInstance}(), UInferStats(0, 0, 0), Dict{Any,Any}(), 0, 0,
                 Dict{Any,Any}(), Dict{Any,Any}(), Dict{Any,Any}(), typemax(Int), 0, 0, 0, 0,
                 nothing)
+
+"""Serve a per-request cached result to the trace: reference the span that
+justified it, so enclosing frames' windows stay fact-complete. A hit whose
+key has no recorded span (context-tainted results) poisons the window
+instead."""
+function memo_note_hit!(st::UInferState, @nospecialize(key))
+    col = st.edges
+    col === nothing && return nothing
+    sp = get(col.spans, key, nothing)
+    sp === nothing ? (col.poison += 1) : push!(col.trace, (0x5, sp[1], sp[2]))
+    return nothing
+end
 
 ⊔(st::UInferState, @nospecialize(a), @nospecialize(b)) =
     a === nothing ? b :

@@ -85,7 +85,13 @@ answer's validity."""
 function global_partition_rte(col::UEdges, mod::Module, name::Symbol)
     key = (mod, name)
     memo = get(col.globmemo, key, nothing)
-    memo === nothing || return memo::CC.RTEffects
+    if memo !== nothing
+        # re-consults must reach the fact trace even though the edge storage
+        # and the clamp already happened (frame windows opened since the first
+        # read still depend on this fact)
+        trace!(col, (0x2, mod, name, memo))
+        return memo::CC.RTEffects
+    end
     local rte
     try
         b = convert(Core.Binding, GlobalRef(mod, name))
@@ -100,6 +106,7 @@ function global_partition_rte(col::UEdges, mod::Module, name::Symbol)
         return CC.RTEffects(Any, Any, CC.Effects())
     end
     col.globmemo[key] = rte
+    trace!(col, (0x2, mod, name, rte))
     return rte
 end
 
@@ -147,6 +154,7 @@ function global_assign_rt_exct(st::UInferState, M::Module, s::Symbol, @nospecial
         if col !== nothing
             clamp_world!(col, partition.min_world, partition.max_world)
             record_binding!(col, b)
+            memo_poison!(col)   # assignment-kind facts are not trace-encodable
         end
         kind = CC.binding_kind(partition)
         if CC.is_some_guard(kind)
@@ -196,6 +204,7 @@ function infer_get_binding_type(fr::Frame, args::Vector{Any})::UResult
             if col !== nothing
                 clamp_world!(col, valid_worlds)
                 record_binding!(col, b)
+                memo_poison!(col)   # binding-type facts are not trace-encodable
             end
             kind = CC.binding_kind(leaf_partition)
             if CC.is_some_guard(kind) || kind == CC.PARTITION_KIND_DECLARED
@@ -1028,7 +1037,10 @@ function lookup_call_matches(st::UInferState, @nospecialize(sig))
     end
     result === nothing && return nothing
     col = st.edges
-    col === nothing || record_call!(col, sig, result)
+    if col !== nothing
+        record_call!(col, sig, result)
+        trace!(col, (0x1, sig, result, st.cfg.max_methods))
+    end
     return result
 end
 
@@ -1264,6 +1276,7 @@ function infer_return_type_call(fr::Frame, args::Vector{Any})
             end
             result === nothing && return nothing   # unboundable: skip the fold
             record_call!(col, sig, result)
+            trace!(col, (0x1, sig, result, -1))
         end
     end
     rt = try
@@ -1272,6 +1285,9 @@ function infer_return_type_call(fr::Frame, args::Vector{Any})
     catch
         return nothing
     end
+    # the folded answer depends on the oracle's transitive view of the method
+    # tables, which the match edge alone cannot revalidate cross-request
+    trace!(st.edges, (0x4, sig, rt))
     # `nortcall = false`: a `return_type` call must never become concrete-eval
     # eligible in its callers (that would re-enter inference at runtime); the
     # fold itself already happened, so everything else is total (stock's
@@ -1508,6 +1524,7 @@ function record_ci_read!(st::UInferState, ci::Core.CodeInstance)
     col === nothing && return nothing
     clamp_world!(col, ci.min_world, ci.max_world)
     record_invoke!(col, nothing, ci)
+    trace!(col, (0x3, ci))
     return nothing
 end
 
@@ -1526,7 +1543,10 @@ function infer_invoke_target(fr::Frame, @nospecialize(tl), args::Vector{Any})::U
         match = Core.MethodMatch(target.specTypes, target.sparam_vals,
                                  target.def::Method, true)
         let col = fr.st.edges
-            col === nothing || record_invoke!(col, target.specTypes, target)
+            if col !== nothing
+                record_invoke!(col, target.specTypes, target)
+                memo_poison!(col)   # mi-invoke facts are not trace-revalidatable
+            end
         end
         return try
             infer_method(fr, match, args)
@@ -1609,7 +1629,10 @@ function invoke_match(fr::Frame, method::Method, @nospecialize(nargtype),
         match = Core.MethodMatch(ti, env, method, argtype <: method.sig)
         let col = fr.st.edges
             # the stock invoke-edge shape: (invokesig, callee MethodInstance)
-            col === nothing || record_invoke!(col, argtype, CC.specialize_method(match))
+            if col !== nothing
+                record_invoke!(col, argtype, CC.specialize_method(match))
+                memo_poison!(col)   # invoke-edge facts are not trace-revalidatable
+            end
         end
         infer_method(fr, match, callargs)
     catch
@@ -1643,6 +1666,7 @@ function method_src(m::Method, mi::Core.MethodInstance, world::UInt,
         end
         if src !== nothing && col !== nothing
             clamp_world!(col, src.min_world, src.max_world)
+            memo_poison!(col)   # staged-expansion windows are not trace-revalidatable
         end
         return src
     end
@@ -1915,6 +1939,15 @@ function infer_method(fr::Frame, match::Core.MethodMatch, args::Vector{Any})::UR
         end
         return UResult(base.rt, eff, base.exct)
     end
+    # cross-request memo bookkeeping (driver mode; see driver.jl's memo
+    # section): this frame's fact-trace window starts here. `tco` snapshots
+    # the world counter — facts queried after a mid-frame counter bump would
+    # be certified fresher than the snapshot, so the stored entry always
+    # revalidates on first consumption in that case (conservative).
+    col = st.edges
+    tlo = col === nothing ? 0 : length(col.trace)
+    tpo = col === nothing ? 0 : col.poison
+    tco = col === nothing ? UInt(0) : Base.get_world_counter()
     # const-seeded frames (interprocedural constant propagation) use their own
     # memo cache keyed by the const-extended signature. Vararg methods qualify
     # too (stock const-props them; method_arglattice builds the precise vararg
@@ -1931,34 +1964,54 @@ function infer_method(fr::Frame, match::Core.MethodMatch, args::Vector{Any})::UR
             constseeded = false
         else
             r = get(st.constcache, ck, nothing)
-            r === nothing || return r::UResult
+            r === nothing || (memo_note_hit!(st, ck); return r::UResult)
             r = get(st.scratch, ck, nothing)
-            r === nothing || return r::UResult
+            r === nothing || (memo_poison!(col); return r::UResult)
             r = get(st.cycle_scratch, ck, nothing)
             if r isa UResult
                 st.cyscr_hits += 1
+                memo_poison!(col)
                 return r
             elseif r isa Tuple && r[2] == st.resolutions
                 st.cyscr_hits += 1
+                memo_poison!(col)
                 return r[1]::UResult
+            end
+            # cross-request memo: a previous driver request's const frame,
+            # with its recorded facts replayed into this request's collector
+            r = global_memo_lookup(st, ck)
+            if r !== nothing
+                st.constcache[ck] = r::UResult
+                return r::UResult
             end
             # all-Const call of a total callee: evaluate for real instead of
             # running the abstract const frame (the concrete_eval_call port)
             r = concrete_eval(fr, match, args, ck)
-            r === nothing || return r::UResult
+            if r !== nothing
+                memo_frame_store!(st, ck, r::UResult, tlo, tpo, tco)
+                return r::UResult
+            end
         end
     end
     if !constseeded
-        haskey(st.cache, mi) && return st.cache[mi]::UResult
+        haskey(st.cache, mi) && (memo_note_hit!(st, mi); return st.cache[mi]::UResult)
         r = get(st.scratch, mi, nothing)
-        r === nothing || return r::UResult
+        r === nothing || (memo_poison!(col); return r::UResult)
         r = get(st.cycle_scratch, mi, nothing)
         if r isa UResult
             st.cyscr_hits += 1
+            memo_poison!(col)
             return r
         elseif r isa Tuple && r[2] == st.resolutions
             st.cyscr_hits += 1
+            memo_poison!(col)
             return r[1]::UResult
+        end
+        # cross-request memo: a previous driver request's widened frame
+        r = global_memo_lookup(st, mi)
+        if r !== nothing
+            st.cache[mi] = r::UResult
+            return r::UResult
         end
     end
     if length(st.active) >= st.cfg.max_depth ||
@@ -2004,6 +2057,11 @@ function infer_method(fr::Frame, match::Core.MethodMatch, args::Vector{Any})::UR
                     else
                         st.constcache[k] = v
                     end
+                    # jointly-converged SCC members commit with the ROOT's
+                    # fact window (a member's own window misses the facts
+                    # justifying the root's value it consumed): superset,
+                    # sound for span references and the global memo alike
+                    memo_frame_store!(st, k, v, tlo, tpo, tco)
                 end
             end
             empty!(st.cycle_scratch)
@@ -2048,13 +2106,15 @@ function infer_method(fr::Frame, match::Core.MethodMatch, args::Vector{Any})::UR
                 st.scratch[ck] = rc
             else
                 st.constcache[ck] = rc
+                memo_frame_store!(st, ck, rc, tlo, tpo, tco)
             end
             frame_done()
             return rc
         end
         # (frame_done(false): members computed against this aborted const frame
         # must not be flushed as converged)
-        haskey(st.cache, mi) && (frame_done(false); return st.cache[mi]::UResult)
+        haskey(st.cache, mi) && (frame_done(false); memo_note_hit!(st, mi);
+                                 return st.cache[mi]::UResult)
     end
     # the memoized path is keyed by mi: it MUST be computed at the
     # mi.specTypes-derived lattice, never at one caller's lattice — a shared
@@ -2148,6 +2208,8 @@ function infer_method(fr::Frame, match::Core.MethodMatch, args::Vector{Any})::UR
     elseif tainted_limit()
         delete!(st.cache, mi)
         st.scratch[mi] = r
+    elseif converged
+        memo_frame_store!(st, mi, r, tlo, tpo, tco)
     end
     # flush only a clean, jointly-converged final pass (no non-converged
     # inner fixpoints, no resource cutoffs)
@@ -2226,10 +2288,15 @@ function native_rt(fr::Frame, match::Core.MethodMatch)
             # CodeInstance chain in the global cache, so invalidation of
             # anything the answer depends on reaches us through the
             # match-edge backedge (mi-level invalidation is transitive).
-            return Core.Compiler.return_type(match.spec_types, fr.st.cfg.world)
+            # For the cross-request memo the answer is a FACT (the oracle's
+            # transitive view is not otherwise revalidatable): trace it.
+            rt = Core.Compiler.return_type(match.spec_types, fr.st.cfg.world)
+            trace!(fr.st.edges, (0x4, match.spec_types, rt))
+            return rt
         end
         return Core.Compiler.return_type(match.spec_types)
     catch
+        memo_poison!(fr.st.edges)
         return Any
     end
 end

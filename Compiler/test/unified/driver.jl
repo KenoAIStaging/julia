@@ -329,7 +329,32 @@ end
     UnifiedCompiler.print_pipeline_stats(io)
     out = String(take!(io))
     @test occursin("unified pipeline:", out)
+    @test occursin("memo hits", out)
 end
+
+@testset "driver: memo counters in the ledger" begin
+    UnifiedCompiler.reset_pipeline_stats!()
+    m0 = pipeline_stats().memo
+    @test m0.hits == 0 && m0.misses == 0 && m0.stale == 0 && m0.stores == 0
+    @eval drv_memo_leaf(x) = x + 5
+    @eval drv_memo_top(x) = drv_memo_leaf(x) * 2
+    f = Base.invokelatest(getglobal, @__MODULE__, :drv_memo_top)
+    interp = drv_interp()
+    r1 = Base.invokelatest(UnifiedCompiler.driver_infer, interp, drv_mi(f, 1))
+    @test r1 isa UnifiedCompiler.DriverResult
+    m1 = pipeline_stats().memo
+    @test m1.stores >= 1                     # the leaf frame entered the memo
+    r2 = Base.invokelatest(UnifiedCompiler.driver_infer, interp, drv_mi(f, 1))
+    @test r2 isa UnifiedCompiler.DriverResult
+    m2 = pipeline_stats().memo
+    @test m2.hits > m1.hits                  # the second request replayed it
+    @test m2.replayed > m1.replayed
+    @test m2.entries >= 1
+    @test r1.rt == r2.rt && r1.effects == r2.effects
+end
+
+# invalidation.jl-style deep parity: edges/worlds/cache chains/memo staleness
+include("driver_invalidation.jl")
 
 @testset "driver: global activation executes correctly (subprocess)" begin
     # jl_set_typeinf_func flips are process-global: exercise them in a child
