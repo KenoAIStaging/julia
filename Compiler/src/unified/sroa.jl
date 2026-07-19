@@ -337,6 +337,28 @@ function resolve_finalizers!(ir::UnifiedIR.IR, st::UInferState)
         end
         r === nothing && continue
         fx = r.effects
+        if !(CC.is_removable_if_unused(fx) || Compiler.is_finalizer_inlineable(fx))
+            # inference-grade effects miss post-opt statement facts (the
+            # driver publishes refined bits only into CodeInstances): retry
+            # the gate at driver grade through the memoized post-opt helper
+            fsig = try
+                Tuple{f isa Type ? Type{f} : typeof(f), objT}
+            catch
+                nothing
+            end
+            match = fsig === nothing ? nothing : resolve_single_match(st, fsig)
+            if match !== nothing
+                mi2 = try
+                    CC.specialize_method(match)
+                catch
+                    nothing
+                end
+                if mi2 isa Core.MethodInstance
+                    fx2 = opt_callee_effects(st, mi2)
+                    fx2 isa CC.Effects && (fx = fx2)
+                end
+            end
+        end
         if CC.is_removable_if_unused(fx)
             UnifiedIR.replace_stmt!(ir, s, K"refine", objo;
                                     type = UnifiedIR.stmt_type(ir, s))

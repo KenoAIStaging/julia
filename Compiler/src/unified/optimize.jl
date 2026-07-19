@@ -971,6 +971,80 @@ function ea_check_args_noescape(ir::UnifiedIR.IR, estate, # ::UEscapeState (esca
     return res
 end
 
+# Post-optimization callee effects: the driver publishes refined bits only
+# into CodeInstances, so mid-pipeline consumers (frame-nothrow scan, the
+# finalizer gate) see inference-grade callee effects that miss post-opt
+# statement facts. Memoized per MethodInstance, world-stamped, cycle-guarded
+# (a callee's optimization recursively consults ITS callees through the
+# same helper).
+const OPT_FX_MEMO = IdDict{Core.MethodInstance,Any}()
+const OPT_FX_WORLD = Base.RefValue{UInt}(0)
+const OPT_FX_ACTIVE = Base.IdSet{Core.MethodInstance}()
+
+"""
+    opt_callee_effects(st, mi) -> Union{Nothing,Effects}
+
+`mi`'s frame effects at driver grade: the body optimized through this
+pipeline (whose tail applies the post-opt refinements, recursively through
+this helper), with the method's `@assume_effects` override applied.
+"""
+function opt_callee_effects(st::UInferState, mi::Core.MethodInstance)
+    trylock(EA_OPT_LOCK) || return nothing
+    try
+        world = st.cfg.world
+        if OPT_FX_WORLD[] != world
+            empty!(OPT_FX_MEMO)
+            OPT_FX_WORLD[] = world
+        end
+        haskey(OPT_FX_MEMO, mi) && return OPT_FX_MEMO[mi]
+        (mi in OPT_FX_ACTIVE || length(OPT_FX_ACTIVE) >= EA_OPT_MAX_ACTIVE) &&
+            return nothing
+        push!(OPT_FX_ACTIVE, mi)
+        r = try
+            opt_callee_effects_uncached(st, mi)
+        catch
+            nothing
+        finally
+            delete!(OPT_FX_ACTIVE, mi)
+        end
+        OPT_FX_MEMO[mi] = r
+        return r
+    finally
+        unlock(EA_OPT_LOCK)
+    end
+end
+
+function opt_callee_effects_uncached(st::UInferState, mi::Core.MethodInstance)
+    m = mi.def
+    m isa Method || return nothing
+    isdefined(m, :generator) && return nothing
+    src = Base.uncompressed_ir(m)
+    length(src.code) <= EA_OPT_MAX_SRC_STMTS || return nothing
+    sig = mi.specTypes
+    sig isa DataType || return nothing
+    ps = collect(Any, sig.parameters)
+    nargs = Int(m.nargs)
+    if m.isva
+        nargs >= 1 || return nothing
+        length(ps) >= nargs - 1 || return nothing
+        vat = try
+            Tuple{ps[nargs:end]...}
+        catch
+            Tuple
+        end
+        ps = Any[ps[1:(nargs - 1)]; vat]
+    end
+    length(ps) == nargs || return nothing
+    Base.any(p -> CC.isvarargtype(p), ps) && return nothing
+    ir = codeinfo_to_ir(src; nargs, name = m.name)
+    ir.meta[:method_instance] = mi
+    ir.meta[:slotnames] = src.slotnames
+    ir.sptypes = Any[t for t in mi.sparam_vals]
+    ir.meta[:sptypes_lat] = sptypes_lattice(mi)
+    ir = optimize_ir!(ir, ps; state = st, inline = true)
+    return apply_effects_override(m, frame_effects_meta(ir))
+end
+
 """
     refine_frame_nothrow!(ir) -> Int
 
@@ -985,7 +1059,7 @@ zeroes `ir.meta[:exct]`. Conservative: any unflagged computational
 statement refuses (statements inside `try` bodies included, though their
 throws would be caught — inference already models that channel).
 """
-function refine_frame_nothrow!(ir::UnifiedIR.IR)
+function refine_frame_nothrow!(ir::UnifiedIR.IR, st::Union{UInferState,Nothing} = nothing)
     eff = frame_effects_meta(ir)
     CC.is_nothrow(eff) && return 0
     # statement-position static-parameter reads are ELIDED by the entry
@@ -1015,6 +1089,27 @@ function refine_frame_nothrow!(ir::UnifiedIR.IR)
             # maybe-undefined residual cell can throw, so it must carry the
             # flag column's proof)
             continue
+        elseif st !== nothing && (k === K"call" || k === K"invoke")
+            # unflagged interprocedural site: nothrow at driver grade — the
+            # callee's own post-opt refinement — when the target is exact
+            # (CI/mi invoke, or a single unambiguous fully-covering match,
+            # which also excludes the MethodError channel)
+            local fx
+            if k === K"invoke"
+                tgt = static_operand_value(ir, UnifiedIR.getop(ir, s, 1))
+                if tgt isa Core.CodeInstance
+                    fx = CC.decode_effects(tgt.ipo_purity_bits)
+                elseif tgt isa Core.MethodInstance
+                    fx = opt_callee_effects(st, tgt)
+                else
+                    return 0
+                end
+            else
+                cmi = ea_resolve_residual_call(ir, st, s)
+                cmi isa Core.MethodInstance || return 0
+                fx = opt_callee_effects(st, cmi)
+            end
+            (fx isa CC.Effects && CC.is_nothrow(fx)) || return 0
         else
             return 0
         end
@@ -1196,7 +1291,7 @@ function optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
     # scans consume.
     try
         refine_effects!(ir)
-        refine_frame_nothrow!(ir)
+        refine_frame_nothrow!(ir, state)
         ea_refine_effect_free!(ir, state)
     catch
     end
