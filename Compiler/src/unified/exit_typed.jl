@@ -113,6 +113,16 @@ struct SynthRaw
     typ::Any
 end
 
+"""A hoisted statement-position load of a value-position global operand
+(B3a Findings F3 residual): stock's verifier rejects unbound/partitioned
+GlobalRefs in value position, so IR-native bodies that place such globals
+directly as operands get an explicit load statement before the user."""
+mutable struct SynthGlobal
+    g::GlobalRef
+    typ::Any
+    ssaidx::Int
+end
+
 # ---- phase-A cell placeholders (rewritten by the phase-B mem2reg) ----------
 
 struct CellDecl; cell::Int32; end
@@ -139,6 +149,7 @@ mutable struct TCtx
     cellload::Dict{Int32,Any}         # cell_get/cell_isdefined uirid => resolved payload
     names::Any                        # meta[:cell_names] or nothing
     catches::Vector{Tuple{TBB,TryCtx}}
+    globhoist::Dict{Tuple{Int32,Int},Any}  # (stmt id, op index) => SynthGlobal
 end
 
 "Create a block and place it at the end of the current layout."
@@ -203,7 +214,8 @@ function ir_to_ircode(ir::UnifiedIR.IR)
     cx = TCtx(ir, TBB[], TBB(), Dict{Int32,Any}(), Dict{Int32,PhiSpec}(),
               Dict{Int32,Tuple{TBB,Int}}(), Tuple{Symbol,TryCtx}[],
               Dict{Int32,Any}(), Dict{Int32,Any}(),
-              get(ir.meta, :cell_names, nothing), Tuple{TBB,TryCtx}[])
+              get(ir.meta, :cell_names, nothing), Tuple{TBB,TryCtx}[],
+              Dict{Tuple{Int32,Int},Any}())
     cx.cur = placebb!(cx)
     emit_tregion!(cx, UnifiedIR.root_region(ir), nothing)
     for bb in cx.placed
@@ -318,6 +330,7 @@ end
 
 function feed_join!(cx::TCtx, j::JoinCtx, vals::Vector{Any})
     apply_unwind!(cx, j)
+    vals = Any[hval(cx, v) for v in vals]   # φ-edge values are value position
     frombb = cx.cur
     if j.materialize
         st = SynthTuple(vals, 0)
@@ -357,6 +370,38 @@ function emit_unwind!(cx::TCtx, depth::Int)
     return nothing
 end
 
+"a value-position GlobalRef stock's verifier allows: Core/Base, or a
+defined-const binding (the conservative single-world form of stock's
+scan_leaf_partitions rule; recently-partitioned consts still hoist safely
+via the negation)"
+global_value_position_ok(g::GlobalRef) =
+    g.mod === Core || g.mod === Base ||
+    (isconst(g.mod, g.name) && isdefined(g.mod, g.name))
+
+"""Hoist a TAG_GLOBAL operand that is not legal in value position into an
+explicit load statement (SynthGlobal) at the current emission point,
+returning the SynthGlobal; any other operand passes through unchanged."""
+function hval(cx::TCtx, @nospecialize(o))
+    (o isa UnifiedIR.Operand && UnifiedIR.optag(o) == UnifiedIR.TAG_GLOBAL) || return o
+    g = cx.ir.body.globals[UnifiedIR.payload(o)]::GlobalRef
+    global_value_position_ok(g) && return o
+    bt = try
+        Core.get_binding_type(g.mod, g.name)
+    catch
+        Any
+    end
+    sg = SynthGlobal(g, bt isa Type ? bt : Any, 0)
+    push!(cx.cur.items, sg)
+    return sg
+end
+
+"statement kinds whose operands are structural or already statement-position
+global reads — the value-position hoist does not apply"
+stmt_keeps_raw_globals(k) =
+    k === K"value" || k === K"globalref" || k === K"isdefined_global" ||
+    k === K"foreigncall" || k === K"cfunction" || k === K"new_opaque_closure" ||
+    k === K"copyast"
+
 "protecting try scopes of the current position: the handlers a store here
 feeds (§6 — the `:body` entries of the eh stack), innermost first"
 function protectors(cx::TCtx)
@@ -391,7 +436,7 @@ function emit_tregion!(cx::TCtx, r::RegionId, jctx::Union{Nothing,JoinCtx})
             feed_join!(cx, jctx, Any[UnifiedIR.getop(ir, s, i) for i in 1:UnifiedIR.nops(ir, s)])
         elseif k === K"return"
             emit_unwind!(cx, 0)
-            setterm!(cx.cur, (:return, UnifiedIR.nops(ir, s) >= 1 ? UnifiedIR.getop(ir, s, 1) : nothing))
+            setterm!(cx.cur, (:return, UnifiedIR.nops(ir, s) >= 1 ? hval(cx, UnifiedIR.getop(ir, s, 1)) : nothing))
         elseif k === K"unreachable"
             setterm!(cx.cur, (:unreachable,))
         elseif k === K"break"
@@ -411,7 +456,7 @@ function emit_tregion!(cx::TCtx, r::RegionId, jctx::Union{Nothing,JoinCtx})
             push!(cx.cur.items, CellDecl(s.id))
         elseif k === K"cell_set"
             cid = UnifiedIR.asstmt(UnifiedIR.getop(ir, s, 1)).id
-            push!(cx.cur.items, CellStore(cid, UnifiedIR.getop(ir, s, 2), protectors(cx)))
+            push!(cx.cur.items, CellStore(cid, hval(cx, UnifiedIR.getop(ir, s, 2)), protectors(cx)))
         elseif k === K"cell_get"
             cid = UnifiedIR.asstmt(UnifiedIR.getop(ir, s, 1)).id
             push!(cx.cur.items, CellLoad(cid, s.id))
@@ -424,6 +469,13 @@ function emit_tregion!(cx::TCtx, r::RegionId, jctx::Union{Nothing,JoinCtx})
         elseif k === K"cell_shared"
             throw(UnsupportedIR("cell_shared in typed exit"))   # gated above
         else
+            if !stmt_keeps_raw_globals(k)
+                for i in 1:UnifiedIR.nops(ir, s)
+                    o = UnifiedIR.getop(ir, s, i)
+                    h = hval(cx, o)
+                    h === o || (cx.globhoist[(s.id, i)] = h)
+                end
+            end
             push!(cx.cur.items, s)
             if UnifiedIR.stmt_type(ir, s) === Union{}
                 # stock's unreachable-after rule: a Bottom-typed statement
@@ -441,7 +493,7 @@ end
 function emit_tif!(cx::TCtx, s::StmtId)
     ir = cx.ir
     rs = UnifiedIR.live_owned_regions(ir, s)
-    cond = UnifiedIR.getop(ir, s, 1)
+    cond = hval(cx, UnifiedIR.getop(ir, s, 1))
     frombb = cx.cur
     joinbb = TBB()                      # deferred: placed after the arms
     j = make_joinctx!(cx, s, joinbb)
@@ -482,7 +534,7 @@ function emit_tloop!(cx::TCtx, s::StmtId)
     setterm!(frombb, (:goto, header))
     for (i, a) in enumerate(breg.args)
         p = PhiSpec(a.id, UnifiedIR.stmt_type(ir, a))
-        push!(p.edges, (frombb, UnifiedIR.getop(ir, s, i)))
+        push!(p.edges, (frombb, hval(cx, UnifiedIR.getop(ir, s, i))))
         push!(header.phis, p)
         cx.phi_of[a.id] = p
     end
@@ -506,8 +558,10 @@ function emit_tcontinue!(cx::TCtx, s::StmtId)
     # the back edge re-enters the loop from outside any try opened inside it:
     # run the leave/pop actions BEFORE the branch (both paths exit the scopes)
     emit_unwind!(cx, depth)
-    frombb = cx.cur
     ctrue = UnifiedIR.optag(cond) == UnifiedIR.TAG_INLINE && UnifiedIR.imm_value(cond) === true
+    cond = hval(cx, cond)
+    vals = Any[hval(cx, v) for v in vals]
+    frombb = cx.cur
     if ctrue
         for (i, a) in enumerate(breg.args)
             push!(cx.phi_of[a.id].edges, (frombb, vals[i]))
@@ -540,7 +594,7 @@ function emit_ttry!(cx::TCtx, s::StmtId)
     hreg = length(rs) == 2 ? UnifiedIR.getregion(ir, rs[2]) : nothing
     hreg === nothing || hreg.kind === UnifiedIR.REGION_HANDLER ||
         throw(UnsupportedIR("try without a handler-kind second region in typed exit"))
-    scope = UnifiedIR.nops(ir, s) >= 1 ? UnifiedIR.getop(ir, s, 1) : nothing
+    scope = UnifiedIR.nops(ir, s) >= 1 ? hval(cx, UnifiedIR.getop(ir, s, 1)) : nothing
     tok = TryTok(0, scope)
     catchbb = TBB()
     tctx = TryCtx(tok, hreg === nothing ? nothing : catchbb)
@@ -598,7 +652,7 @@ function emit_tgoto!(cx::TCtx, s::StmtId)
     emit_unwind!(cx, ddepth)
     dblk = UnifiedIR.getregion(ir, dest)
     for (i, a) in enumerate(dblk.args)
-        push!(cx.phi_of[a.id].edges, (cx.cur, args[i]))
+        push!(cx.phi_of[a.id].edges, (cx.cur, hval(cx, args[i])))
     end
     setterm!(cx.cur, (:goto, dbb))
     return nothing
@@ -613,7 +667,7 @@ function emit_tbrif!(cx::TCtx, s::StmtId)
         throw(UnsupportedIR("br_if to an unregistered island block in typed exit"))
     (e1[2] == length(cx.ehstack) && e2[2] == length(cx.ehstack)) ||
         throw(UnsupportedIR("cross-scope br_if in typed exit"))
-    cond = UnifiedIR.getop(ir, s, 1)
+    cond = hval(cx, UnifiedIR.getop(ir, s, 1))
     # trampoline for the true edge keeps fallthrough adjacency
     srcbb = cx.cur
     tramp = placebb!(cx)
@@ -621,7 +675,8 @@ function emit_tbrif!(cx::TCtx, s::StmtId)
         dest, args = edge
         dblk = UnifiedIR.getregion(ir, dest)
         for (i, a) in enumerate(dblk.args)
-            push!(cx.phi_of[a.id].edges, (predbb, args[i]))
+            # hoisted loads land in srcbb, which dominates both edges
+            push!(cx.phi_of[a.id].edges, (predbb, hval(cx, args[i])))
         end
     end
     setterm!(tramp, (:goto, e1[1]))
@@ -651,7 +706,7 @@ function emit_tcfg!(cx::TCtx, s::StmtId)
     end
     entryblk = UnifiedIR.getregion(ir, rs[1])
     for (i, a) in enumerate(entryblk.args)
-        push!(cx.phi_of[a.id].edges, (frombb, UnifiedIR.getop(ir, s, i)))
+        push!(cx.phi_of[a.id].edges, (frombb, hval(cx, UnifiedIR.getop(ir, s, i))))
     end
     setterm!(frombb, (:goto, cx.islands[rs[1].id][1]))
     for rid in rs
@@ -963,6 +1018,7 @@ function celltypes!(cx::TCtx, bbs::Vector{TBB})
     typof = IdDict{Any,Any}(x => Union{} for x in nodes)
     function ptyp(@nospecialize(p))
         p === CELL_UNDEF && return Union{}         # contributes nothing
+        p isa SynthGlobal && return p.typ
         (p isa PhiSpec || p isa PhiCSpec) && return get(typof, p, p isa PhiSpec ? something_typ(p) : Bool)
         p isa UnifiedIR.Operand || return CC.Const(p)
         t = UnifiedIR.optag(p)
@@ -1045,7 +1101,7 @@ function assemble_ircode(cx::TCtx, ir::UnifiedIR.IR, argmap::Dict{Int32,Int}, ro
             nst += 1
             if it isa StmtId
                 ssaof[it.id] = nst
-            elseif it isa SynthUps || it isa SynthExc
+            elseif it isa SynthUps || it isa SynthExc || it isa SynthGlobal
                 it.ssaidx = nst
             end
         end
@@ -1061,7 +1117,8 @@ function assemble_ircode(cx::TCtx, ir::UnifiedIR.IR, argmap::Dict{Int32,Int}, ro
     # resolve a renaming payload / synthesized reference to an IRCode value
     function pval(@nospecialize(p))
         p isa UnifiedIR.Operand && return tval(p)
-        (p isa PhiSpec || p isa PhiCSpec || p isa SynthUps || p isa SynthExc) &&
+        (p isa PhiSpec || p isa PhiCSpec || p isa SynthUps || p isa SynthExc ||
+         p isa SynthGlobal) &&
             return Core.SSAValue(p.ssaidx)
         p isa SynthTuple && return Core.SSAValue(p.ssaidx)
         p === CELL_UNDEF && return CELL_UNDEF
@@ -1078,7 +1135,7 @@ function assemble_ircode(cx::TCtx, ir::UnifiedIR.IR, argmap::Dict{Int32,Int}, ro
             haskey(cx.synth_of, o.id) && return Core.SSAValue(cx.synth_of[o.id].ssaidx)
             haskey(ssaof, o.id) && return Core.SSAValue(ssaof[o.id])
             error("typed exit: unmapped value %$(o.id)")
-        elseif o isa SynthTuple
+        elseif o isa SynthTuple || o isa SynthGlobal
             return Core.SSAValue(o.ssaidx)
         elseif o isa UnifiedIR.Operand
             t = UnifiedIR.optag(o)
@@ -1120,6 +1177,7 @@ function assemble_ircode(cx::TCtx, ir::UnifiedIR.IR, argmap::Dict{Int32,Int}, ro
         p isa PhiSpec && return p.typ === nothing ? Any : p.typ
         p isa PhiCSpec && return p.typ === nothing ? Any : p.typ
         p isa SynthTuple && return Any
+        p isa SynthGlobal && return p.typ
         p === CELL_UNDEF && return Union{}
         p === nothing && return CC.Const(nothing)
         return CC.Const(p)
@@ -1161,7 +1219,12 @@ function assemble_ircode(cx::TCtx, ir::UnifiedIR.IR, argmap::Dict{Int32,Int}, ro
     function translate_stmt(s::StmtId)
         k = UnifiedIR.stmt_kind(ir, s)
         n = UnifiedIR.nops(ir, s)
-        ops = Any[tval(UnifiedIR.getop(ir, s, i)) for i in 1:n]
+        ops = Vector{Any}(undef, n)
+        for i in 1:n
+            h = isempty(cx.globhoist) ? nothing : get(cx.globhoist, (s.id, i), nothing)
+            ops[i] = h === nothing ? tval(UnifiedIR.getop(ir, s, i)) :
+                                     Core.SSAValue((h::SynthGlobal).ssaidx)
+        end
         if k === K"call"
             if modmap !== nothing
                 tgt = get(modmap::Dict{Int32,Any}, s.id, nothing)
@@ -1273,6 +1336,10 @@ function assemble_ircode(cx::TCtx, ir::UnifiedIR.IR, argmap::Dict{Int32,Int}, ro
                 types[pos] = it.typ === nothing ? Any : it.typ
             elseif it isa SynthRaw
                 stmts[pos] = it.ex
+                types[pos] = it.typ
+            elseif it isa SynthGlobal
+                # statement-position load of a value-position-illegal global
+                stmts[pos] = it.g
                 types[pos] = it.typ
             else
                 error("typed exit: unknown item $(typeof(it))")
