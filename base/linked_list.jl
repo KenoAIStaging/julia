@@ -149,6 +149,17 @@ function _list_deletefirst!(q::IntrusiveLinkedList{T}, val::T) where T
     return q
 end
 
+function in(val::T, list::IntrusiveLinkedList{T}) where T
+    head = list.head
+    while head !== nothing
+        if val === head
+            return true
+        end
+        head = head.next
+    end
+    return false
+end
+
 #function list_deletefirst!(q::Array{T}, val::T) where T
 #    i = findfirst(isequal(val), q)
 #    i === nothing || deleteat!(q, i)
