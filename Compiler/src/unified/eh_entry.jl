@@ -141,6 +141,22 @@ function codeinfo_to_ir_eh(ci::Core.CodeInfo; nargs::Int, name::Symbol)
         end
         return found
     end
+    # block reachability (normal edges + the enter's exceptional edge): the
+    # island-membership rules below only bind for reachable blocks — dead
+    # blocks may carry arbitrary stale gotos (stock's flow-based
+    # compute_trycatch never visits them, so their edges are inert)
+    reachable = falses(nblocks)
+    let work = Int[blockof[1]]
+        while !isempty(work)
+            bi = pop!(work)
+            reachable[bi] && continue
+            reachable[bi] = true
+            append!(work, normal_succs(bi))
+            hi = bi < nblocks ? leaders[bi + 1] - 1 : n
+            st = code[hi]
+            st isa Core.EnterNode && push!(work, blockof[st.catch_dest])
+        end
+    end
     # F10: a catch-scope block reachable through a NORMAL edge from outside
     # the catch subtree (stock's shared catch-dest/join shapes) must not live
     # in the handler island — the exit converters synthesize the
@@ -151,8 +167,11 @@ function codeinfo_to_ir_eh(ci::Core.CodeInfo; nargs::Int, name::Symbol)
     # edge carries the pop (synthentry below).
     blocknode = Int[node_of(leaders[bi]) for bi in 1:nblocks]
     normal_preds = [Int[] for _ in 1:nblocks]
-    for pb in 1:nblocks, sb in normal_succs(pb)
-        push!(normal_preds[sb], pb)
+    for pb in 1:nblocks
+        reachable[pb] || continue
+        for sb in normal_succs(pb)
+            push!(normal_preds[sb], pb)
+        end
     end
     let changed = true
         while changed
@@ -277,6 +296,7 @@ function codeinfo_to_ir_eh(ci::Core.CodeInfo; nargs::Int, name::Symbol)
     ssamap = Vector{Any}(undef, n)
     excarg = Dict{Int,StmtId}()           # handler idx -> %exc region_arg
     curnode = Ref(0)
+    curblock = Ref(0)   # emitting block index; 0 = synthetic entry
 
     function convert_value(@nospecialize(v))::UnifiedIR.Operand
         if v isa Core.SSAValue
@@ -316,9 +336,13 @@ function codeinfo_to_ir_eh(ci::Core.CodeInfo; nargs::Int, name::Symbol)
 
     function goto_block!(bi::Int)
         # sealed cross-island gotos may only target an ancestor island
-        # (§5.5/§5.9) — anything else the exit converters cannot rebalance
-        is_node_ancestor_or_self(blocknode[bi], curnode[]) ||
-            throw(UnsupportedIR("goto into a non-ancestor handler island"))
+        # (§5.5/§5.9) — anything else the exit converters cannot rebalance.
+        # Enforced for reachable emitters only: dead blocks carry inert
+        # stale edges (never executed, never visited by compute_trycatch)
+        if curblock[] == 0 || reachable[curblock[]]
+            is_node_ancestor_or_self(blocknode[bi], curnode[]) ||
+                throw(UnsupportedIR("goto into a non-ancestor handler island"))
+        end
         append_stmt!(b, K"goto", UnifiedIR.op_block(blockregions[bi]), UnifiedIR.op_inline(0))
     end
 
@@ -338,6 +362,7 @@ function codeinfo_to_ir_eh(ci::Core.CodeInfo; nargs::Int, name::Symbol)
             reg.first = StmtId(Int(b.ir.body.len) + 1)
             push!(b.open, sr)
             curnode[] = node
+            curblock[] = 0
             goto_block!(blockof[catchdest_of[node - H]])
             reg.last = StmtId(Int(b.ir.body.len))
             pop!(b.open)
@@ -371,6 +396,7 @@ function codeinfo_to_ir_eh(ci::Core.CodeInfo; nargs::Int, name::Symbol)
 
     function emit_block!(bi::Int, node::Int)
         curnode[] = node
+        curblock[] = bi
         lo = leaders[bi]
         hi = bi < nblocks ? leaders[bi + 1] - 1 : n
         terminated = false
@@ -386,6 +412,7 @@ function codeinfo_to_ir_eh(ci::Core.CodeInfo; nargs::Int, name::Symbol)
                 h == 0 && throw(UnsupportedIR("unregistered EnterNode"))
                 emit_try!(h, node)
                 curnode[] = node
+                curblock[] = bi
                 append_stmt!(b, K"unreachable")
                 terminated = true
                 break
@@ -396,8 +423,9 @@ function codeinfo_to_ir_eh(ci::Core.CodeInfo; nargs::Int, name::Symbol)
                 cond = convert_value(st.cond)
                 fallbi = blockof[i + 1]
                 destbi = blockof[st.dest]
-                (is_node_ancestor_or_self(blocknode[fallbi], node) &&
-                 is_node_ancestor_or_self(blocknode[destbi], node)) ||
+                !reachable[bi] ||
+                    (is_node_ancestor_or_self(blocknode[fallbi], node) &&
+                     is_node_ancestor_or_self(blocknode[destbi], node)) ||
                     throw(UnsupportedIR("br_if into a non-ancestor handler island"))
                 append_stmt!(b, K"br_if", cond,
                              UnifiedIR.op_block(blockregions[fallbi]), UnifiedIR.op_inline(0),
