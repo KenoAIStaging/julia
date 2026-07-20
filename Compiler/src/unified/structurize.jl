@@ -710,12 +710,46 @@ end
 # select conversion
 # ---------------------------------------------------------------------------
 
+"""Callees that are total for ARBITRARY argument values. Speculation
+legality must be context-free BY CONSTRUCTION, never flag-trusted: the
+flag column proves a member NOTHROW under its arm's branch condition, and
+inference's flow-sensitive operand refinement materializes no `refine`
+statement for the refine ban to catch. The concrete failure shape (wave-7,
+`Compiler.iterate(::UseRefIterator, ::Int)`): in
+`op === nothing ? nothing : (UseRef(it, op), op)` the guarded
+`UseRef(it, op)` call is nothrow — inference refines `op::Int` under the
+guard — so selectify hoisted it above the `===`; the later union split
+then materialized its MethodError arm UNCONDITIONALLY, throwing
+`UseRef(::UseRefIterator, ::Nothing)` whenever the guard would have
+returned `nothing`. The same context-dependence applies to `new` (field
+conversion), `cell_get` (guarded definedness) and global reads (guarded
+`isdefined`), so arms admit ONLY whitelisted total calls."""
+_sel_speculatable_callee(@nospecialize f) =
+    f === Core.tuple || f === Core.:(===) || f === Core.typeof
+
+"Static callee value of a call member (inline/const/const-global operands)."
+function _sel_static_callee(ir::UnifiedIR.IR, m)
+    o = UnifiedIR.getop(ir, m, 1)
+    t = UnifiedIR.optag(o)
+    if t == UnifiedIR.TAG_INLINE
+        return UnifiedIR.imm_value(o)
+    elseif t == UnifiedIR.TAG_CONST
+        return ir.body.constants[UnifiedIR.payload(o)]
+    elseif t == UnifiedIR.TAG_GLOBAL
+        g = ir.body.globals[UnifiedIR.payload(o)]
+        (isconst(g.mod, g.name) && isdefined(g.mod, g.name)) &&
+            return getglobal(g.mod, g.name)
+    end
+    return nothing
+end
+
 """
     selectify!(ir) -> Int
 
-`if` ops with two tiny, fully speculatable arms (all members EFFECT_FREE |
-NOTHROW | TERMINATES, no region owners) that each produce one value become
-`K"select"` with the arm bodies hoisted before it. Editable state.
+`if` ops with two tiny, fully speculatable arms (whitelisted total calls
+only — see `_sel_speculatable_callee` — additionally carrying EFFECT_FREE |
+NOTHROW | TERMINATES flags, no region owners) that each produce one value
+become `K"select"` with the arm bodies hoisted before it. Editable state.
 """
 function selectify!(ir::UnifiedIR.IR)
     n = 0
@@ -738,11 +772,14 @@ function selectify!(ir::UnifiedIR.IR)
             for m in ms[1:end-1]
                 mk = UnifiedIR.stmt_kind(ir, m)
                 (UnifiedIR.owns_regions(mk) || mk === K"region_arg") && (ok = false; break)
-                # never speculate control-dependent type assertions (refine is
-                # a Pi: its narrowing only holds under the branch condition),
-                # nor extracts (their default-pure flags assume a well-typed
-                # operand that the branch may be guarding)
-                (mk === K"refine" || mk === K"extract") && (ok = false; break)
+                # only whitelisted total calls speculate: any other member's
+                # purity flags may encode facts inference proved UNDER the
+                # branch condition (refine-free flow-sensitive refinement,
+                # guarded definedness, guarded field types) that do not
+                # survive the hoist — see _sel_speculatable_callee
+                mk === K"call" || (ok = false; break)
+                f = _sel_static_callee(ir, m)
+                (f !== nothing && _sel_speculatable_callee(f)) || (ok = false; break)
                 UnifiedIR.stmt_flag(ir, m) & spec == spec || (ok = false; break)
                 push!(hoist, m)
                 total += 1

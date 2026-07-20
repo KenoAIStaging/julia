@@ -130,3 +130,22 @@ end
         end
     end
 end
+
+# wave-7 regression: selectify! must not speculate a member whose NOTHROW
+# flag inference proved UNDER the arm's branch condition (flow-sensitive
+# operand refinement materializes no `refine` statement for the refine ban
+# to catch). Fail-before shape (`Compiler.iterate(::UseRefIterator, ::Int)`):
+# the guarded constructor call hoisted above its `=== nothing` guard, and
+# the later union split materialized its MethodError arm unconditionally —
+# interpreting the typed body at `nothing` threw
+# `MethodError: S7Wrap(::Nothing)` instead of returning `nothing`.
+struct S7Wrap
+    a::Int
+end
+s7guard(op::Union{Nothing,Int}) = op === nothing ? nothing : (S7Wrap(op), op)
+
+@testset "selectify: no speculation of branch-condition-dependent members" begin
+    ir = UnifiedCompiler.typed_ir(s7guard, Any[Union{Nothing,Int}])
+    @test UnifiedIR.interpret(ir, s7guard, nothing) === nothing
+    @test UnifiedIR.interpret(ir, s7guard, 2) == (S7Wrap(2), 2)
+end
