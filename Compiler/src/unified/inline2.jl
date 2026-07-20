@@ -528,6 +528,62 @@ function reads_unbakeable_sparam(callee::UnifiedIR.IR, spvals::Vector{Any})
     return false
 end
 
+"""Substitute the callee method's static parameters into the STRUCTURAL
+type slots of `cfunction`/`foreigncall` statements of a callee body about
+to be spliced (stock `ssa_substitute_op!`'s cfunction/foreigncall arms).
+Those slots are interned constants — `splice_body!`'s `TAG_SPARAM`
+substitution never sees the TypeVars INSIDE them — so without this the
+spliced body carries the CALLEE method's TypeVars into a caller whose
+enclosing-method environment cannot resolve them, and codegen's
+`verify_ref_type` hard-errors ("type Ref should have an element type, not
+Ref{<:T}" — the libuv `@cfunction(_uv_hook_close, Cvoid, (Ref{T},))`
+image-fatal class). Returns `false` (decline the splice) when a slot
+references a typevar but `sparam_vals` is not fully static: stock
+reconstructs VALUE reads through `spvals_ssa` in that regime but has no
+runtime path for these structural slots either."""
+function instantiate_foreign_type_slots!(callee::UnifiedIR.IR, m::Method,
+                                         spvals::Core.SimpleVector)
+    msig = m.sig
+    msig isa UnionAll || return true
+    static = !isempty(spvals) && CC.validate_sparams(spvals)
+    inst(@nospecialize(t)) = ccall(:jl_instantiate_type_in_env, Any,
+                                   (Any, Any, Ptr{Any}), t, msig, spvals)
+    for s in UnifiedIR.each_stmt(callee)
+        k = UnifiedIR.stmt_kind(callee, s)
+        (k === K"cfunction" || k === K"foreigncall") || continue
+        # operand layout mirrors the lowered Expr (codeinfo_entry stores the
+        # pieces verbatim, in order):
+        #   cfunction:   (output_type, fexpr, rt, argt, cconv) -> slots 3, 4
+        #   foreigncall: (name, rt, argt, nreq, cconv, args...) -> slots 2, 3
+        #   (the foreignglobal marker shifts the foreigncall layout by one)
+        ofs = 0
+        if k === K"foreigncall"
+            o1 = UnifiedIR.getop(callee, s, 1)
+            if UnifiedIR.optag(o1) == UnifiedIR.TAG_CONST &&
+               UnifiedIR.getconst(callee, o1) === FOREIGNGLOBAL_MARKER
+                ofs = 1
+            end
+        end
+        for i in (k === K"cfunction" ? (3, 4) : (2 + ofs, 3 + ofs))
+            i <= UnifiedIR.nops(callee, s) || return false
+            o = UnifiedIR.getop(callee, s, i)
+            UnifiedIR.optag(o) == UnifiedIR.TAG_CONST || continue
+            t = UnifiedIR.getconst(callee, o)
+            if t isa Core.SimpleVector
+                any(x -> CC.has_free_typevars(x), Any[t...]) || continue
+                static || return false
+                t2 = Core.svec(Any[inst(x) for x in t]...)
+            else
+                ((t isa Type || t isa TypeVar) && CC.has_free_typevars(t)) || continue
+                static || return false
+                t2 = inst(t)
+            end
+            UnifiedIR.setop!(callee, s, i, UnifiedIR.vop(callee, t2))
+        end
+    end
+    return true
+end
+
 """The effects-side half of stock `adjust_boundscheck!`: a callee inlined at
 an `@inbounds`-flagged site enters an elided-boundscheck context, so every
 spliced statement is marked FLAG_INBOUNDS — the post-optimization effects
@@ -615,6 +671,7 @@ function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
         # pinned markers (lb === ub) still have a unique bakeable value
         spvals = Any[bakeable_sparam(v) for v in mi.sparam_vals]
         reads_unbakeable_sparam(callee_ir, spvals) && continue
+        instantiate_foreign_type_slots!(callee_ir, m, mi.sparam_vals) || continue
         if !site_inline
             # stock: never inline error paths — a Union{}-returning callee
             # keeps its (cold) call unless explicitly inline-annotated

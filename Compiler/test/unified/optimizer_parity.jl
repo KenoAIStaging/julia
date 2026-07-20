@@ -327,4 +327,56 @@ end
     end
 end
 
+# wave 9: static-parameter reconstruction family
+op_cfun_hook(x) = nothing
+function op_cfun_assoc(handle::Ptr{Cvoid}, jlobj::T) where T
+    # the base/libuv.jl associate_julia_struct shape: the cfunction's Ref{T}
+    # references the METHOD's static parameter
+    _ = @cfunction(op_cfun_hook, Cvoid, (Ref{T},))
+    handle == C_NULL && return nothing
+    ccall(:jl_uv_associate_julia_struct, Cvoid, (Ptr{Cvoid}, Any), handle, jlobj)
+end
+mutable struct OPCFunObj; x::Int; end
+op_cfun_caller(w::OPCFunObj) = op_cfun_assoc(C_NULL, w)
+
+@testset "optimizer parity: wave-9 sparam reconstruction" begin
+    saved = Base.REFLECTION_COMPILER[]
+    try
+        Base.REFLECTION_COMPILER[] = Compiler
+        OPUnified.enable_pipeline!()
+
+        @testset "inlined cfunction type slots carry no method typevars" begin
+            src = _code_typed1(op_cfun_caller, (OPCFunObj,))
+            # the callee must actually inline (guards vacuity below): no
+            # residual call/invoke of op_cfun_assoc
+            @test !any(x -> _isinvoke(:op_cfun_assoc, x) ||
+                            _iscall(src, op_cfun_assoc, x), src.code)
+            ncfun = 0
+            for x in src.code
+                if Meta.isexpr(x, :cfunction)
+                    ncfun += 1
+                    # rt + argt slots must be fully instantiated: a free
+                    # TypeVar here is codegen-fatal in the spliced-into
+                    # method ("type Ref should have an element type")
+                    @test !Compiler.has_free_typevars(x.args[3])
+                    for t in x.args[4]::Core.SimpleVector
+                        @test ccall(:jl_has_free_typevars, Cint, (Any,), t) == 0
+                    end
+                elseif Meta.isexpr(x, :foreigncall)
+                    @test ccall(:jl_has_free_typevars, Cint, (Any,), x.args[2]) == 0
+                    for t in x.args[3]::Core.SimpleVector
+                        @test ccall(:jl_has_free_typevars, Cint, (Any,), t) == 0
+                    end
+                end
+            end
+            @test ncfun == 1
+            # behavior: codegen accepts the emitted form
+            @test op_cfun_caller(OPCFunObj(1)) === nothing
+        end
+    finally
+        OPUnified.disable_pipeline!()
+        Base.REFLECTION_COMPILER[] = saved
+    end
+end
+
 end # module UnifiedOptimizerParityTests
