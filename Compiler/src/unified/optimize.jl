@@ -64,7 +64,11 @@ function refine_effects!(ir::UnifiedIR.IR; interp = CC.NativeInterpreter())
         flags = UInt32(0)
         CC.is_consistent(effects) && (flags |= UnifiedIR.FLAG_CONSISTENT)
         CC.is_effect_free(effects) && (flags |= UnifiedIR.FLAG_EFFECT_FREE)
-        CC.is_nothrow(effects) && (flags |= UnifiedIR.FLAG_NOTHROW)
+        # builtin_effects is blind to min_ninitialized-violating news (F11,
+        # #52857 class): a maybe-undef immutable field load must keep its
+        # conditional UndefRefError throw
+        CC.is_nothrow(effects) && !getfield_maybe_undef(fl, argl) &&
+            (flags |= UnifiedIR.FLAG_NOTHROW)
         CC.is_terminates(effects) && (flags |= UnifiedIR.FLAG_TERMINATES)
         if flags & UnifiedIR.FLAG_NOTHROW == 0 &&
            (fl === Core.getfield || fl === Base.getfield) && length(argl) >= 2
@@ -284,8 +288,15 @@ function canonicalize_getfields!(ir::UnifiedIR.IR)
             # Bool boundscheck must not legalize an atomics violation
             Base.isfieldatomic(xt, idx) && continue
         end
+        # the kind-default PURE flag claims nothrow, which a load of a field
+        # the PartialStruct does not prove defined (under-initialized
+        # immutable new, #52857/F11) must not: keep the conditional
+        # UndefRefError throw observable
+        flag = getfield_maybe_undef(Core.getfield,
+                                    Any[stmt_lattice(ir, vo), CC.Const(idx)]) ?
+            (UnifiedIR.FLAG_PURE & ~UnifiedIR.FLAG_NOTHROW) : nothing
         UnifiedIR.replace_stmt!(ir, s, K"extract", vo, UnifiedIR.op_inline(idx);
-                                type = UnifiedIR.stmt_type(ir, s))
+                                type = UnifiedIR.stmt_type(ir, s), flag)
         n += 1
     end
     return n

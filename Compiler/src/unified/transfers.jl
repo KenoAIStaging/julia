@@ -39,6 +39,37 @@ function effects_mask(e::CC.Effects)
     return m
 end
 
+"""An under-initialized immutable `new` (the #52857 class) violates the
+type-level "first min_ninitialized fields are defined" invariant that
+`isdefined_tfunc`/`getfield_nothrow` trust BEFORE consulting PartialStruct
+undef facts, so a load of such a field comes back nothrow and the optimizer
+deletes its conditional UndefRefError throw — which stock's sroa preserves
+in the conditional block (the "affinity" property). True when `f` is a
+getfield of a field the PartialStruct does not prove defined inside the
+min_ninitialized prefix (legitimately-constructed values always carry
+`false` there, see `partialstruct_init_undefs`) — the load may throw (F11)."""
+function getfield_maybe_undef(@nospecialize(f), argl::Vector{Any})
+    f === Core.getfield || return false
+    length(argl) >= 2 || return false
+    obj = argl[1]
+    obj isa CC.PartialStruct || return false
+    ut = Base.unwrap_unionall(obj.typ)
+    ut isa DataType || return false
+    fld = argl[2]
+    fld isa CC.Const || return false
+    v = fld.val
+    if v isa Symbol
+        idx = Base.fieldindex(ut, v, false)
+    elseif v isa Int
+        idx = v
+    else
+        return false
+    end
+    und = obj.undefs
+    (1 <= idx <= length(und) && idx <= CC.datatype_min_ninitialized(ut)) || return false
+    return und[idx] !== false
+end
+
 "`CC.builtin_effects`/`CC.intrinsic_effects`, full-width, defensively.
 `rt` must be the LATTICE element (Const-ness drives e.g. apply_type nothrow)."
 function builtin_call_effects(@nospecialize(f), argl::Vector{Any}, @nospecialize(rt))
@@ -50,11 +81,15 @@ function builtin_call_effects(@nospecialize(f), argl::Vector{Any}, @nospecialize
             CC.Effects()
         end
     end
-    return try
+    eff = try
         CC.builtin_effects(CC.fallback_lattice, f, argl, rt)
     catch
         CC.Effects()
     end
+    if eff.nothrow && getfield_maybe_undef(f, argl)
+        eff = CC.Effects(eff; nothrow = false)
+    end
+    return eff
 end
 
 "`CC.builtin_exct`/`CC.intrinsic_exct` for a builtin call, defensively."
@@ -67,11 +102,15 @@ function builtin_call_exct(@nospecialize(f), argl::Vector{Any}, @nospecialize(rt
             Any
         end
     end
-    return try
+    exct = try
         CC.builtin_exct(CC.fallback_lattice, f, argl, rt)
     catch
         Any
     end
+    if getfield_maybe_undef(f, argl) && exct isa Type && !(UndefRefError <: exct)
+        exct = Union{exct, UndefRefError}   # the invariant-blind exct misses it (F11)
+    end
+    return exct
 end
 
 """The abstract_eval_globalref port for cache-grade inference: resolve the
@@ -1060,7 +1099,13 @@ function transfer_new(fr::Frame, s::StmtId)
             end
             v === nothing || return (v, eff, NEW_EXCT)
         end
-        if anyrefine || nargs > CC.datatype_min_ninitialized(rt)
+        # under-initialized news (nargs < min_ninitialized — the #52857
+        # class) MUST keep the missing fields' undef facts: the plain
+        # DataType would let getfield_nothrow trust the type-level
+        # "first min_ninitialized fields are defined" invariant the
+        # allocation just violated, and the optimizer would delete the
+        # load's conditional UndefRefError throw stock preserves (F11)
+        if anyrefine || nargs != CC.datatype_min_ninitialized(rt)
             undefs = Union{Nothing,Bool}[false for _ in 1:nargs]
             if nargs < fcount
                 for i in (nargs + 1):fcount

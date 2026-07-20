@@ -975,12 +975,12 @@ end
     irc = UC.ir_to_ircode(ir)
     @test Compiler.verify_ir(irc) === nothing
     @test Core.OpaqueClosure(irc)(false) == 1
-    # F11 pin: the maybe-undef field load (which stock turns into a
-    # conditional UndefRefError throw — the "affinity" under test) is
-    # currently deleted outright by the unified optimizer (the transfers
-    # model extracts of partially-initialized immutables as removable)
-    @test_broken count_kind(ir, K"if") + count_kind(ir, K"extract") +
-                 count_kind(ir, K"call") > 0
+    # F11 (fixed): the maybe-undef field load survives as a conditional
+    # throwing statement on the taken path (stock keeps it as a conditional
+    # UndefRefError throw — the "affinity" under test); the under-initialized
+    # new publishes its undef facts and the effects paths keep !nothrow
+    @test count_kind(ir, K"if") + count_kind(ir, K"extract") +
+          count_kind(ir, K"call") > 0
 end
 
 # ---------------------------------------------------------------------------
