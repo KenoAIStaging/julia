@@ -695,8 +695,12 @@ function _transfer(fr::Frame, s::StmtId, k::UnifiedIR.Kind)
         return (Any, CC.EFFECTS_TOTAL)      # the cell token
     elseif k === K"cell_get"
         cellid = UnifiedIR.asstmt(UnifiedIR.getop(ir, s, 1)).id
-        # maybe-undef read can throw UndefVarError
-        eff = cellid in fr.newed_cells ?
+        # maybe-undef read can throw UndefVarError — unless a flow-sensitive
+        # refinement is active for the cell: refinements arise only from a
+        # store (`cell_set` overlay) or a completed read (branch/typeassert
+        # subjects) on every path here, either of which proves definedness
+        # (stock's VarState.undef precision; `cell_new` kills the witness)
+        eff = (cellid in fr.newed_cells && refined(fr, (:cell, cellid)) === nothing) ?
               CC.Effects(CC.EFFECTS_TOTAL; nothrow = false) : CC.EFFECTS_TOTAL
         # escape/world discipline (§5.7): reads of a poisoned shared cell
         # (some capturing closure escapes or is world-shifted, or the cell
@@ -738,6 +742,12 @@ function _transfer(fr::Frame, s::StmtId, k::UnifiedIR.Kind)
                        CC.EFFECTS_TOTAL
         return (nothing, eff)
     elseif k === K"cell_new"
+        # re-declaration makes the binding fresh and unassigned: any active
+        # refinement of the cell (a definedness witness above) must die on
+        # this path. An innermost KILL shadows outer scopes without touching
+        # them (deleting an outer entry could unmask a staler one).
+        cellid = UnifiedIR.asstmt(UnifiedIR.getop(ir, s, 1)).id
+        fr.pending_refine = (:cell, cellid) => REFINE_KILL
         return (nothing, CC.EFFECTS_TOTAL)
     elseif k === K"throw_undef_if_not"
         condl = opl(fr, UnifiedIR.getop(ir, s, 1))

@@ -1250,6 +1250,10 @@ function infer_cfg!(fr::Frame, s::StmtId)
                 for k in (length(fr.refinements) - npush + 1):length(fr.refinements)
                     merge!(m, fr.refinements[k])
                 end
+                # KILL entries shadow during flattening but must not cross
+                # edges as values (they are not lattice elements; a killed
+                # subject simply carries no refinement on this path)
+                filter!(p -> p.second !== REFINE_KILL, m)
                 m
             end
             for st in UnifiedIR.region_stmts(ir, rid)
