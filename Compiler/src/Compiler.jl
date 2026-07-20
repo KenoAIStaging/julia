@@ -231,9 +231,12 @@ function _unified_from_pkgimage()
     # the pkgimage binds to the loader-registered Compiler package instance;
     # only usable when THIS module is that instance (a Base.Compiler session
     # keeps the carrier path)
-    compiler_id = Base.PkgId(Base.UUID(0x807dbc54b67e4c79_8afbeafe4df6f2e1), "Compiler")
+    # NTuple{2,UInt64} spelling: a UInt128 literal lowers to `@uint128_str`,
+    # which calls `Base.parse` — undefined when this file is included during
+    # the basecompiler bootstrap stage
+    compiler_id = Base.PkgId(Base.UUID((0x807dbc54b67e4c79, 0x8afbeafe4df6f2e1)), "Compiler")
     Base.maybe_root_module(compiler_id) === Compiler || return nothing
-    unified_id = Base.PkgId(Base.UUID(0x6d101ee7afa6416a_b7978a652f7b3d1c), "UnifiedCompiler")
+    unified_id = Base.PkgId(Base.UUID((0x6d101ee7afa6416a, 0xb7978a652f7b3d1c)), "UnifiedCompiler")
     pkgdir = Base.joinpath(Base.Sys.BINDIR::Base.String, Base.DATAROOTDIR, "julia")
     UC = try
         pushed = false
