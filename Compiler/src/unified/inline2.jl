@@ -650,6 +650,7 @@ the direct call then resolves/inlines on later rounds.
 function fold_apply_iterates!(ir::UnifiedIR.IR)
     UnifiedIR.check_state(ir, UnifiedIR.LAYOUT_EDITABLE, "fold_apply_iterates!")
     n = 0
+    unroll_ch = get(ir.meta, :apply_iter_unroll, nothing)
     for s in collect(UnifiedIR.each_stmt(ir))
         UnifiedIR.is_tombstone(ir, s) && continue
         UnifiedIR.stmt_kind(ir, s) === K"call" || continue
@@ -657,7 +658,12 @@ function fold_apply_iterates!(ir::UnifiedIR.IR)
         nop >= 3 || continue
         static_operand_value(ir, UnifiedIR.getop(ir, s, 1)) === Core._apply_iterate || continue
         static_operand_value(ir, UnifiedIR.getop(ir, s, 2)) === Base.iterate || continue
+        unrolls = unroll_ch === nothing ? nothing :
+                  get(unroll_ch::Dict{Int32,Vector{Tuple{Int,Int}}}, s.id, nothing)
         newops = UnifiedIR.Operand[UnifiedIR.getop(ir, s, 3)]
+        # element plan: an existing operand, a tuple projection (op, idx,
+        # type), or an iterate-protocol unroll (op, -count, nothing) resolved
+        # at materialization time
         elems = Vector{Union{UnifiedIR.Operand,Tuple{UnifiedIR.Operand,Int,Any}}}()
         ok = true
         total = 0
@@ -672,32 +678,137 @@ function fold_apply_iterates!(ir::UnifiedIR.IR)
                 total += length(v)
             else
                 wt = CC.widenconst(lat)
-                (wt isa DataType && wt <: Tuple && wt !== Tuple) || (ok = false; break)
-                ps = wt.parameters
-                Base.any(p -> CC.isvarargtype(p), ps) && (ok = false; break)
-                for j in 1:length(ps)
-                    p = ps[j]
-                    push!(elems, (o, j, p isa Type ? p : Any))
+                if wt isa DataType && wt <: Tuple && wt !== Tuple &&
+                   !Base.any(p -> CC.isvarargtype(p), wt.parameters)
+                    ps = wt.parameters
+                    for j in 1:length(ps)
+                        p = ps[j]
+                        push!(elems, (o, j, p isa Type ? p : Any))
+                    end
+                    total += length(ps)
+                else
+                    # non-tuple container: inference recorded a provably
+                    # exhausted fixed-length iterate unroll for this operand
+                    # position, or the whole apply stays (stock
+                    # rewrite_apply_exprargs' iterate materialization)
+                    cnt = 0
+                    if unrolls !== nothing
+                        k = findfirst(u -> u[1] == i, unrolls)
+                        k === nothing || (cnt = unrolls[k][2] + 1)
+                    end
+                    cnt == 0 && (ok = false; break)
+                    push!(elems, (o, -(cnt - 1), nothing))
+                    total += cnt - 1
                 end
-                total += length(ps)
             end
             total <= 512 || (ok = false; break)
         end
         ok || continue
+        itero = UnifiedIR.getop(ir, s, 2)
         for e in elems
             if e isa UnifiedIR.Operand
                 push!(newops, e)
             else
                 (o, j, pt) = e
-                ex = UnifiedIR.insert_before!(ir, s, K"extract", o,
-                                              UnifiedIR.op_inline(j); type = pt)
-                push!(newops, UnifiedIR.op_stmt(ex))
+                if j >= 1
+                    ex = UnifiedIR.insert_before!(ir, s, K"extract", o,
+                                                  UnifiedIR.op_inline(j); type = pt)
+                    push!(newops, UnifiedIR.op_stmt(ex))
+                else
+                    # materialize the iterate chain: exactly the calls the
+                    # runtime apply would make (the final exhausted call
+                    # included — its effects are part of the semantics; DCE
+                    # removes it when provably effect-free). Types come from
+                    # the follow-up inference pass.
+                    cnt = -j
+                    stateo = nothing
+                    for _ in 1:cnt
+                        itc = stateo === nothing ?
+                            UnifiedIR.insert_before!(ir, s, K"call", itero, o; type = Any) :
+                            UnifiedIR.insert_before!(ir, s, K"call", itero, o, stateo; type = Any)
+                        el = UnifiedIR.insert_before!(ir, s, K"extract",
+                                UnifiedIR.op_stmt(itc), UnifiedIR.op_inline(1); type = Any)
+                        st2 = UnifiedIR.insert_before!(ir, s, K"extract",
+                                UnifiedIR.op_stmt(itc), UnifiedIR.op_inline(2); type = Any)
+                        push!(newops, UnifiedIR.op_stmt(el))
+                        stateo = UnifiedIR.op_stmt(st2)
+                    end
+                    # the final, nothing-returning iterate call
+                    stateo === nothing ?
+                        UnifiedIR.insert_before!(ir, s, K"call", itero, o; type = Any) :
+                        UnifiedIR.insert_before!(ir, s, K"call", itero, o, stateo; type = Any)
+                end
             end
         end
         UnifiedIR.replace_stmt!(ir, s, K"call", newops...;
                                 type = UnifiedIR.stmt_type(ir, s))
         n += 1
     end
+    return n
+end
+
+"""
+    svecify_apply_args!(ir) -> Int
+
+Residual `Core._apply_iterate` statements reach codegen as dynamic apply
+calls. Stock's `lift_apply_args!` (#59548) rewrites each fixed-shape
+`Tuple`-typed container argument into a `Core.svec(...)` call — svec's
+boxed layout matches codegen's apply ABI. Port: a container operand whose
+def is a `Core.tuple` call reuses its element operands; otherwise a known
+fixed-arity tuple type spreads through `extract` projections. Non-tuple
+containers are left alone. Runs once after the final inference pass (the
+svec type would only degrade the apply's flattening if re-inferred).
+"""
+function svecify_apply_args!(ir::UnifiedIR.IR)
+    UnifiedIR.check_state(ir, UnifiedIR.LAYOUT_EDITABLE, "svecify_apply_args!")
+    n = 0
+    for s in collect(UnifiedIR.each_stmt(ir))
+        UnifiedIR.is_tombstone(ir, s) && continue
+        UnifiedIR.stmt_kind(ir, s) === K"call" || continue
+        nop = UnifiedIR.nops(ir, s)
+        nop >= 4 || continue
+        static_operand_value(ir, UnifiedIR.getop(ir, s, 1)) === Core._apply_iterate || continue
+        newops = UnifiedIR.Operand[UnifiedIR.getop(ir, s, i) for i in 1:nop]
+        changed = false
+        for i in 4:nop
+            o = newops[i]
+            wt = CC.widenconst(stmt_lattice(ir, o))
+            (wt isa DataType && wt.name === Tuple.name) || continue
+            svecops = nothing
+            if UnifiedIR.optag(o) == UnifiedIR.TAG_STMT
+                d = UnifiedIR.asstmt(o)
+                if !UnifiedIR.is_tombstone(ir, d) &&
+                   UnifiedIR.stmt_kind(ir, d) === K"call" &&
+                   static_operand_value(ir, UnifiedIR.getop(ir, d, 1)) === Core.tuple
+                    svecops = UnifiedIR.Operand[UnifiedIR.getop(ir, d, j)
+                                                for j in 2:UnifiedIR.nops(ir, d)]
+                end
+            end
+            if svecops === nothing
+                ps = wt.parameters
+                (!isempty(ps) && !Base.any(p -> CC.isvarargtype(p), ps)) || continue
+                svecops = UnifiedIR.Operand[]
+                for j in 1:length(ps)
+                    p = ps[j]
+                    ex = UnifiedIR.insert_before!(ir, s, K"extract", o,
+                                                  UnifiedIR.op_inline(j);
+                                                  type = p isa Type ? p : Any)
+                    push!(svecops, UnifiedIR.op_stmt(ex))
+                end
+            end
+            sv = UnifiedIR.insert_before!(ir, s, K"call",
+                                          UnifiedIR.vop(ir, Core.svec), svecops...;
+                                          type = Core.SimpleVector)
+            newops[i] = UnifiedIR.op_stmt(sv)
+            changed = true
+        end
+        if changed
+            UnifiedIR.replace_stmt!(ir, s, K"call", newops...;
+                                    type = UnifiedIR.stmt_type(ir, s))
+            n += 1
+        end
+    end
+    n > 0 && UnifiedIR.dce!(ir)   # the replaced tuple ctors are usually dead now
     return n
 end
 
