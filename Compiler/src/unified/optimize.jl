@@ -453,9 +453,23 @@ function forward_extracts!(ir::UnifiedIR.IR)
             continue
         elseif dk === K"call"
             callee = static_operand_value(ir, UnifiedIR.getop(ir, def, 1))
-            callee === Core.tuple || continue
-            1 + idx <= UnifiedIR.nops(ir, def) || continue
-            el = UnifiedIR.getop(ir, def, idx + 1)
+            if (callee === Core.getfield || callee === Base.getfield) &&
+               UnifiedIR.nops(ir, def) == 3 &&
+               static_operand_value(ir, UnifiedIR.getop(ir, def, 3)) === :captures
+                # captures-tuple load of an opaque closure (the OC-inlining
+                # self substitution): element idx is new_opaque_closure env
+                # operand 5+idx (stock sroa's is_getfield_captures walk)
+                oo = UnifiedIR.getop(ir, def, 2)
+                UnifiedIR.optag(oo) == UnifiedIR.TAG_STMT || continue
+                ocdef = skip_refines(ir, UnifiedIR.asstmt(oo))
+                UnifiedIR.stmt_kind(ir, ocdef) === K"new_opaque_closure" || continue
+                5 + idx <= UnifiedIR.nops(ir, ocdef) || continue
+                el = UnifiedIR.getop(ir, ocdef, 5 + idx)
+            else
+                callee === Core.tuple || continue
+                1 + idx <= UnifiedIR.nops(ir, def) || continue
+                el = UnifiedIR.getop(ir, def, idx + 1)
+            end
         elseif dk === K"new"
             T = concrete_datatype(stmt_lattice(ir, UnifiedIR.getop(ir, def, 1)))
             (T isa DataType && !ismutabletype(T)) || continue

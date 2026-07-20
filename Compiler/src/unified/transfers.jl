@@ -629,7 +629,7 @@ function _transfer(fr::Frame, s::StmtId, k::UnifiedIR.Kind)
         args = Any[widenucond(a) for a in opls(fr, s, 1)]
         r = infer_call(fr, args; sid = s.id)
         r = apply_intercond(fr, s, 1, r)
-        get(ENV, "UIR_DEBUG", "") == "1" && println("DBG call %", s.id, " args=", args, " -> ", r.rt)
+        get(ENV, "UIR_DEBUG", "") == "1" && println("DBG call %", s.id, " args=", args, " -> ", r.rt, " exct=", r.exct)
         maybe_typeassert_refine!(fr, s, args, r.rt)
         fr.pending_refine === nothing && maybe_setfield_refine!(fr, s, args, r.rt)
         # order matters: resolve CALLEE conditional noub against this
@@ -833,7 +833,9 @@ function _transfer(fr::Frame, s::StmtId, k::UnifiedIR.Kind)
     elseif k === K"copyast"
         # fresh mutable copy each evaluation: not consistent
         return (Any, CC.Effects(CC.EFFECTS_TOTAL; consistent = CC.ALWAYS_FALSE))
-    elseif k === K"method_def" || k === K"cfunction" || k === K"new_opaque_closure"
+    elseif k === K"new_opaque_closure"
+        return transfer_new_opaque_closure(fr, s)
+    elseif k === K"method_def" || k === K"cfunction"
         return (Any, CC.EFFECTS_UNKNOWN)
     else
         return (Any, CC.EFFECTS_UNKNOWN)   # unknown/external kind: opacity contract §8.2
@@ -1124,6 +1126,49 @@ function transfer_new(fr::Frame, s::StmtId)
     end
 end
 
+"""The abstract_eval_new_opaque_closure port: `opaque_closure_tfunc` builds a
+`PartialOpaque` when the source Method is statically known (and the
+allow-partial flag — operand 4 — is literally `true`), giving OC call sites
+the source to devirtualize against. Stock's eager create-site child inference
+(OpaqueClosureCreateInfo) is not needed here: `infer_opaque_call` re-derives
+the callee from the lattice element at each use. Effects/exct parity with
+stock: `Effects()`/`Any`."""
+function transfer_new_opaque_closure(fr::Frame, s::StmtId)
+    ir = fr.ir
+    nop = UnifiedIR.nops(ir, s)
+    nop >= 5 || return (Union{}, CC.Effects(), Any)
+    mi = get(ir.meta, :mi, nothing)
+    mi isa Core.MethodInstance || (mi = get(ir.meta, :method_instance, nothing))
+    mi isa Core.MethodInstance || return (Any, CC.Effects(), Any)
+    args = Any[widenucond(opl(fr, UnifiedIR.getop(ir, s, i))) for i in 1:5]
+    env = Any[widenucond(opl(fr, UnifiedIR.getop(ir, s, i))) for i in 6:nop]
+    rt = try
+        CC.opaque_closure_tfunc(CC.fallback_lattice, args[1], args[2], args[3],
+                                args[5], env, mi)
+    catch
+        Any
+    end
+    if rt isa CC.PartialOpaque
+        a4 = args[4]
+        # stock: `ea[4] !== true` disables PartialOpaque propagation
+        (a4 isa CC.Const && a4.val === true) || (rt = CC.widenconst(rt))
+    end
+    # stock's stmt_effect_flags: a structurally well-formed new_opaque_closure
+    # (exact Tuple argt, Type bounds, Method source) is nothrow and removable
+    # (consistent stays false — each evaluation allocates a fresh identity)
+    wellformed = try
+        argt, isexact = CC.instanceof_tfunc(args[1], true)
+        isexact && argt isa Type && argt <: Tuple &&
+            CC.:⊑(CC.fallback_lattice, args[2], Type) &&
+            CC.:⊑(CC.fallback_lattice, args[3], Type) &&
+            CC.:⊑(CC.fallback_lattice, args[5], Method)
+    catch
+        false
+    end
+    wellformed || return (rt, CC.Effects(), Any)
+    return (rt, CC.Effects(CC.EFFECTS_TOTAL; consistent = CC.ALWAYS_FALSE), Union{})
+end
+
 function transfer_splatnew(fr::Frame, s::StmtId)
     ir = fr.ir
     lat = CC.fallback_lattice
@@ -1200,6 +1245,76 @@ function lookup_call_matches(st::UInferState, @nospecialize(sig))
         trace!(col, (0x1, sig, result, st.cfg.max_methods))
     end
     return result
+end
+
+"""The abstract_call_opaque_closure port. The callee frame's SELF slot is
+seeded with the closure's capture ENVIRONMENT tuple (stock's
+`newargtypes[1] = ft.env` — the runtime OC ABI passes captures as argument
+1, and the body reads them via `getfield(_1, i)`), and the signature is
+built from that same env element, so the mi-keyed generic frame
+(`specialize_method` on `Tuple{env..., argts...}`) is exactly as precise as
+stock's. The check block reproduces stock's implicit type asserts: a return
+value or argument tuple outside the declared OC signature makes the call
+!nothrow with a TypeError arm."""
+function infer_opaque_call(fr::Frame, closure::CC.PartialOpaque, args::Vector{Any})::UResult
+    tt = closure.typ
+    envl = closure.env
+    sigparts = Any[CC.widenconst(envl)]
+    for i in 2:length(args)
+        a = args[i]
+        CC.isvarargtype(a) && return UResult(Any, CC.Effects())
+        t = CC.widenconst(a)
+        t === Union{} && return UResult(Union{}, CC.EFFECTS_THROWS)
+        push!(sigparts, t)
+    end
+    local sig, ocsig, ocrt
+    try
+        sig = Tuple{sigparts...}
+        utt = Base.unwrap_unionall(tt)::DataType
+        ocargsig = Base.rewrap_unionall(utt.parameters[1], tt)
+        oa = Base.unwrap_unionall(ocargsig)
+        oa isa DataType || return UResult(Any, CC.Effects())
+        ocsig = Base.rewrap_unionall(Tuple{Tuple, oa.parameters...}, ocargsig)
+        p2 = utt.parameters[2]
+        ocrt = Base.rewrap_unionall(p2 isa TypeVar ? p2.ub : p2, tt)
+        ocrt isa Type || (ocrt = Any)
+    catch
+        return UResult(Any, CC.Effects())
+    end
+    if !Base.hasintersect(sig, ocsig)
+        # arity/type mismatch is a guaranteed dispatch failure (stock's
+        # EFFECTS_THROWS + MethodError∪TypeError)
+        return UResult(Union{}, CC.EFFECTS_THROWS, Union{MethodError,TypeError})
+    end
+    ocmethod = closure.source
+    ocmethod isa Method || return UResult(Any, CC.Effects())
+    if !isdefined(ocmethod, :source)
+        # created from optimized source: cannot infer further; the declared
+        # return type still binds (stock's ocrt branch)
+        return UResult(ocrt, CC.Effects(), Any)
+    end
+    match = Core.MethodMatch(sig, Core.svec(), ocmethod, sig <: ocsig)
+    cargs = Vector{Any}(undef, length(args))
+    cargs[1] = envl
+    for i in 2:length(args)
+        cargs[i] = args[i]
+    end
+    r = infer_method(fr, match, cargs)
+    rt = r.rt
+    eff = r.effects
+    exct = r.exct
+    ok = try
+        CC.:⊑(CC.fallback_lattice, widenucond(rt), ocrt) && sig <: ocsig
+    catch
+        false
+    end
+    if !ok
+        # implicit type asserts on the arguments and the return value
+        eff = CC.Effects(eff; nothrow = false)
+        exct = exct === Any ? Any :
+            CC.tmerge(CC.fallback_lattice, exct, TypeError)
+    end
+    return UResult(rt, eff, exct)
 end
 
 function infer_call(fr::Frame, args::Vector{Any}; sid::Int32 = Int32(0))::UResult
@@ -1280,6 +1395,30 @@ function infer_call(fr::Frame, args::Vector{Any}; sid::Int32 = Int32(0))::UResul
         # `nortcall=false` keeps callers out of concrete evaluation (a fold
         # there would re-enter inference — the RT_CALL_EFFECTS rule)
         return UResult(Type, CC.Effects(CC.EFFECTS_THROWS; nortcall = false))
+    end
+    # opaque closures: a PartialOpaque callee devirtualizes to its source
+    # method (the abstract_call_opaque_closure port); a widened OpaqueClosure
+    # callee still knows its declared return type (stock's hasintersect
+    # fallback in abstract_call_unknown)
+    if ftl isa CC.PartialOpaque
+        return infer_opaque_call(fr, ftl, args)
+    end
+    let wft = f === nothing ? CC.widenconst(ftl) :
+              (f isa Core.OpaqueClosure ? typeof(f) : nothing)
+        if wft isa Type && wft !== Any && Base.hasintersect(wft, Core.OpaqueClosure)
+            uft = Base.unwrap_unionall(wft)
+            if uft isa DataType && uft.name === Core.OpaqueClosure.body.body.name &&
+               length(uft.parameters) >= 2
+                p2 = uft.parameters[2]
+                rt = try
+                    Base.rewrap_unionall(p2 isa TypeVar ? p2.ub : p2, wft)
+                catch
+                    Any
+                end
+                return UResult(rt isa Type ? rt : Any, CC.Effects())
+            end
+            return UResult(Any, CC.Effects())
+        end
     end
     # union splitting (the abstract_call_gf_by_type port): small unions in
     # argument position dispatch per element and join — `<(::Union{Int32,
@@ -1970,6 +2109,13 @@ function const_key_elem(@nospecialize(a))
         end
         return (0x2, CC.widenconst(a), CC._getundefs(a), (enc...,))
     end
+    if a isa CC.PartialOpaque
+        # identity-keyed pieces (source Method, parent mi) plus the encoded
+        # env element pin the seed exactly (the OC-capturing-OC corpus)
+        enc = const_key_elem(a.env)
+        enc === nothing && return nothing
+        return (0x3, a.typ, a.source, a.parent, enc)
+    end
     a isa Type && return (0x1, a)
     CC.isvarargtype(a) && return (0x1, a)
     # UCond/UInterCond/other extended elements: context-dependent seeds the
@@ -2057,7 +2203,7 @@ function const_args_profitable(args::Vector{Any})
         a = args[i]
         if a isa CC.Const
             Base.issingletontype(typeof(a.val)) || return true
-        elseif a isa CC.PartialStruct
+        elseif a isa CC.PartialStruct || a isa CC.PartialOpaque
             return true
         end
     end

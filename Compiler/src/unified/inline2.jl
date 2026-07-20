@@ -368,6 +368,44 @@ function resolve_inline_target(ir::UnifiedIR.IR, s::StmtId, k::UnifiedIR.Kind, s
                 (p isa Type && !CC.has_free_typevars(p)) && (f = p)
             end
         end
+        let po = args[1]
+            if po isa CC.PartialOpaque
+                # opaque-closure call: devirtualize to the closure's source
+                # method (stock handle_opaque_closure_call!). Inlining drops
+                # the implicit argument/return typeasserts, so it is only
+                # legal when the static types already prove both.
+                ocm = po.source
+                (ocm isa Method && isdefined(ocm, :source) &&
+                 !isdefined(ocm, :generator) && !ocm.isva) || return nothing
+                local ocsig, ocrt, sig
+                try
+                    tt = po.typ
+                    utt = Base.unwrap_unionall(tt)::DataType
+                    ocargsig = Base.rewrap_unionall(utt.parameters[1], tt)
+                    oa = Base.unwrap_unionall(ocargsig)
+                    oa isa DataType || return nothing
+                    ocsig = Base.rewrap_unionall(Tuple{Tuple, oa.parameters...}, ocargsig)
+                    p2 = utt.parameters[2]
+                    ocrt = Base.rewrap_unionall(p2 isa TypeVar ? p2.ub : p2, tt)
+                    ocrt isa Type || return nothing
+                    argts = Any[CC.widenconst(a) for a in args[2:end]]
+                    any(t -> t === Union{}, argts) && return nothing
+                    sig = Tuple{CC.widenconst(po.env), argts...}
+                catch
+                    return nothing
+                end
+                sig <: ocsig || return nothing
+                sitet = UnifiedIR.stmt_type(ir, s)
+                rok = try
+                    CC.:⊑(CC.fallback_lattice, sitet === nothing ? Any : sitet, ocrt)
+                catch
+                    false
+                end
+                rok || return nothing
+                match = Core.MethodMatch(sig, Core.svec(), ocm, true)
+                return (ocm, CC.specialize_method(match), false)
+            end
+        end
         if f === Core.invoke && nop >= 3
             # Core.invoke(f2, types::Type{<:Tuple}, args...): the target
             # method is looked up on the DECLARED signature. Inlining drops
@@ -573,8 +611,14 @@ function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
             # stock cost-model admission: the cached CodeInstance's
             # inlining_cost, or the same model computed over the optimized
             # callee body; the raw statement-count limits remain the
-            # no-verdict fallback
-            cost = inline2_cost(state, mi, src)
+            # no-verdict fallback. OC callees skip the verdict: the
+            # mi-generic body prices its capture-routed inner calls as
+            # dynamic dispatch, but the SPLICED body devirtualizes them
+            # through the captures forwarding (stock is deliberately
+            # generous here — const_prop_methodinstance_heuristic's
+            # is_for_opaque_closure arm — and inlines the const-prop
+            # result, whose cost model never sees the dynamic shape)
+            cost = m.is_for_opaque_closure ? nothing : inline2_cost(state, mi, src)
             if cost isa Int
                 threshold = Compiler.OptimizationParams(state.cfg.interp).inline_cost_threshold
                 declared_inline && (threshold += 19 * threshold)
@@ -624,6 +668,21 @@ function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
         else
             UnifiedIR.Operand[UnifiedIR.getop(ir, s, i)
                               for i in (argofs + 1):UnifiedIR.nops(ir, s)]
+        end
+        if m.is_for_opaque_closure
+            # the OC body's SELF slot is the capture environment: substitute a
+            # captures load for argument 1 (stock ir_inline_spec_info!'s
+            # `getfield(oc, :captures)` insertion); forward_extracts! then
+            # forwards loads through it to the new_opaque_closure operands
+            (invoke_call || m.isva || isempty(argmap)) && continue
+            ocop = argmap[1]
+            pol = stmt_lattice(ir, ocop)
+            pol isa CC.PartialOpaque || continue
+            capt = UnifiedIR.insert_before!(ir, s, K"call",
+                UnifiedIR.vop(ir, Core.getfield), ocop, UnifiedIR.vop(ir, :captures);
+                type = pol.env,
+                flag = UnifiedIR.FLAG_REMOVABLE | UnifiedIR.FLAG_NOUB)
+            argmap[1] = UnifiedIR.op_stmt(capt)
         end
         UnifiedIR.splice_body!(ir, s, callee_ir; argmap, sparams = spvals)
         inlined += 1
