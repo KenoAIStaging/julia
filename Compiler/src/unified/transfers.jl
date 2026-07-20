@@ -2244,6 +2244,55 @@ function scc_update!(st::UInferState, escalate::Bool)
     return changed
 end
 
+"""Runtime CodeInstance cache serving (wave 9, the durable memo home): stock
+`typeinf_edge`'s cache-hit path (`return_cached_result`). A callee mi with a
+current native-cache CodeInstance serves rettype/exct/effects straight from
+the CI — the cost of a body inferred once (this session, a previous root, the
+stock fallback, or a baked sysimage/pkgimage entry) is one cache read, never
+a re-walk of its callee tree. Soundness mirrors stock exactly: the consuming
+body records the CI as an edge (`store_backedges` registers the backedge, so
+any transitive invalidation of the callee decays this body too) and clamps
+its world window to the CI's. Precision equals stock's cache hits:
+`cached_return_type` decodes Const/PartialStruct/PartialOpaque/
+InterConditional from `rettype_const` (the driver publishes the same
+encodings — see `driver_infer`'s tail). Only UNBOUNDED entries serve
+(`max_world == typemax`): the driver never publishes bounded results, so
+consuming a bounded fact would forfeit the whole request at finish.
+Disable with `CI_SERVE_ENABLED[] = false` (triage switch)."""
+const CI_SERVE_ENABLED = Base.RefValue(true)
+
+function ci_cache_serve(st::UInferState, mi::Core.MethodInstance)
+    CI_SERVE_ENABLED[] || return nothing
+    interp = st.cfg.interp
+    ci = get(CC.code_cache(interp), mi, nothing)
+    # an InferenceResult is an IN-PROGRESS overlay entry (its .ci may be an
+    # unfilled engine reservation): never serve those
+    ci isa Core.CodeInstance || return nothing
+    ci.max_world == typemax(UInt) || return nothing
+    rt = CC.cached_return_type(ci)
+    if rt isa CC.InterConditional
+        rt = UInterCond(rt.slot, rt.thentype, rt.elsetype)
+        let m = mi.def
+            m isa Method && (rt = sanitize_intercond(m, rt))
+        end
+    elseif rt isa CC.InterMustAlias
+        rt = CC.widenmustalias(rt)
+    end
+    effects = CC.decode_effects(ci.ipo_purity_bits)
+    exct = ci.exctype
+    col = st.edges
+    if col isa UEdges
+        clamp_world!(col, ci.min_world, ci.max_world) || return nothing
+        record_invoke!(col, nothing, ci)
+        trace!(col, (0x3, ci))
+        # the single 0x3 fact is this frame's whole window: span it so
+        # per-request cache hits stay fact-complete for enclosing frames
+        col.spans[mi] = (length(col.trace), length(col.trace))
+    end
+    DRIVER_PHASES.ci_serves += 1
+    return UResult(rt, effects, exct)
+end
+
 function infer_method(fr::Frame, match::Core.MethodMatch, args::Vector{Any})::UResult
     st = fr.st
     m = match.method
@@ -2345,6 +2394,13 @@ function infer_method(fr::Frame, match::Core.MethodMatch, args::Vector{Any})::UR
         end
         # cross-request memo: a previous driver request's widened frame
         r = global_memo_lookup(st, mi)
+        if r !== nothing
+            st.cache[mi] = r::UResult
+            return r::UResult
+        end
+        # runtime CodeInstance cache: stock typeinf_edge's cache-hit path
+        # (a body with a current CI never re-walks; see ci_cache_serve)
+        r = ci_cache_serve(st, mi)
         if r !== nothing
             st.cache[mi] = r::UResult
             return r::UResult
@@ -2461,6 +2517,13 @@ function infer_method(fr::Frame, match::Core.MethodMatch, args::Vector{Any})::UR
         # must not be flushed as converged)
         haskey(st.cache, mi) && (frame_done(false); memo_note_hit!(st, mi);
                                  return st.cache[mi]::UResult)
+        let r = ci_cache_serve(st, mi)
+            if r !== nothing
+                st.cache[mi] = r::UResult
+                frame_done(false)
+                return r::UResult
+            end
+        end
     end
     # the memoized path is keyed by mi: it MUST be computed at the
     # mi.specTypes-derived lattice, never at one caller's lattice — a shared

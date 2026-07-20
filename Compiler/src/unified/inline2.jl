@@ -48,6 +48,7 @@ const INLINE_COST_WORLD = Base.RefValue{UInt}(0)
 const INLINE_COST_ACTIVE = Base.IdSet{Core.MethodInstance}()
 const INLINE_COST_MAX_ACTIVE = 4
 const INLINE_COST_MAX_SRC_STMTS = 1000
+const CI_COST_ENABLED = Base.RefValue(true)
 
 """
     inline2_cost(st, mi, src) -> Union{Int,Nothing}
@@ -62,19 +63,31 @@ statement-count heuristic.
 function inline2_cost(st::UInferState, mi::Core.MethodInstance, src::Core.CodeInfo)
     interp = st.cfg.interp
     interp isa Compiler.AbstractInterpreter || return nothing
+    # Cached-CodeInstance fast path (wave 9): stock admission's EXACT policy
+    # input — `inlining_cost(ci.inferred)`, the model verdict stored at the
+    # callee's own publication (the driver measures its devirtualized exit
+    # IRCode; stock entries carry stock's verdict). The wave-6 objection
+    # (cache-warmth nondeterminism: the stored cost was measured over a
+    # less-devirtualized body than this pipeline's recompute) predates the
+    # driver's :invoke emission running BEFORE the cost model — stored and
+    # recomputed verdicts now price the same body shape, and the recompute
+    # towers were the cold-walk's dominant optimizer cost. Triage switch:
+    # `CI_COST_ENABLED[] = false`.
+    if CI_COST_ENABLED[]
+        ci = get(Compiler.code_cache(interp), mi, nothing)
+        if ci isa Core.CodeInstance && ci.max_world == typemax(UInt)
+            inf = @atomic :monotonic ci.inferred
+            # `nothing` = source discarded (const-ABI etc.): no verdict here —
+            # unified inlines from the ORIGINAL source, so fall through to the
+            # computed model rather than declining outright
+            inf === nothing || return Int(Compiler.inlining_cost(inf))
+        end
+    end
     # narrow-budget states are the driver's reentrant/self-hosting passes:
     # optimizing callee bodies for cost there multiplies the burn-in
     # quadratically (the world advances between passes, restamping the
     # memo) — those passes keep the cheap statement-count fallback
     st.cfg.frame_budget >= 1000 || return nothing
-    # NOTE deliberately no cached-CodeInstance fast path: the driver's
-    # stored inlining_cost is measured over a body whose residual
-    # resolvable calls may have stayed dynamic (its devirtualizer resolves
-    # less than this pipeline — the A6 seam), so consulting it makes
-    # admission depend on cache warmth (cold/warm nondeterminism across a
-    # test group). The memoized computation below is deterministic per
-    # (mi, world) and uses stock's model over this pipeline's own
-    # optimized body.
     world = st.cfg.world
     # same-task reentry succeeds (ReentrantLock); a cross-thread race skips
     # the memo and yields no verdict rather than blocking a compile path
@@ -89,12 +102,14 @@ function inline2_cost(st::UInferState, mi::Core.MethodInstance, src::Core.CodeIn
             return nothing
         opt_work_take!() || return nothing
         push!(INLINE_COST_ACTIVE, mi)
+        t0 = time_ns()
         r = try
             inline2_cost_uncached(st, mi, src)
         catch
             nothing
         finally
             delete!(INLINE_COST_ACTIVE, mi)
+            DRIVER_PHASES.cost_tower += Int(time_ns() - t0)
         end
         INLINE_COST_MEMO[mi] = r
         return r

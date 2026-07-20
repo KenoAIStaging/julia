@@ -953,12 +953,14 @@ function ea_opt_summary(st::UInferState, mi::Core.MethodInstance)
             return false
         opt_work_take!() || return false
         push!(EA_OPT_ACTIVE, mi)
+        t0 = time_ns()
         r = try
             ea_opt_summary_uncached(st, mi)
         catch
             false
         finally
             delete!(EA_OPT_ACTIVE, mi)
+            DRIVER_PHASES.ea_tower += Int(time_ns() - t0)
         end
         EA_OPT_SUMMARIES[mi] = r
         return r
@@ -1209,6 +1211,27 @@ pipeline (whose tail applies the post-opt refinements, recursively through
 this helper), with the method's `@assume_effects` override applied.
 """
 function opt_callee_effects(st::UInferState, mi::Core.MethodInstance)
+    # cached-CodeInstance fast path (wave 9): the callee CI's published ipo
+    # effects ARE driver grade — the driver publishes `refine_post_opt`ed
+    # bits, stock entries carry stock's refined bits. The consumption is
+    # soundness-relevant (nothrow feeds statement flags and DCE), so the CI
+    # is recorded as an edge and the window clamped — the `ci_cache_serve`
+    # protocol. Unbounded entries only; a failed clamp falls through.
+    if CI_SERVE_ENABLED[]
+        ci = get(Compiler.code_cache(st.cfg.interp), mi, nothing)
+        if ci isa Core.CodeInstance && ci.max_world == typemax(UInt)
+            col = st.edges
+            okcol = true
+            if col isa UEdges
+                okcol = clamp_world!(col, ci.min_world, ci.max_world)
+                if okcol
+                    record_invoke!(col, nothing, ci)
+                    trace!(col, (0x3, ci))
+                end
+            end
+            okcol && return CC.decode_effects(ci.ipo_purity_bits)
+        end
+    end
     # reentrant/self-hosting passes skip the driver-grade recompute (see
     # inline2_cost's budget gate)
     st.cfg.frame_budget >= 1000 || return nothing
@@ -1224,12 +1247,14 @@ function opt_callee_effects(st::UInferState, mi::Core.MethodInstance)
             return nothing
         opt_work_take!() || return nothing
         push!(OPT_FX_ACTIVE, mi)
+        t0 = time_ns()
         r = try
             opt_callee_effects_uncached(st, mi)
         catch
             nothing
         finally
             delete!(OPT_FX_ACTIVE, mi)
+            DRIVER_PHASES.fx_tower += Int(time_ns() - t0)
         end
         OPT_FX_MEMO[mi] = r
         return r

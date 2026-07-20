@@ -283,6 +283,13 @@ function load_unified!()
             U = Base.invokelatest(Core.getglobal, carrier, :Unified)
             UNIFIED_LOAD_MODE[] = :carrier
         end
+        # wave-9 triage knob: JULIA_UNIFIED_CI_SERVE=0 disables the
+        # CodeInstance-cache serving (callee inference serve + the
+        # cost/effects fast paths) for A/B runs
+        if Base.get(Base.ENV, "JULIA_UNIFIED_CI_SERVE", "1") == "0"
+            Base.invokelatest(Core.getglobal, U, :CI_SERVE_ENABLED)[] = false
+            Base.invokelatest(Core.getglobal, U, :CI_COST_ENABLED)[] = false
+        end
         Core.eval(@__MODULE__, Core.Expr(:const, Core.Expr(:(=), :Unified, U)))
     end
     return Base.invokelatest(Core.getglobal, @__MODULE__, :Unified)

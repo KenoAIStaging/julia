@@ -728,6 +728,7 @@ function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInsta
     start_counter = Base.get_world_counter()
     col = UEdges(world)
     world <= start_counter || return Fallback(:world_unprovable)
+    tphase = time_ns()
 
     # Generated functions: `retrieve_code_info` expands the staged body
     # (jl_code_for_staged) — the expansion's validity window arrives as
@@ -778,9 +779,20 @@ function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInsta
     argl = method_arglattice(def, mi, Any[])
     argl === nothing && return Fallback(:arglattice)
 
+    let t = time_ns()
+        DRIVER_PHASES.entry += Int(t - tphase)
+        tphase = t
+    end
     local rt, effects, exct
+    local rt_pre    # the root pass's PRECISE return element (infer_ir!'s
+                    # return value; `meta[:rettype]` widens conditionals) —
+                    # the InterConditional cache encoding needs it below
     try
-        infer_ir!(uir, copy(argl); state = st)
+        rt_pre = infer_ir!(uir, copy(argl); state = st)
+        let t = time_ns()
+            DRIVER_PHASES.infer += Int(t - tphase)
+            tphase = t
+        end
         # the ipo effects baseline is the INFERENCE-time frame effects with
         # the method-level `@assume_effects` override (stock's finish order);
         # the optimizer's recompute below only REFINES it upward — a
@@ -794,6 +806,10 @@ function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInsta
             # post-optimization body (branches folded, dead throws gone)
             # re-inferred; upgrade any axis it proves
             effects = refine_post_opt(effects, frame_effects_meta(uir))
+            let t = time_ns()
+                DRIVER_PHASES.optimize += Int(t - tphase)
+                tphase = t
+            end
         end
         rt = get(uir.meta, :rettype, Any)
     catch err
@@ -806,6 +822,7 @@ function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInsta
 
     src = nothing
     if optimize && emit_code
+        tphase = time_ns()
         # :invoke emission for residual statically-resolved calls (each
         # rewrite is individually sound, so a failure just leaves the
         # remaining sites as dynamic calls)
@@ -820,6 +837,10 @@ function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInsta
                 devirtualize_modifyops!(uir, st, interp)
             catch
             end
+        end
+        let t = time_ns()
+            DRIVER_PHASES.devirt += Int(t - tphase)
+            tphase = t
         end
         local ircode
         try
@@ -849,7 +870,9 @@ function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInsta
         catch err
             return Fallback(:exit_error, err)
         end
+        DRIVER_PHASES.exit += Int(time_ns() - tphase)
     end
+    DRIVER_PHASES.bodies += 1
 
     col.ok || return Fallback(:world_unprovable)
     (col.valid_worlds.min_world <= world <= col.valid_worlds.max_world) ||
@@ -861,6 +884,12 @@ function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInsta
     end
     src isa Core.CodeInfo && (src.edges = edges)
 
+    # stock's cache encodings (typeinfer.jl's rettype_const cases), so
+    # `cached_return_type` round-trips the precision `ci_cache_serve` (and
+    # stock's own typeinf_edge cache hits) decode: Const, constType,
+    # PartialStruct, PartialOpaque, and InterConditional — the last from the
+    # PRE-optimization pass's precise element (stock computes its cached
+    # result there too; a post-opt Const/constType improvement wins instead)
     rettype_const = nothing
     const_flags = 0x00
     if rt isa CC.Const
@@ -870,6 +899,17 @@ function driver_infer(interp::Compiler.AbstractInterpreter, mi::Core.MethodInsta
         const_flags = constabi ? 0x03 : 0x02
     elseif Compiler.isconstType(rt)
         rettype_const = Compiler.type_parameter(rt)
+        const_flags = 0x02
+    elseif rt isa CC.PartialStruct
+        rettype_const = (CC._getundefs(rt), rt.fields)
+        const_flags = 0x02
+    elseif rt isa CC.PartialOpaque
+        rettype_const = rt
+        const_flags = 0x02
+    elseif rt === Bool && (@isdefined(rt_pre)) &&
+           (rt_pre = sanitize_intercond(def, rt_pre); rt_pre isa UInterCond)
+        rettype_const = CC.InterConditional(rt_pre.slot, rt_pre.thentype,
+                                            rt_pre.elsetype)
         const_flags = 0x02
     end
 
