@@ -581,7 +581,12 @@ function _transfer(fr::Frame, s::StmtId, k::UnifiedIR.Kind)
             (cl[1], callsite_noub(fr, s, cl[2]), cl[3]) :
             (cl[1], callsite_noub(fr, s, cl[2]))
         cond = conditional_call(fr, s)
-        cond === nothing || return (cond, CC.EFFECTS_TOTAL)
+        if cond !== nothing
+            # the isdefined arm carries the builtin's own (nothrow) effects;
+            # isa/===/! conditionals are total
+            cond isa Tuple && return (cond[1], cond[2]::CC.Effects)
+            return (cond, CC.EFFECTS_TOTAL)
+        end
         args = Any[widenucond(a) for a in opls(fr, s, 1)]
         r = infer_call(fr, args; sid = s.id)
         r = apply_intercond(fr, s, 1, r)
@@ -600,7 +605,10 @@ function _transfer(fr::Frame, s::StmtId, k::UnifiedIR.Kind)
         return (r.rt, callsite_noub(fr, s, r.effects), r.exct)
     elseif k === K"intrinsic"
         cond = conditional_call(fr, s)   # not_int Conditional inversion
-        cond === nothing || return (cond, CC.EFFECTS_TOTAL)
+        if cond !== nothing
+            cond isa Tuple && return (cond[1], cond[2]::CC.Effects)
+            return (cond, CC.EFFECTS_TOTAL)
+        end
         args = opls(fr, s, 1)
         f = CC.singleton_type(args[1])
         f === nothing && args[1] isa CC.Const && (f = (args[1]::CC.Const).val)
@@ -919,12 +927,15 @@ function conditional_call(fr::Frame, s::StmtId)
         catch
             return nothing
         end
-        # the caller assumes a conditional-shaped call is total: only form
-        # one when this isdefined is provably nothrow
-        builtin_call_effects(isdefined, argl, rt).nothrow || return nothing
-        rt isa CC.Const && return rt
+        # unlike isa/===, isdefined is not total: mutable/module subjects
+        # taint consistency (the field can become defined later) — carry the
+        # builtin's own effects with the refinement (nothrow-gated so the
+        # exct channel stays empty)
+        eff = builtin_call_effects(isdefined, argl, rt)
+        eff.nothrow || return nothing
+        rt isa CC.Const && return (rt, eff)
         subj = cond_subject(fr, vo)
-        subj === nothing && return rt
+        subj === nothing && return (rt, eff)
         wat = CC.widenconst(argtype2)
         if wat isa Union
             thent = Union{}
@@ -946,15 +957,15 @@ function conditional_call(fr::Frame, s::StmtId)
                     elset = CC.tmerge(lat, elset, ty)
                 end
             end
-            return UCond(subj, thent, elset)
+            return (UCond(subj, thent, elset), eff)
         end
         thent = try
             CC.form_partially_defined_struct(lat, argtype2, fldl)
         catch
             nothing
         end
-        thent === nothing && return rt
-        return UCond(subj, thent, argtype2)
+        thent === nothing && return (rt, eff)
+        return (UCond(subj, thent, argtype2), eff)
     elseif (f === (!) || f === Core.Intrinsics.not_int) && n == 2
         # stock's Conditional inversion for `!`/`not_int` (loop lowerings
         # negate the `=== nothing` exit test through not_int)
