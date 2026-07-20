@@ -329,19 +329,36 @@ function result_arms(ir::UnifiedIR.IR, def::StmtId)
     return arms
 end
 
+"A constant immutable struct value's field `fidx` as a fresh constant
+operand, or nothing (mutable/undef/out-of-range values decline)."
+function const_struct_field_op(ir::UnifiedIR.IR, @nospecialize(v), fidx::Int)
+    v === nothing && return nothing
+    ismutable(v) && return nothing
+    (1 <= fidx <= nfields(v) && isdefined(v, fidx)) || return nothing
+    return UnifiedIR.vop(ir, getfield(v, fidx))
+end
+
 "Rewrite the field-`fidx` load `s` over per-arm constructed values
 (`armpairs` = (result stmt, value operand) per live arm of `ifop`) to
 `select`/`refine` when every arm value is an arm-local immutable
-new/`Core.tuple` whose element operand is visible at `s`. True on success."
+new/`Core.tuple` (or a constant struct leaf) whose element operand is
+visible at `s`. True on success."
 function forward_arm_elements!(ir::UnifiedIR.IR, s::StmtId, ifop::StmtId,
                                armpairs::Vector{Tuple{StmtId,UnifiedIR.Operand}},
                                fidx::Int)
     els = UnifiedIR.Operand[]
     for (_, ro) in armpairs
-        UnifiedIR.optag(ro) == UnifiedIR.TAG_STMT || return false
+        local el::UnifiedIR.Operand
+        if UnifiedIR.optag(ro) != UnifiedIR.TAG_STMT
+            # constant immutable struct leaf (a materialized arm result):
+            # project the field as a fresh constant
+            elc = const_struct_field_op(ir, static_operand_value(ir, ro), fidx)
+            elc === nothing && return false
+            push!(els, elc)
+            continue
+        end
         ad = skip_refines(ir, UnifiedIR.asstmt(ro))
         adk = UnifiedIR.stmt_kind(ir, ad)
-        local el::UnifiedIR.Operand
         if adk === K"call" &&
            static_operand_value(ir, UnifiedIR.getop(ir, ad, 1)) === Core.tuple
             1 + fidx <= UnifiedIR.nops(ir, ad) || return false
@@ -352,7 +369,13 @@ function forward_arm_elements!(ir::UnifiedIR.IR, s::StmtId, ifop::StmtId,
             fidx <= UnifiedIR.nops(ir, ad) - 1 || return false
             el = UnifiedIR.getop(ir, ad, fidx + 1)
         else
-            return false
+            # Const-typed arm def of any kind: still a constant struct leaf
+            lat = UnifiedIR.stmt_type(ir, ad)
+            lat isa CC.Const || return false
+            elc = const_struct_field_op(ir, lat.val, fidx)
+            elc === nothing && return false
+            push!(els, elc)
+            continue
         end
         if UnifiedIR.optag(el) == UnifiedIR.TAG_STMT
             UnifiedIR.visible(ir, UnifiedIR.asstmt(el), s) || return false
@@ -484,6 +507,36 @@ function forward_extracts!(ir::UnifiedIR.IR)
             UnifiedIR.visible(ir, UnifiedIR.asstmt(el), s) || continue
         end
         UnifiedIR.replace_stmt!(ir, s, K"refine", el; type = UnifiedIR.stmt_type(ir, s))
+        n += 1
+    end
+    return n
+end
+
+"""
+    dedup_selects!(ir) -> Int
+
+CSE for `select`s: identical (cond, a, b) triples collapse to the first
+occurrence when it is visible at the duplicate (stock SROA's lifting-cache
+phi dedup — two loads of the same field of the same join produce ONE join).
+The duplicate becomes a `refine` of the survivor; `forward_refines!` and DCE
+finish the cleanup.
+"""
+function dedup_selects!(ir::UnifiedIR.IR)
+    seen = Dict{NTuple{3,UnifiedIR.Operand},StmtId}()
+    n = 0
+    for s in UnifiedIR.each_stmt(ir)
+        UnifiedIR.stmt_kind(ir, s) === K"select" || continue
+        UnifiedIR.nops(ir, s) == 3 || continue
+        key = (UnifiedIR.getop(ir, s, 1), UnifiedIR.getop(ir, s, 2),
+               UnifiedIR.getop(ir, s, 3))
+        first = get(seen, key, nothing)
+        if first === nothing
+            seen[key] = s
+            continue
+        end
+        UnifiedIR.visible(ir, first, s) || continue
+        UnifiedIR.replace_stmt!(ir, s, K"refine", UnifiedIR.op_stmt(first);
+                                type = UnifiedIR.stmt_type(ir, s))
         n += 1
     end
     return n
@@ -1440,6 +1493,7 @@ function _optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
         changed += fold_splatnews!(ir)
         changed += fold_pure_queries!(ir)
         changed += lift_keyvalue_gets!(ir)
+        changed += dedup_selects!(ir)
         changed += forward_refines!(ir)
         changed += forward_if_results!(ir)
         changed += UnifiedIR.promote_cells!(ir)

@@ -73,13 +73,13 @@ es_union(a, b) = @atomic a.x es_mymax b
     end
 end
 
-@testset "invoke_modify declines: non-single or non-modifiable" begin
-    # op over a Union v: two matches — must stay a dynamic builtin call
-    # (stock reaches 2x invoke_modify via callsite union split of the
-    # modifyproperty! wrapper, an inline2 concern, not exit emission)
+@testset "invoke_modify union split and non-modifiable declines" begin
+    # op over a Union v: union_split_calls! (wave 8) splits the modifyfield!
+    # on its value argument, so BOTH narrowed arms devirtualize — stock's
+    # two-Expr(:invoke_modify) shape (the modifyproperty! wrapper split)
     n, stmts, _ = es_emit(es_union, Any[ESAtomic{Int}, Union{Int,Float64}])
-    @test n == 0
-    @test count((@nospecialize(x),) -> Meta.isexpr(x, :invoke_modify), stmts) == 0
+    @test n == 2
+    @test count(es_isinvokemodify(:es_mymax), stmts) == 2
     # defined-const binding cannot be modified: stays dynamic
     n, stmts, _ = es_emit(es_constglobinc, Any[])
     @test n == 0
