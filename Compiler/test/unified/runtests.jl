@@ -233,7 +233,7 @@ end
         @test !startswith(String(mi.def.name), "chainf")
     end
     for k in keys(st.constcache)
-        mi = k[1]
+        mi = k.parts[1]
         @test !(mi isa Core.MethodInstance && mi.def isa Method &&
                 startswith(String(mi.def.name), "chainf"))
     end
@@ -242,6 +242,30 @@ end
     ir2 = UnifiedCompiler.lowered_ir(chaindriver, Tuple{Int64})
     rt2 = UnifiedCompiler.infer_ir!(ir2, Any[CC.Const(chaindriver), Int64]; state = st2)
     @test CC.widenconst(rt2) == Int64
+end
+
+@testset "UConstKey: dispatch-uniform const-memo keys (wave-7 wedge regression)" begin
+    mi = let m = first(methods(sin, (Float64,)))
+        CC.specialize_method(m, Tuple{typeof(sin),Float64}, Core.svec())
+    end
+    # equal-content keys built independently compare equal with equal hashes
+    # (the cross-request memo keys hits by equality, not identity)
+    k1 = UnifiedCompiler.const_key(mi, Any[CC.Const(sin), CC.Const(1.0)])
+    k2 = UnifiedCompiler.const_key(mi, Any[CC.Const(sin), CC.Const(1.0)])
+    @test k1 isa UnifiedCompiler.UConstKey     # one concrete key type: Dict ops
+                                               # never compile per-shape hash
+                                               # specializations (the wedge)
+    @test isequal(k1, k2) && hash(k1) == hash(k2)
+    @test !isequal(k1, UnifiedCompiler.const_key(mi, Any[CC.Const(sin), CC.Const(2.0)]))
+    # mutable Const payloads pin by IDENTITY (the concrete-eval egal contract):
+    # two isequal-but-not-egal payloads must not share a memoized fold
+    d1, d2 = Dict(:a => 1), Dict(:a => 1)
+    @test isequal(d1, d2)
+    @test !isequal(UnifiedCompiler.const_key(mi, Any[CC.Const(sin), CC.Const(d1)]),
+                   UnifiedCompiler.const_key(mi, Any[CC.Const(sin), CC.Const(d2)]))
+    # a Dict lookup keyed by UConstKey round-trips through fresh key objects
+    tbl = Dict{Any,Int}(k1 => 1)
+    @test tbl[k2] == 1
 end
 
 @testset "concrete evaluation of total const calls" begin

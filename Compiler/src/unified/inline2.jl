@@ -129,7 +129,19 @@ function inline2_cost_uncached(st::UInferState, mi::Core.MethodInstance,
     ir.meta[:slotnames] = src.slotnames
     ir.sptypes = Any[t for t in mi.sparam_vals]
     ir.meta[:sptypes_lat] = sptypes_lattice(mi)
-    ir = optimize_ir!(ir, ps; state = st, inline = true)
+    # tower frame cap: price with a BOUNDED walk, refuse when it fires
+    # (see TOWER_FRAME_CAP) — the statement-count fallback then applies,
+    # which declines the same budget-busting bodies the capped walk would
+    # have priced at MAX
+    lim0 = st.limited
+    prevcap = TOWER_FRAME_CAP[]
+    ir = try
+        TOWER_FRAME_CAP[] = TOWER_FRAME_BUDGET[]
+        optimize_ir!(ir, ps; state = st, inline = true)
+    finally
+        TOWER_FRAME_CAP[] = prevcap
+    end
+    st.limited > lim0 && return nothing
     # statically-resolvable residual calls must be measured as `:invoke`
     # (stock's inliner has rewritten declined candidates before its cost
     # model sees them: UNKNOWN_CALL_COST, not the dynamic nonleaf penalty)

@@ -216,9 +216,12 @@ end
 # entry CodeInstance's edges and world bounds come out exactly as if the
 # callee had been re-inferred, minus the walk.
 #
-# Keying: per-MethodInstance for widened frames, per-const-key (the
-# `const_key` encoding, whose egal semantics IdDict matches exactly) for
-# const-seeded frames and concrete evaluations.
+# Keying: per-MethodInstance for widened frames, per-const-key (`UConstKey`:
+# precomputed egal-consistent hash, `===`-swept parts — one concrete key
+# type, so the table never compiles per-shape hash/lookup specializations)
+# for const-seeded frames and concrete evaluations. The table is a plain
+# `Dict`: `UConstKey`s are freshly built per request, so equality (not
+# identity) must key the hits; `hash(::UConstKey)` reads a field.
 #
 # World validation (invalidation correctness): an entry stores the world its
 # facts were last validated at plus the world COUNTER observed at that
@@ -249,7 +252,7 @@ mutable struct MemoEntry
 end
 
 const DRIVER_MEMO_ENABLED = Base.RefValue(true)
-const DRIVER_MEMO = Base.IdDict{Any,Any}()     # (mi | const key) -> MemoEntry
+const DRIVER_MEMO = Dict{Any,Any}()            # (mi | UConstKey) -> MemoEntry
 const MEMO_LOCK = Base.Threads.SpinLock()
 const MEMO_OWNER = Base.RefValue{Any}(nothing)
 const MEMO_HITS = Base.Threads.Atomic{Int}(0)
@@ -547,13 +550,18 @@ valve had to stay tiny (32; 431a7d4e82 measured a budget of 1000 spending
 ~30s in the cascade where 32 spent ~2s). The A6 cross-request memo
 amortizes the inference share of each admission (callee trees replay from
 recorded facts), which reopens the valve to its pre-wedge width — and
-makes it a net WIN: `activate!` at budget 1000 measures 58.7s against the
-budget-32 baseline's 70.6s, with 990 unified bodies against 35. Full
-admission stays closed: entry-convert + optimizer + typed exit are
-per-body and un-memoized, and an uncapped valve pushes `activate!` beyond
-12 minutes; those per-body costs need their own amortization before the
-valve can come out entirely."
-const DRIVER_REENTRANT_BUDGET = Base.RefValue(1000)
+makes it a net WIN for `activate!`: at budget 1000 it measures 58.7s
+against the budget-32 baseline's 70.6s, with 990 unified bodies against
+35. But the RUNTIME demo showed the other side of that ledger (wave-7 P1):
+the memo amortizes only the inference share — entry-convert + optimizer +
+typed exit are per-body and un-memoized, and a workload pass whose
+first-touch surface is the driver's own interior specializations (surgery
+helpers, pipeline passes) spends SECONDS per admitted body compiling the
+compiler through its own optimizer, wedging `unified_driver_demo` pass 1
+from ~60s to timeout. Until the per-body optimizer/exit work is amortized,
+reentrant admissions beyond the small sample must go to stock (fast,
+cached, semantically identical), so the valve stays at the wave-5 width."
+const DRIVER_REENTRANT_BUDGET = Base.RefValue(32)
 const REENTRANT_ADMITTED = Base.Threads.Atomic{Int}(0)
 
 ":invoke emission switch (devirtualize_calls!)."
@@ -1062,8 +1070,10 @@ function _unified_typeinf(interp::Compiler.AbstractInterpreter, mi::Core.MethodI
     end
     local result
     # nested passes (depth > 1: reentrant driver-code compiles and
-    # devirtualization targets) run with the narrower budgets
-    nested = driver_task_state().depth > 1
+    # devirtualization targets — plus compiler-internal bodies at any
+    # depth, see is_selfhost_module) run with the narrower budgets
+    nested = driver_task_state().depth > 1 ||
+             (mi.def isa Method && is_selfhost_module((mi.def::Method).module))
     max_depth = nested ? DRIVER_REENTRANT_MAX_DEPTH[] : DRIVER_MAX_DEPTH[]
     frame_budget = nested ? DRIVER_REENTRANT_FRAME_BUDGET[] : DRIVER_FRAME_BUDGET[]
     try
@@ -1091,6 +1101,26 @@ function _unified_typeinf(interp::Compiler.AbstractInterpreter, mi::Core.MethodI
     end
 end
 
+"""Is `m` compiler-internal (a module named `Compiler` or `UnifiedIR`, or
+nested inside one)? Such bodies are the compiler compiling ITSELF, whatever
+call depth they arrive at: when the valve declines a body and the stock
+path compiles it, the compiles that stock inference's own execution then
+demands (its tfuncs, specialized on the full lattice stack — the wave-7
+`replacefield!_tfunc` wedge) arrive at task depth 0, because the fallback
+runs after `unified_typeinf` returned and popped its depth. Classifying
+self-hosting by MODULE instead of only by depth routes them through the
+same reentrant valve/budgets as the rest of the burn-in — a body like
+`replacefield!_tfunc(::InferenceLattice{MustAliasesLattice{...}}, ...)`
+must never receive a full-budget unified pass mid-workload."""
+function is_selfhost_module(m::Module)
+    while true
+        (nameof(m) === :Compiler || nameof(m) === :UnifiedIR) && return true
+        p = parentmodule(m)
+        p === m && return false
+        m = p
+    end
+end
+
 """
     unified_typeinf(interp::AbstractInterpreter, mi::MethodInstance, source_mode::UInt8)
         -> Union{Nothing,CodeInstance}
@@ -1113,9 +1143,13 @@ function unified_typeinf(interp::Compiler.AbstractInterpreter, mi::Core.MethodIn
         count_fallback!(:reentrant_depth)
         return nothing
     end
-    if dts.depth > 0
-        # reentrant request (the self-hosting burn-in): admit within the
-        # session budget, else decline precisely — stock compiles + caches
+    selfhost = let d = mi.def
+        d isa Method && is_selfhost_module(d.module)
+    end
+    if dts.depth > 0 || selfhost
+        # reentrant request (the self-hosting burn-in, by depth or by
+        # module): admit within the session budget, else decline precisely
+        # — stock compiles + caches
         if REENTRANT_ADMITTED[] >= DRIVER_REENTRANT_BUDGET[]
             count_fallback!(:reentrant_budget)
             return nothing

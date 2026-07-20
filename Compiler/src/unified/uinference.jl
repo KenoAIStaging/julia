@@ -62,7 +62,15 @@ mutable struct UEdges
     valid_worlds::CC.WorldRange
     ok::Bool
     calls::Vector{Any}                    # (atype, CC.MethodLookupResult) in discovery order
-    callindex::Dict{Any,Int}              # atype -> index into calls (dedup)
+    callindex::Base.IdDict{Any,Int}       # atype -> index into calls (dedup by
+                                          # egal: atypes are interned Types or
+                                          # immutable wrappers (TypeEgal), and
+                                          # hash-based keying would compile a
+                                          # fresh Base.hash specialization per
+                                          # deep-tuple key TYPE — the wave-7
+                                          # runtime-wedge class; a rare
+                                          # equal-but-not-egal atype only
+                                          # records a duplicate (sound) edge
     invokes::Vector{Any}                  # (invokesig, MethodInstance|CodeInstance)
     bindings::Vector{Core.Binding}        # order-preserving, dedup'd
     bindingset::Base.IdSet{Core.Binding}
@@ -93,7 +101,7 @@ mutable struct UEdges
 end
 UEdges(world::UInt) =
     UEdges(world, CC.WorldRange(UInt(1), Base.get_world_counter()), true,
-           Any[], Dict{Any,Int}(), Any[], Core.Binding[], Base.IdSet{Core.Binding}(),
+           Any[], Base.IdDict{Any,Int}(), Any[], Core.Binding[], Base.IdSet{Core.Binding}(),
            Dict{Tuple{Module,Symbol},Any}(), Any[], Dict{Any,Tuple{Int,Int}}(), 0)
 
 "Intersect the collector's valid range with `[minw, maxw]`; a disjoint range
@@ -141,6 +149,59 @@ end
 represent: every enclosing frame becomes ineligible for the global memo."
 @inline memo_poison!(col::UEdges) = (col.poison += 1; nothing)
 @inline memo_poison!(::Nothing) = nothing
+
+"""
+    UConstKey
+
+Memo key for a const-seeded frame: `parts` is `[mi, elem...]` with the
+`const_key_elem` encodings, `h` an objectid-mixed hash precomputed at
+construction. The point of the wrapper is DISPATCH UNIFORMITY: keying the
+const memos (and the A6 span/global-memo tables) by raw splatted tuples
+gave every distinct (callee, const-arg-shape) pattern its own concrete
+deep-tuple TYPE, and each hash-based `Dict` operation on such a key
+compiled a fresh `Base.hash`/`get`/`setindex!` specialization through the
+flipped runtime at 50-400ms apiece — the wave-7 demo wedge. `UConstKey`
+is one concrete type: its `hash` reads the precomputed field and its
+equality is an egal (`===`) sweep over `parts`, so no per-shape method
+ever compiles and no user-defined `hash` runs (objectid never throws —
+the old "unhashable Const payload" probe is obsolete).
+
+Semantics: elements are immutable tuples, so per-element `===` is
+structural egal — exactly the pinning the const memo requires (mutable
+Const payloads already key by identity through their `objectid`
+component; immutables compare by content). This is marginally stricter
+than the old tuple `isequal` for immutable containers wrapping mutables
+(those now pin by identity too — a lost memo hit at worst, never a
+collision).
+"""
+struct UConstKey
+    h::UInt
+    parts::Vector{Any}
+end
+function Base.isequal(a::UConstKey, b::UConstKey)
+    a.h == b.h || return false
+    pa, pb = a.parts, b.parts
+    n = length(pa)
+    n == length(pb) || return false
+    @inbounds for i in 1:n
+        pa[i] === pb[i] || return false
+    end
+    return true
+end
+Base.:(==)(a::UConstKey, b::UConstKey) = isequal(a, b)
+Base.hash(k::UConstKey, h::UInt) = hash(k.h, h)
+
+"""Hard frame cap for the driver-grade callee towers (0 = uncapped). The
+cost/effects/EA-summary helpers set it around their uncached callee
+optimizations; `infer_method`'s resource cutoff takes the min of this cap
+and the state's own frame budget, and the helpers REFUSE their verdict
+when any cutoff fired under the cap (`st.limited` moved) — a candidate
+that roots a budget-busting graph (the print/string family) must cost one
+bounded walk, not thousands of frames per optimizer round. Deterministic:
+the cap is a fixed constant, so a tower verdict still depends only on
+(mi, world)."""
+const TOWER_FRAME_CAP = Base.RefValue(0)
+const TOWER_FRAME_BUDGET = Base.RefValue(250)
 
 mutable struct UInferState
     cfg::UInferConfig

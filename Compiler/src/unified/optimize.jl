@@ -779,8 +779,18 @@ function ea_opt_summary_uncached(st::UInferState, mi::Core.MethodInstance)
     # (setindex!/setproperty!/convert chains) must dissolve to raw
     # setfield!/getfield for the field-precise summary — a raw lowered body
     # keeps the field symbol behind a dynamic argument and the analysis
-    # collapses to ⊤ (the same reason EAUtils analyzes post-inlining IR)
-    ir = optimize_ir!(ir, ps; state = st, inline = true)
+    # collapses to ⊤ (the same reason EAUtils analyzes post-inlining IR).
+    # Tower frame cap (see TOWER_FRAME_CAP): bounded walk, no summary when
+    # it fires (a cut walk's escape view would be optimistic)
+    lim0 = st.limited
+    prevcap = TOWER_FRAME_CAP[]
+    ir = try
+        TOWER_FRAME_CAP[] = TOWER_FRAME_BUDGET[]
+        optimize_ir!(ir, ps; state = st, inline = true)
+    finally
+        TOWER_FRAME_CAP[] = prevcap
+    end
+    st.limited > lim0 && return false
     nargs = length(UnifiedIR.getregion(ir, UnifiedIR.root_region(ir)).args)
     res = analyze_escapes(ir, nargs; get_escape_cache = EAOptSummarizer(st),
                           resolve_call = ea_opt_resolver(ir, st))
@@ -1047,7 +1057,17 @@ function opt_callee_effects_uncached(st::UInferState, mi::Core.MethodInstance)
     ir.meta[:slotnames] = src.slotnames
     ir.sptypes = Any[t for t in mi.sparam_vals]
     ir.meta[:sptypes_lat] = sptypes_lattice(mi)
-    ir = optimize_ir!(ir, ps; state = st, inline = true)
+    # tower frame cap (see TOWER_FRAME_CAP): bounded walk, no verdict when
+    # it fires — a cut walk's effects would be unsound to publish anyway
+    lim0 = st.limited
+    prevcap = TOWER_FRAME_CAP[]
+    ir = try
+        TOWER_FRAME_CAP[] = TOWER_FRAME_BUDGET[]
+        optimize_ir!(ir, ps; state = st, inline = true)
+    finally
+        TOWER_FRAME_CAP[] = prevcap
+    end
+    st.limited > lim0 && return nothing
     return apply_effects_override(m, frame_effects_meta(ir))
 end
 

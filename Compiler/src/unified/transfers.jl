@@ -1792,22 +1792,21 @@ function const_key_elem(@nospecialize(a))
     return nothing
 end
 
-"Hashable memo key for a const-seeded frame, or nothing."
+"Memo key for a const-seeded frame (`UConstKey`; see its docstring for the
+dispatch-uniformity rationale), or nothing."
 function const_key(mi::Core.MethodInstance, args::Vector{Any})
-    key = Vector{Any}(undef, length(args) + 1)
-    key[1] = mi
+    parts = Vector{Any}(undef, length(args) + 1)
+    parts[1] = mi
+    h = objectid(mi)
     for (i, a) in enumerate(args)
         e = const_key_elem(a)
         e === nothing && return nothing
-        key[i + 1] = e
+        parts[i + 1] = e
+        # objectid is egal-consistent (structural over the immutable encoding
+        # tuples) and total — no user `hash` method runs, nothing can throw
+        h = hash(objectid(e), h)
     end
-    t = (key...,)
-    try
-        hash(t)
-    catch
-        return nothing      # unhashable Const payload: skip const memoization
-    end
-    return t
+    return UConstKey(h, parts)
 end
 
 """The concrete_eval_call port: when every argument is a Const
@@ -2014,8 +2013,18 @@ function infer_method(fr::Frame, match::Core.MethodMatch, args::Vector{Any})::UR
             return r::UResult
         end
     end
+    fbudget = st.cfg.frame_budget
+    let cap = TOWER_FRAME_CAP[]
+        # driver-grade callee towers (cost model / post-opt effects / EA
+        # summaries) run under a hard frame cap: a tower whose candidate
+        # roots a budget-busting graph (the print/string family) must not
+        # re-walk thousands of frames per optimizer round to price one
+        # inlining decision — the helpers refuse the verdict instead when
+        # the cap fires (see inline2_cost_uncached)
+        0 < cap < fbudget && (fbudget = cap)
+    end
     if length(st.active) >= st.cfg.max_depth ||
-       st.stats.frames - st.budget_mark >= st.cfg.frame_budget
+       st.stats.frames - st.budget_mark >= fbudget
         # resource cutoff: the result is CONTEXT-dependent — callers must not
         # memoize anything computed on top of it (see `tainted` below)
         st.limited += 1
