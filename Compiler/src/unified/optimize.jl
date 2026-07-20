@@ -1390,7 +1390,17 @@ function _optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
     # Core.svec for the codegen apply ABI (stock lift_apply_args!, #59548).
     # Deliberately after the last inference pass — a svec-typed container
     # would only degrade the apply's abstract flattening if re-inferred.
-    svecify_apply_args!(ir)
+    # The rewrite needs an editable window (insert_before!/replace_stmt!);
+    # the IR is dense here, so only open one when a residual apply exists.
+    if any(s -> UnifiedIR.stmt_kind(ir, s) === K"call" &&
+                UnifiedIR.nops(ir, s) >= 4 &&
+                static_operand_value(ir, UnifiedIR.getop(ir, s, 1)) === Core._apply_iterate,
+           UnifiedIR.each_stmt(ir))
+        UnifiedIR.editable(ir)
+        svecify_apply_args!(ir)
+        ir, _ = UnifiedIR.compact!(ir)
+        UnifiedIR.dce!(ir)   # the replaced tuple ctors are dead now (dense-legal here)
+    end
     UnifiedIR.verify_ir(ir; level = 1)
     return ir
 end
