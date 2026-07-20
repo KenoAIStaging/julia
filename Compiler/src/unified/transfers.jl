@@ -583,10 +583,11 @@ function _transfer(fr::Frame, s::StmtId, k::UnifiedIR.Kind)
         cond = conditional_call(fr, s)
         cond === nothing || return (cond, CC.EFFECTS_TOTAL)
         args = Any[widenucond(a) for a in opls(fr, s, 1)]
-        r = infer_call(fr, args)
+        r = infer_call(fr, args; sid = s.id)
         r = apply_intercond(fr, s, 1, r)
         get(ENV, "UIR_DEBUG", "") == "1" && println("DBG call %", s.id, " args=", args, " -> ", r.rt)
         maybe_typeassert_refine!(fr, s, args, r.rt)
+        fr.pending_refine === nothing && maybe_setfield_refine!(fr, s, args, r.rt)
         # order matters: resolve CALLEE conditional noub against this
         # statement's inbounds context (stock 4188), then produce THIS
         # frame's own-boundscheck conditional (which must survive)
@@ -683,7 +684,24 @@ function _transfer(fr::Frame, s::StmtId, k::UnifiedIR.Kind)
         return (Bool, CC.Effects(CC.EFFECTS_TOTAL; consistent = CC.ALWAYS_FALSE,
                                  inaccessiblememonly = CC.ALWAYS_FALSE))
     elseif k === K"cell_isdefined"
-        return (Bool, CC.EFFECTS_TOTAL)
+        cellop = UnifiedIR.asstmt(UnifiedIR.getop(ir, s, 1))
+        cellid = cellop.id
+        if UnifiedIR.stmt_kind(ir, cellop) === K"cell_shared" || cellid in fr.poisoned_cells
+            # a visible closure may store between the test and any use: no
+            # flow-sensitive definedness facts (the cond_subject discipline)
+            return (Bool, CC.EFFECTS_TOTAL)
+        end
+        if !(cellid in fr.newed_cells) || refined(fr, (:cell, cellid)) !== nothing
+            # provably assigned here: no cell_new at all, or an active
+            # flow-sensitive witness (store/completed read on every path)
+            return (CC.Const(true), CC.EFFECTS_TOTAL)
+        end
+        # conditional definedness (stock's @isdefined undef refinement): the
+        # then path carries a witness typed by the join of the frame's stores
+        # (any defined value is bounded by it); the else path carries an
+        # explicit no-witness KILL
+        return (UCond((:cell, cellid), cell_lattice(fr, cellid), REFINE_KILL),
+                CC.EFFECTS_TOTAL)
     elseif k === K"boundscheck"
         # value depends on the inlining context: not consistent — unless its
         # every use is the boundscheck argument of a memory builtin, where the
@@ -804,6 +822,31 @@ function maybe_typeassert_refine!(fr::Frame, s::StmtId, args::Vector{Any},
     return nothing
 end
 
+"""Back-propagate a successful `setfield!(x, name, v[, order])` as a
+field-definedness refinement of x's subject (stock abstract_call_known's
+form_partially_defined_struct site): later `isdefined(x, name)` folds and
+later reads of that field are nothrow. Only with full argument type
+information (stock's vararg gate)."""
+function maybe_setfield_refine!(fr::Frame, s::StmtId, args::Vector{Any},
+                                @nospecialize(rt))
+    4 <= length(args) <= 5 || return nothing
+    f = CC.singleton_type(args[1])
+    f === nothing && args[1] isa CC.Const && (f = (args[1]::CC.Const).val)
+    f === setfield! || return nothing
+    rt === Union{} && return nothing
+    any(a -> CC.isvarargtype(a), args) && return nothing
+    subj = cond_subject(fr, UnifiedIR.getop(fr.ir, s, 2))
+    subj === nothing && return nothing
+    refined = try
+        CC.form_partially_defined_struct(CC.fallback_lattice, args[2], args[3])
+    catch
+        nothing
+    end
+    refined === nothing && return nothing
+    fr.pending_refine = subj => refined
+    return nothing
+end
+
 "Produce UCond lattice elements for conditional-shaped calls (§10.3)."
 function conditional_call(fr::Frame, s::StmtId)
     ir = fr.ir
@@ -863,6 +906,55 @@ function conditional_call(fr::Frame, s::StmtId)
             return UCond(subj, thent, elset)
         end
         return rt
+    elseif f === isdefined && n == 3
+        # stock abstract_isdefined: refine the subject's field-definedness
+        # (PartialStruct undefs) along the branch arms
+        vo = UnifiedIR.getop(ir, s, 2)
+        vl = opl(fr, vo)
+        argtype2 = widenucond(vl)
+        fldl = widenucond(opl(fr, UnifiedIR.getop(ir, s, 3)))
+        argl = Any[argtype2, fldl]
+        rt = try
+            CC.builtin_tfunction(fr.st.cfg.interp, isdefined, argl, nothing)
+        catch
+            return nothing
+        end
+        # the caller assumes a conditional-shaped call is total: only form
+        # one when this isdefined is provably nothrow
+        builtin_call_effects(isdefined, argl, rt).nothrow || return nothing
+        rt isa CC.Const && return rt
+        subj = cond_subject(fr, vo)
+        subj === nothing && return rt
+        wat = CC.widenconst(argtype2)
+        if wat isa Union
+            thent = Union{}
+            elset = Union{}
+            for ty in CC.uniontypes(wat)
+                cnd = try
+                    CC.isdefined_tfunc(lat, ty, fldl)
+                catch
+                    Bool
+                end
+                if cnd isa CC.Const
+                    if cnd.val === true
+                        thent = CC.tmerge(lat, thent, ty)
+                    else
+                        elset = CC.tmerge(lat, elset, ty)
+                    end
+                else
+                    thent = CC.tmerge(lat, thent, ty)
+                    elset = CC.tmerge(lat, elset, ty)
+                end
+            end
+            return UCond(subj, thent, elset)
+        end
+        thent = try
+            CC.form_partially_defined_struct(lat, argtype2, fldl)
+        catch
+            nothing
+        end
+        thent === nothing && return rt
+        return UCond(subj, thent, argtype2)
     elseif (f === (!) || f === Core.Intrinsics.not_int) && n == 2
         # stock's Conditional inversion for `!`/`not_int` (loop lowerings
         # negate the `=== nothing` exit test through not_int)
@@ -1054,7 +1146,7 @@ function lookup_call_matches(st::UInferState, @nospecialize(sig))
     return result
 end
 
-function infer_call(fr::Frame, args::Vector{Any})::UResult
+function infer_call(fr::Frame, args::Vector{Any}; sid::Int32 = Int32(0))::UResult
     st = fr.st
     ftl = args[1]
     f = CC.singleton_type(ftl)
@@ -1063,7 +1155,7 @@ function infer_call(fr::Frame, args::Vector{Any})::UResult
     end
     if f isa Core.Builtin
         if f === Core._apply_iterate
-            return infer_apply(fr, args)
+            return infer_apply(fr, args; sid)
         elseif f === Core.invoke
             return infer_invoke(fr, args)
         elseif f === Core.throw
@@ -1472,8 +1564,12 @@ function iterate_elements(fr::Frame, @nospecialize(x))
     return (elems, fx, exct)
 end
 
-"Core._apply_iterate(iterate, f, iters...): flatten precisely when possible."
-function infer_apply(fr::Frame, args::Vector{Any})::UResult
+"Core._apply_iterate(iterate, f, iters...): flatten precisely when possible.
+`sid != 0` names the apply's own statement: a precise iterate-protocol
+unroll is then recorded in `ir.meta[:apply_iter_unroll]` (stmt id =>
+[(operand index, element count)...]) for `fold_apply_iterates!` to
+materialize (the stock ApplyCallInfo channel)."
+function infer_apply(fr::Frame, args::Vector{Any}; sid::Int32 = Int32(0))::UResult
     length(args) >= 3 || return UResult(Any, CC.Effects())
     fl = args[3]
     fl === Union{} && return UResult(Union{}, CC.EFFECTS_THROWS)
@@ -1482,6 +1578,8 @@ function infer_apply(fr::Frame, args::Vector{Any})::UResult
     precise = true
     iterfx = CC.EFFECTS_TOTAL      # the iterate protocol's own effects
     iterexct = Union{}
+    unrolls = Tuple{Int,Int}[]     # (operand idx, element count) per iterate-container
+    unrollok = true
     for i in 4:length(args)
         a = args[i]
         if CC.isvarargtype(a)
@@ -1499,10 +1597,22 @@ function infer_apply(fr::Frame, args::Vector{Any})::UResult
             iterexct = iterexct === Any ? Any :
                        CC.tmerge(CC.fallback_lattice, iterexct, iexct)
             exact = false
+            if unrollok && !Base.any(e -> CC.isvarargtype(e), elems) &&
+               Base.all(e -> e !== Union{}, elems)
+                # provably-exhausted fixed unroll: rewrite-eligible
+                push!(unrolls, (i, length(elems)))
+            else
+                unrollok = false
+            end
             continue
         end
         append!(flat, ce[1])
         exact &= ce[2]
+    end
+    if sid != 0 && precise && unrollok && !isempty(unrolls)
+        ch = get!(() -> Dict{Int32,Vector{Tuple{Int,Int}}}(),
+                  fr.ir.meta, :apply_iter_unroll)::Dict{Int32,Vector{Tuple{Int,Int}}}
+        ch[sid] = unrolls
     end
     if !precise
         flat = Any[fl, Vararg{Any}]

@@ -82,6 +82,58 @@ end
           Union{MethodError,ArgumentError}
 end
 
+@testset "effects parity: cell definedness witnesses" begin
+    # a for-loop under a guard lowers to a cfg island whose iterate cell is
+    # newed: the flow-sensitive store witness must keep the reads nothrow
+    @eval par_guarded_loop(c) = (s = 0; if c; for i in 1:2; s += 1; end; end; s)
+    e = ueffects(par_guarded_loop, (Bool,))
+    @test CC.is_nothrow(e)
+    @test uexct(par_guarded_loop, (Bool,)) === Union{}
+    # @isdefined-guarded read of a conditionally-assigned local (stock's
+    # VarState.undef refinement through the cell_isdefined conditional)
+    @eval function par_isdef_guard(c, x)
+        local val
+        if c
+            val = x
+        end
+        if @isdefined val
+            return val
+        end
+        return zero(Int)
+    end
+    @test CC.is_nothrow(ueffects(par_isdef_guard, (Bool, Int)))
+    # negation flips the witness to the else arm
+    @eval function par_isdef_neg(c, x)
+        local val
+        if c
+            val = x
+        end
+        if !(@isdefined val)
+            return 0
+        end
+        return val
+    end
+    @test CC.is_nothrow(ueffects(par_isdef_neg, (Bool, Int)))
+end
+
+@testset "effects parity: isdefined field conditionals" begin
+    # stock abstract_isdefined: the then arm refines the subject's field
+    # definedness (PartialStruct undefs), making the guarded read nothrow
+    e = ueffects((Base.RefValue{Any},)) do x
+        if isdefined(x, :x)
+            return getfield(x, :x)
+        end
+    end
+    @test CC.is_nothrow(e)
+    # setfield! back-propagates the definedness (stock's
+    # form_partially_defined_struct site): the isdefined folds
+    e = ueffects((Base.RefValue{String}, String)) do x, v
+        setfield!(x, :x, v)
+        getfield(x, :x)
+    end
+    @test CC.is_nothrow(e)
+end
+
 @testset "effects parity: noub matrix (array indexing)" begin
     # frame-own conditional (the method-level @_noub_if_noinbounds_meta)
     @test CC.is_noub_if_noinbounds(ueffects(getindex, (Vector{Int}, Int)))

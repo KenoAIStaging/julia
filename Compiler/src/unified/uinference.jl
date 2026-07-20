@@ -511,6 +511,10 @@ function itself).
 function infer_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
                    state::UInferState = UInferState())
     UnifiedIR.check_state(ir, UnifiedIR.LAYOUT_DENSE, "infer_ir!")
+    # rewrite channels keyed by statement id are only valid for THIS body
+    # walk (compaction renumbers): consumers read between this pass and the
+    # next compaction, so stale entries must never survive into a new pass
+    delete!(ir.meta, :apply_iter_unroll)
     root = UnifiedIR.getregion(ir, UnifiedIR.root_region(ir))
     length(argtypes) == length(root.args) ||
         error("infer_ir!: $(length(argtypes)) argtypes for $(length(root.args)) parameters")
@@ -696,7 +700,9 @@ function note_return!(fr::Frame, s::StmtId)
             old = fr.rettype
             if old === nothing
                 fr.rettype = v
-            elseif old isa UCond && old.subject == v.subject
+            elseif old isa UCond && old.subject == v.subject &&
+                   old.thentype !== REFINE_KILL && v.thentype !== REFINE_KILL &&
+                   old.elsetype !== REFINE_KILL && v.elsetype !== REFINE_KILL
                 fr.rettype = UCond(v.subject,
                     CC.tmerge(CC.fallback_lattice, old.thentype, v.thentype),
                     CC.tmerge(CC.fallback_lattice, old.elsetype, v.elsetype))
@@ -1189,6 +1195,10 @@ function infer_cfg!(fr::Frame, s::StmtId)
     cursrc = Ref{Int32}(0)   # region id of the block being walked
 
     function merge_edge!(src_st::StmtId, dest::RegionId, vals::Vector{Any}, ref::RefMap)
+        # KILL markers shadow within a block but never cross edges as values
+        # (not lattice elements; a killed subject carries no refinement)
+        any(v -> v === REFINE_KILL, values(ref)) &&
+            (ref = filter(p -> p.second !== REFINE_KILL, ref))
         # backward edge (region ids are in creation = statement order): the
         # island may cycle — §5.1 rule 5 drops TERMINATES (unless the looping
         # terminator carries `:terminates_locally`). Applies to both

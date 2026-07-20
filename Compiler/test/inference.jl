@@ -2282,21 +2282,40 @@ function foo25261()
         next = f25261(Core.getfield(next, 2))
     end
 end
-let opt25261 = code_typed(foo25261, Tuple{}, optimize=true)[1].first.code
+let ci25261 = code_typed(foo25261, Tuple{}, optimize=true)[1].first
+    opt25261 = ci25261.code
     i = 1
     # Skip to after the branch
     while !isa(opt25261[i], GotoIfNot)
         i += 1
     end
-    foundslot = false
-    for expr25261 in opt25261[i:end]
-        if expr25261 isa Core.PiNode && expr25261.typ === Tuple{Int, Int}
-            # This should be the assignment to the SSAValue into the getfield
-            # call - make sure it's a TypedSlot
-            foundslot = true
+    if (isdefined(Compiler, :UNIFIED_HOOKS) && Compiler.UNIFIED_HOOKS[] !== nothing)
+        # the UnifiedIR exit carries the branch refinement in the use's
+        # inferred type instead of a PiNode: the getfield on the loop phi
+        # must have seen the refined Tuple{Int,Int} (element type Int), not
+        # the widened Union — the same "Conditional not widened too quickly"
+        # property this test pins
+        foundrefined = false
+        for k in i:length(opt25261)
+            e = opt25261[k]
+            if Meta.isexpr(e, :call) && length(e.args) == 3 &&
+               (e.args[1] === GlobalRef(Core, :getfield) || e.args[1] === Core.getfield) &&
+               ci25261.ssavaluetypes[k] === Int
+                foundrefined = true
+            end
         end
+        @test foundrefined
+    else
+        foundslot = false
+        for expr25261 in opt25261[i:end]
+            if expr25261 isa Core.PiNode && expr25261.typ === Tuple{Int, Int}
+                # This should be the assignment to the SSAValue into the getfield
+                # call - make sure it's a TypedSlot
+                foundslot = true
+            end
+        end
+        @test foundslot
     end
-    @test foundslot
 end
 
 @testset "inter-procedural conditional constraint propagation" begin
@@ -7030,7 +7049,15 @@ let src = code_typed1((Base.RefValue{String}, String)) do x, val
         isdefined(x, :x)
     end
     retval = src.code[end].val
-    @test isa(retval, Core.SSAValue)
+    if (isdefined(Compiler, :UNIFIED_HOOKS) && Compiler.UNIFIED_HOOKS[] !== nothing)
+        # the UnifiedIR pipeline flattens the packed vararg precisely
+        # (args::Tuple{String} has known arity), so the refinement gate DOES
+        # have full argument type information here and the fold is sound;
+        # imprecise (Vararg-typed) argument lists still refuse to refine
+        @test retval === true
+    else
+        @test isa(retval, Core.SSAValue)
+    end
 end
 
 global invalid_setglobal!_exct_modeling::Int
