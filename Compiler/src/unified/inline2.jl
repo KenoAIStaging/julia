@@ -799,8 +799,15 @@ function fold_apply_iterates!(ir::UnifiedIR.IR)
                 end
             end
         end
+        # the apply site's inlining/inbounds context binds the rewritten
+        # direct call (a callsite `@noinline f(args...)` must keep the
+        # invoke — the Base.allocated measurement shape)
+        sitebits = UnifiedIR.stmt_flag(ir, s) &
+                   (UnifiedIR.FLAG_INLINE | UnifiedIR.FLAG_NOINLINE |
+                    UnifiedIR.FLAG_INBOUNDS)
         UnifiedIR.replace_stmt!(ir, s, K"call", newops...;
-                                type = UnifiedIR.stmt_type(ir, s))
+                                type = UnifiedIR.stmt_type(ir, s),
+                                flag = sitebits == 0 ? nothing : sitebits)
         n += 1
     end
     return n

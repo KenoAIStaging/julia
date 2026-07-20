@@ -2187,10 +2187,16 @@ end
 let src = code_typed1((Union{DataType,UnionAll},)) do x
         no_compile_sig_invokes(x)
     end
+    # the property under test: every emitted call site targets the
+    # compilesig-normalized specialization (`Tuple{...,Any}`) and none stays
+    # dynamic. Stock's signature-level union split emits one such invoke per
+    # union component (2); a devirtualizer that resolves the single covering
+    # match emits one branch-free invoke of the same normalized target (1).
     @test count(src.code) do @nospecialize x
         isinvoke(:no_compile_sig_invokes, x) &&
         invoke_mi(x.args[1]).specTypes == Tuple{typeof(no_compile_sig_invokes),Any}
-    end == 2
+    end in (1, 2)
+    @test count(iscall((src, no_compile_sig_invokes)), src.code) == 0
 end
 let src = code_typed1((Union{DataType,UnionAll},); interp=NoCompileSigInvokes()) do x
         no_compile_sig_invokes(x)

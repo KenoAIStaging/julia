@@ -895,7 +895,7 @@ JIT work happens here: the caller's `add_codeinsts_to_jit!` walk collects
 embedded CodeInstance targets via `collectinvokes!`.
 """
 function driver_ci_for_invoke(interp::Compiler.AbstractInterpreter, mi::Core.MethodInstance,
-                              allow_production::Bool)
+                              allow_production::Bool; normalize::Bool = true)
     let code = get(Compiler.code_cache(interp), mi, nothing)
         code isa Compiler.InferenceResult && (code = code.ci)
         if code isa Core.CodeInstance &&
@@ -918,7 +918,7 @@ function driver_ci_for_invoke(interp::Compiler.AbstractInterpreter, mi::Core.Met
     dts.devirt += 1
     push!(dts.inflight, mi)
     try
-        ci = _unified_typeinf(interp, mi, Compiler.SOURCE_MODE_ABI)
+        ci = _unified_typeinf(interp, mi, Compiler.SOURCE_MODE_ABI; normalize)
     finally
         dts.depth -= 1
         dts.devirt -= 1
@@ -977,6 +977,13 @@ function devirtualize_calls!(uir, st::UInferState, interp::Compiler.AbstractInte
             continue
         end
         mi isa Core.MethodInstance || continue
+        if isdefined(match.method, :generator) && !Base.isdispatchtuple(mi.specTypes)
+            # a staged method's runnable body is the generator's expansion,
+            # which needs a CONCRETE signature; an :invoke of an abstract
+            # staged mi cannot expand at runtime — the site must stay a
+            # dynamic call (stock leaves these unresolved; the f59018 shape)
+            continue
+        end
         target = ccall(:jl_normalize_to_compilable_mi, Any, (Any,), mi)
         target isa Core.MethodInstance || continue
         # stock's :invoke legality (compileable_specialization): the target's
@@ -985,13 +992,35 @@ function devirtualize_calls!(uir, st::UInferState, interp::Compiler.AbstractInte
         # runtime re-derives per call) leaves the callee's sparam reads
         # unbound — the emitted code throws `UndefVarError: T` at the first
         # `static_parameter` use. Such sites keep the dynamic :call.
-        sparams = target.sparam_vals
-        (CC.unionall_depth((match.method).sig) == length(sparams) &&
-         CC.validate_sparams(sparams)) || continue
-        (ci, did_produce) = driver_ci_for_invoke(interp, target,
-                                                 produced < DEVIRT_PRODUCTION_BUDGET[])
-        did_produce && (produced += 1)
-        tgt = ci === nothing ? target : ci
+        sparams_ok = (t::Core.MethodInstance) ->
+            (CC.unionall_depth((match.method).sig) == length(t.sparam_vals) &&
+             CC.validate_sparams(t.sparam_vals))
+        local ci = nothing
+        local tgt = nothing
+        if target !== mi && sparams_ok(mi) &&
+           let ut = Base.unwrap_unionall(mi.specTypes)
+               ut isa DataType && Base.any(p -> p isa Core.TypeEgal, ut.parameters)
+           end
+            # stock compileable_specialization's keep_direct_edge rule: the
+            # normalized signature has a less precise ABI for TypeEgal
+            # arguments, so a direct inferred edge for the precise call
+            # signature wins when its code can be produced
+            (dci, did_produce) = driver_ci_for_invoke(interp, mi,
+                                                      produced < DEVIRT_PRODUCTION_BUDGET[];
+                                                      normalize = false)
+            did_produce && (produced += 1)
+            if dci isa Core.CodeInstance && dci.def === mi
+                ci = dci
+                tgt = dci
+            end
+        end
+        if tgt === nothing
+            sparams_ok(target) || continue
+            (ci, did_produce) = driver_ci_for_invoke(interp, target,
+                                                     produced < DEVIRT_PRODUCTION_BUDGET[])
+            did_produce && (produced += 1)
+            tgt = ci === nothing ? target : ci
+        end
         if ci isa Core.CodeInstance && col isa UEdges
             # the embedded CI must cover every world this body claims
             clamp_world!(col, ci.min_world, ci.max_world) || continue
@@ -1056,8 +1085,12 @@ function finish_unified!(interp::Compiler.AbstractInterpreter, mi::Core.MethodIn
 end
 
 function _unified_typeinf(interp::Compiler.AbstractInterpreter, mi::Core.MethodInstance,
-                          source_mode::UInt8)
-    mi = ccall(:jl_normalize_to_compilable_mi, Any, (Any,), mi)::Core.MethodInstance
+                          source_mode::UInt8; normalize::Bool = true)
+    # normalize=false: a direct inferred edge for the PRECISE call signature
+    # (TypeEgal slots — stock typeinf_edge caches these un-normalized; the
+    # devirtualizer's keep_direct_edge consumer)
+    normalize &&
+        (mi = ccall(:jl_normalize_to_compilable_mi, Any, (Any,), mi)::Core.MethodInstance)
     # fast cache path (stock typeinf_ext's)
     let code = get(Compiler.code_cache(interp), mi, nothing)
         code isa Compiler.InferenceResult && (code = code.ci)
