@@ -1142,8 +1142,13 @@ function assemble_ircode(cx::TCtx, ir::UnifiedIR.IR, argmap::Dict{Int32,Int}, ro
             t == UnifiedIR.TAG_STMT && return tval(UnifiedIR.asstmt(o))
             t == UnifiedIR.TAG_INLINE && return UnifiedIR.imm_value(o)
             if t == UnifiedIR.TAG_CONST
-                v = ir.body.constants[UnifiedIR.payload(o)]
-                return v isa Union{Symbol,Expr} ? QuoteNode(v) : v
+                # stock quoting breadth (is_self_quoting): EVERY AST-node
+                # value — LineNumberNode/SSAValue/GotoNode/... literals in
+                # macro-machinery bodies, not just Symbol/Expr — must come
+                # back QuoteNode-wrapped or codegen misreads it (a bare
+                # LineNumberNode in value position is a codegen error, a
+                # bare SSAValue a miscompile)
+                return Compiler.quoted(ir.body.constants[UnifiedIR.payload(o)])
             end
             t == UnifiedIR.TAG_GLOBAL && return ir.body.globals[UnifiedIR.payload(o)]
             t == UnifiedIR.TAG_SPARAM && return Expr(:static_parameter, Int(UnifiedIR.payload(o)))
@@ -1193,11 +1198,22 @@ function assemble_ircode(cx::TCtx, ir::UnifiedIR.IR, argmap::Dict{Int32,Int}, ro
         return out
     end
 
-    # foreigncall/cfunction operands are STRUCTURAL syntax pieces (the
-    # (name, lib) tuple Expr, sparam-dependent type Exprs): emit interned
-    # Expr constants raw, not value-quoted
+    # foreigncall/cfunction/new_opaque_closure operands mix two storage
+    # conventions: operands from the ORIGINAL lowered statement were stored
+    # VERBATIM (that entry arm never unwraps QuoteNodes — structural Exprs,
+    # the cconv slot's own QuoteNode((sym, ..., gc_safe)) that emit_ccall
+    # requires as-is, QuoteNode-wrapped value args), while constants the
+    # optimizer SUBSTITUTES into value slots (inlined callee arguments —
+    # the `Module()` → ccall `:anonymous` shape) follow the general pool
+    # convention (bare). `tval` value-quotes every non-self-quoting
+    # constant; restore the verbatim classes by stripping the added layer
+    # exactly when the stored object was itself an Expr or QuoteNode — a
+    # bare-stored Symbol/AST-leaf value keeps its tval quoting (emitting it
+    # bare is a binding read / codegen error). Only a substituted constant
+    # whose runtime VALUE is itself a QuoteNode mis-strips here (accepted:
+    # not expressible from real lowered ccall/cfunction sites).
     function raw_structural(@nospecialize(o))
-        o isa QuoteNode && o.value isa Expr && return o.value
+        o isa QuoteNode && (o.value isa Expr || o.value isa QuoteNode) && return o.value
         return o
     end
 
@@ -1247,7 +1263,7 @@ function assemble_ircode(cx::TCtx, ir::UnifiedIR.IR, argmap::Dict{Int32,Int}, ro
         if k === K"foreigncall" || k === K"cfunction" || k === K"new_opaque_closure"
             rawops = Any[raw_structural(o) for o in ops]
             if k === K"foreigncall" && !isempty(rawops) &&
-               rawops[1] isa QuoteNode && rawops[1].value === FOREIGNGLOBAL_MARKER
+               rawops[1] isa QuoteNode && (rawops[1]::QuoteNode).value === FOREIGNGLOBAL_MARKER
                 # marker-encoded Expr(:foreignglobal, name) — see codeinfo_entry
                 return Expr(:foreignglobal, rawops[2:end]...)
             end

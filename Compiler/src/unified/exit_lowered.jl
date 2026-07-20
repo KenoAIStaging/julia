@@ -130,8 +130,9 @@ function exit_value(cx::ExitCtx, o::UnifiedIR.Operand)
     elseif t == UnifiedIR.TAG_INLINE
         return UnifiedIR.imm_value(o)
     elseif t == UnifiedIR.TAG_CONST
-        v = ir.body.constants[UnifiedIR.payload(o)]
-        return v isa Union{Symbol,Expr} ? QuoteNode(v) : v
+        # stock quoting breadth (is_self_quoting), see the typed exit's
+        # TAG_CONST arm: every AST-node value must be QuoteNode-wrapped
+        return Compiler.quoted(ir.body.constants[UnifiedIR.payload(o)])
     elseif t == UnifiedIR.TAG_GLOBAL
         return ir.body.globals[UnifiedIR.payload(o)]
     elseif t == UnifiedIR.TAG_SPARAM
@@ -364,9 +365,11 @@ function emit_stmt!(cx::ExitCtx, s::StmtId, k::UnifiedIR.Kind, loopctxs)
     elseif k === K"splatnew"
         cx.ssaof[s.id] = emitstmt!(cx, Expr(:splatnew, exit_values(cx, s, 1)...))
     elseif k === K"foreigncall"
-        # structural syntax pieces (the (name, lib) tuple Expr, sparam-
-        # dependent type Exprs) must come back raw, not value-quoted
-        vals = Any[v isa QuoteNode && v.value isa Expr ? v.value : v
+        # verbatim-stored pieces (structural Exprs, the cconv slot's own
+        # QuoteNode, QuoteNode-wrapped value args) get the one added
+        # QuoteNode layer stripped; bare-stored constants keep their value
+        # quoting — see exit_typed's raw_structural for the discrimination
+        vals = Any[v isa QuoteNode && (v.value isa Expr || v.value isa QuoteNode) ? v.value : v
                    for v in exit_values(cx, s, 1)]
         v1 = isempty(vals) ? nothing : vals[1]
         v1 isa QuoteNode && (v1 = v1.value)
@@ -377,7 +380,7 @@ function emit_stmt!(cx::ExitCtx, s::StmtId, k::UnifiedIR.Kind, loopctxs)
             cx.ssaof[s.id] = emitstmt!(cx, Expr(:foreigncall, vals...))
         end
     elseif k === K"cfunction"
-        vals = Any[v isa QuoteNode && v.value isa Expr ? v.value : v
+        vals = Any[v isa QuoteNode && (v.value isa Expr || v.value isa QuoteNode) ? v.value : v
                    for v in exit_values(cx, s, 1)]
         cx.ssaof[s.id] = emitstmt!(cx, Expr(:cfunction, vals...))
     elseif k === K"globalref"

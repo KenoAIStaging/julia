@@ -167,4 +167,85 @@ end
     @test irc[Core.SSAValue(1)][:stmt].args[2] == GlobalRef(ESHoistM, :c)
 end
 
+# Quoted-AST constants at the exit boundary (C1 sys-unified regression): the
+# entry converter unwraps EVERY QuoteNode into the constants pool, so both
+# exits must re-quote with stock breadth (`Base.is_self_quoting`) — not just
+# Symbol/Expr. A bare LineNumberNode in value position is a codegen error
+# (the class that broke Test.parse_testset_args under the sys-unified image),
+# a bare SSAValue literal a dangling-reference miscompile.
+@eval es_lnn_lit(x) = ($(QuoteNode(LineNumberNode(7, :es_lit))), x)
+@eval es_ssa_lit(x) = (x, $(QuoteNode(Core.SSAValue(7))))
+@testset "quoted AST-node constants through the exits" begin
+    # exit_lowered: redefine through IR and execute both exits' emissions
+    let g = ES_U.redefine_through_ir(es_lnn_lit, Tuple{Int}; mod = @__MODULE__)
+        @test Base.invokelatest(g, 3) == es_lnn_lit(3) == (LineNumberNode(7, :es_lit), 3)
+    end
+    let g = ES_U.redefine_through_ir(es_ssa_lit, Tuple{Int}; mod = @__MODULE__)
+        @test Base.invokelatest(g, 2) == es_ssa_lit(2) == (2, Core.SSAValue(7))
+    end
+    # typed exit: no bare AST-node constant in any emitted value position
+    let uir = ES_U.typed_ir(es_lnn_lit, Any[Int])
+        irc = ES_U.ir_to_ircode(uir)
+        bare = 0
+        for i in 1:length(irc.stmts)
+            stmt = irc[Core.SSAValue(i)][:stmt]
+            stmt isa Expr || continue
+            for a in stmt.args
+                a isa LineNumberNode && (bare += 1)
+            end
+        end
+        @test bare == 0
+    end
+    # end-to-end through the driver + codegen
+    @test ES_U.with_unified_compiler(es_lnn_lit, 5) == (LineNumberNode(7, :es_lit), 5)
+    @test ES_U.with_unified_compiler(es_ssa_lit, 5) == (5, Core.SSAValue(7))
+end
+
+# The flip side of the same boundary: foreigncall/cfunction STRUCTURAL slots
+# are stored VERBATIM at entry (no QuoteNode unwrap), so the exits must strip
+# exactly the one QuoteNode layer the value accessors add — over-quoting the
+# cconv slot's own QuoteNode makes emit_ccall's convert_cconv segfault (the
+# C1 build-6 crash), under-quoting was never sound either.
+es_pid() = ccall(:getpid, Cint, ())
+es_pid_wrap(x) = (es_pid() > 0) ? x + 1 : x
+@testset "foreigncall structural slots stay verbatim through the exits" begin
+    let g = ES_U.redefine_through_ir(es_pid, Tuple{}; mod = @__MODULE__)
+        @test Base.invokelatest(g) == es_pid()
+    end
+    # typed exit + codegen (the segfault path): the emitted foreigncall's
+    # cconv slot must satisfy emit_ccall's QuoteNode contract
+    @test ES_U.with_unified_compiler(es_pid) == es_pid()
+    @test ES_U.with_unified_compiler(es_pid_wrap, 41) == 42
+    let uir = ES_U.typed_ir(es_pid, Any[])
+        irc = ES_U.ir_to_ircode(uir)
+        fcs = [irc[Core.SSAValue(i)][:stmt] for i in 1:length(irc.stmts)
+               if Meta.isexpr(irc[Core.SSAValue(i)][:stmt], :foreigncall)]
+        @test !isempty(fcs)
+        for fc in fcs
+            @test fc.args[5] isa QuoteNode  # emit_ccall asserts this shape
+        end
+    end
+end
+
+# Inlining substitutes pool constants (stored BARE, general convention) into
+# foreigncall VALUE slots: they must come back value-QUOTED while the
+# verbatim-stored structural slots are stripped — the build-7 regression,
+# where `Module()`'s inlined ccall got a bare `:anonymous` Symbol in value
+# position (evaluated as a binding read: UndefVarError).
+@inline es_newmod(name::Symbol) = ccall(:jl_f_new_module, Ref{Module}, (Any, Bool, Bool), name, false, false)
+es_newmod0() = es_newmod(:es_anon_mod)
+@testset "substituted constants in foreigncall value slots stay quoted" begin
+    let uir = ES_U.typed_ir(es_newmod0, Any[])
+        irc = ES_U.ir_to_ircode(uir)
+        fcs = [irc[Core.SSAValue(i)][:stmt] for i in 1:length(irc.stmts)
+               if Meta.isexpr(irc[Core.SSAValue(i)][:stmt], :foreigncall)]
+        @test !isempty(fcs)  # the ccall inlined into es_newmod0
+        for fc in fcs
+            @test fc.args[5] isa QuoteNode                       # cconv verbatim
+            @test all(a -> !(a isa Symbol), fc.args[6:end])      # no bare value Symbol
+        end
+    end
+    @test nameof(ES_U.with_unified_compiler(es_newmod0)) === :es_anon_mod
+end
+
 end # module UnifiedExitShapeTests
