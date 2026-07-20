@@ -1375,6 +1375,11 @@ function _optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
         ea_refine_effect_free!(ir, state)
     catch
     end
+    # residual dynamic applies: convert fixed-shape tuple containers to
+    # Core.svec for the codegen apply ABI (stock lift_apply_args!, #59548).
+    # Deliberately after the last inference pass — a svec-typed container
+    # would only degrade the apply's abstract flattening if re-inferred.
+    svecify_apply_args!(ir)
     UnifiedIR.verify_ir(ir; level = 1)
     return ir
 end
