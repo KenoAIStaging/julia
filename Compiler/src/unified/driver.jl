@@ -627,7 +627,13 @@ function refine_post_opt(base::Compiler.Effects, post::Compiler.Effects)
         consistent = post.consistent === Compiler.ALWAYS_TRUE ?
             Compiler.ALWAYS_TRUE : base.consistent,
         effect_free = post.effect_free === Compiler.ALWAYS_TRUE ?
-            Compiler.ALWAYS_TRUE : base.effect_free,
+            Compiler.ALWAYS_TRUE :
+            # the post-opt EA :argmem outcome (ea_refine_effect_free!) is a
+            # strict upgrade over a FALSE base: forward the conditional bit
+            # so it resolves against the caller's inaccessiblememonly
+            (post.effect_free === Compiler.EFFECT_FREE_IF_INACCESSIBLEMEMONLY &&
+             base.effect_free === Compiler.ALWAYS_FALSE ?
+             Compiler.EFFECT_FREE_IF_INACCESSIBLEMEMONLY : base.effect_free),
         nothrow = base.nothrow | post.nothrow,
         terminates = base.terminates | post.terminates,
         notaskstate = base.notaskstate | post.notaskstate,
