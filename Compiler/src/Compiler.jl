@@ -215,20 +215,72 @@ end
 # the sysimage bootstrap stage must never see it (UnifiedIR is bootstrapped
 # into Base later than the compiler), and the stdlib stub fast-path above
 # bypasses module evaluation entirely, so it is loaded on demand:
+
+# how the last load_unified! resolved: :none, :pkgimage or :carrier
+const UNIFIED_LOAD_MODE = RefValue{Symbol}(:none)
+
+# Try the precompiled UnifiedCompiler pkgimage (top-level package next to
+# Compiler/UnifiedIR in share/julia; same source files, evaluated against the
+# loader-registered Compiler package instance). Returns the Unified module or
+# nothing (caller falls back to the interpreted carrier include). Never taken
+# during bootstrap/sysimage builds or inside another precompile process.
+function _unified_from_pkgimage()
+    Base.isdefined(Base, :end_base_include) || return nothing
+    Base.get(Base.ENV, "JULIA_UNIFIED_PKGIMAGE", "1") == "0" && return nothing
+    Base.generating_output() && return nothing
+    # the pkgimage binds to the loader-registered Compiler package instance;
+    # only usable when THIS module is that instance (a Base.Compiler session
+    # keeps the carrier path)
+    compiler_id = Base.PkgId(Base.UUID(0x807dbc54b67e4c79_8afbeafe4df6f2e1), "Compiler")
+    Base.maybe_root_module(compiler_id) === Compiler || return nothing
+    unified_id = Base.PkgId(Base.UUID(0x6d101ee7afa6416a_b7978a652f7b3d1c), "UnifiedCompiler")
+    pkgdir = Base.joinpath(Base.Sys.BINDIR::Base.String, Base.DATAROOTDIR, "julia")
+    UC = try
+        pushed = false
+        if Base.locate_package(unified_id) === nothing
+            # make the share/julia package directory visible for this require
+            # only (the demo/bench sessions already have it on LOAD_PATH; the
+            # --project=Compiler/test environments do not)
+            Base.push!(Base.LOAD_PATH, pkgdir)
+            pushed = true
+        end
+        try
+            Base.invokelatest(Base.require, unified_id)
+        finally
+            pushed && Base.filter!(p -> p !== pkgdir, Base.LOAD_PATH)
+        end
+    catch err
+        Base.println(Base.stderr,
+            "load_unified!: UnifiedCompiler pkgimage unavailable, using the carrier include: ",
+            Base.sprint(Base.showerror, err))
+        nothing
+    end
+    UC isa Base.Module || return nothing
+    # the package must be bound to THIS Compiler instance
+    Base.invokelatest(Core.getglobal, UC, :CompilerModule) === Compiler || return nothing
+    return Base.invokelatest(Core.getglobal, UC, :Unified)
+end
+
 function load_unified!()
     if !Base.isdefined(@__MODULE__, :Unified)
-        # Evaluate the port in a Main-rooted carrier module: this baremodule
-        # rebinds `getproperty = Core.getfield` and `top`-resolution inside
-        # its nested tree targets it, which would compile every `x.f` in the
-        # port to raw getfield — breaking property-forwarding types
-        # (UnifiedIR.IRBody forwards its row properties to the substrate).
-        path = Base.joinpath(Base.Sys.BINDIR::Base.String, Base.DATAROOTDIR,
-                             "julia", "Compiler", "src", "unified", "Unified.jl")
-        carrier = Base.Module(:CompilerUnifiedCarrier)
-        Core.eval(carrier, Core.Expr(:const, Core.Expr(:(=), :CompilerModule, @__MODULE__)))
-        Base.include(carrier, path)
-        Core.eval(@__MODULE__, Core.Expr(:const, Core.Expr(:(=), :Unified,
-                  Base.invokelatest(Core.getglobal, carrier, :Unified))))
+        U = _unified_from_pkgimage()
+        if U !== nothing
+            UNIFIED_LOAD_MODE[] = :pkgimage
+        else
+            # Evaluate the port in a Main-rooted carrier module: this baremodule
+            # rebinds `getproperty = Core.getfield` and `top`-resolution inside
+            # its nested tree targets it, which would compile every `x.f` in the
+            # port to raw getfield — breaking property-forwarding types
+            # (UnifiedIR.IRBody forwards its row properties to the substrate).
+            path = Base.joinpath(Base.Sys.BINDIR::Base.String, Base.DATAROOTDIR,
+                                 "julia", "Compiler", "src", "unified", "Unified.jl")
+            carrier = Base.Module(:CompilerUnifiedCarrier)
+            Core.eval(carrier, Core.Expr(:const, Core.Expr(:(=), :CompilerModule, @__MODULE__)))
+            Base.include(carrier, path)
+            U = Base.invokelatest(Core.getglobal, carrier, :Unified)
+            UNIFIED_LOAD_MODE[] = :carrier
+        end
+        Core.eval(@__MODULE__, Core.Expr(:const, Core.Expr(:(=), :Unified, U)))
     end
     return Base.invokelatest(Core.getglobal, @__MODULE__, :Unified)
 end
