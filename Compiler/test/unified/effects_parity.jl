@@ -73,6 +73,15 @@ end
     @test CC.is_nothrow(ueffects(par_catchread))
 end
 
+@testset "effects parity: throw_methoderror exct arms" begin
+    # stock abstract_throw_methoderror: zero call args ⇒ ArgumentError,
+    # fixed nonzero arity ⇒ MethodError, imprecise (vararg) arity ⇒ Union
+    @test uexct(() -> Core.throw_methoderror()) === ArgumentError
+    @test uexct(x -> Core.throw_methoderror(x), (Int,)) === MethodError
+    @test uexct(args -> Core.throw_methoderror(args...), (Vector{Any},)) ===
+          Union{MethodError,ArgumentError}
+end
+
 @testset "effects parity: noub matrix (array indexing)" begin
     # frame-own conditional (the method-level @_noub_if_noinbounds_meta)
     @test CC.is_noub_if_noinbounds(ueffects(getindex, (Vector{Int}, Int)))

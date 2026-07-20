@@ -1061,7 +1061,16 @@ function infer_call(fr::Frame, args::Vector{Any})::UResult
             exct = length(args) == 2 ? CC.widenconst(widenucond(args[2])) : Any
             return UResult(Union{}, CC.EFFECTS_THROWS, exct)
         elseif f === Core.throw_methoderror
-            return UResult(Union{}, CC.EFFECTS_THROWS, MethodError)
+            # stock abstract_throw_methoderror: zero call args raises
+            # ArgumentError; an imprecise (vararg) arity may be either
+            exct = if length(args) == 1
+                ArgumentError
+            elseif !CC.isvarargtype(args[2])
+                MethodError
+            else
+                Union{MethodError, ArgumentError}
+            end
+            return UResult(Union{}, CC.EFFECTS_THROWS, exct)
         elseif f === setglobal!
             return infer_setglobal(fr, args)
         elseif f === Core.get_binding_type
