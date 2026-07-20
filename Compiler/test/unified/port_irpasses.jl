@@ -73,6 +73,12 @@ const SV_53521 = ScopedValue(1)
 with_read_53521(x) = @with SV_53521 => x begin
     SV_53521[]
 end
+nested_with_53521(x) = @with SV_53521 => x begin
+    inner = @with SV_53521 => x + 1 begin
+        SV_53521[]
+    end
+    (inner, SV_53521[])
+end
 
 # irpasses.jl #52857 fixture struct (1 field, no inner constructor —
 # `Expr(:new)` with no values leaves the field unset)
@@ -841,17 +847,21 @@ end
     ir = optimized(ir, Any[Any, Bool])
     @test UnifiedIR.verify_ir(ir; level = 1)
     ci60 = UC.ir_to_codeinfo(ir)
+    # F10 (fixed): the catch-dest block shared with the normal path is
+    # reassigned out of the handler island (the pop_exception rides the
+    # handler's synthetic exit edge instead of the shared join), so the
+    # emitted body is enter/leave-balanced. Crash-safety discipline: the
+    # compute_trycatch witness must hold BEFORE any invocation (an
+    # unbalanced body segfaults the process when invoked).
+    @test trycatch_ok(ci60)
     if trycatch_ok(ci60)
         g = UC.define_ir_method!(B3BDefs, gensym(:row60), 2, ir)
         @test Base.invokelatest(g, true) == 1
         @test Base.invokelatest(g, false) == 1
-    else
-        # F10: the lowered exit routes the try-skipping path INTO the
-        # handler epilogue (a `goto` to the pop_exception block without the
-        # :enter); stock inference's compute_trycatch asserts ("unbalanced
-        # try/catch") and kills the process when such a method is invoked,
-        # so the pin is this static witness, not an execution
-        @test_broken trycatch_ok(ci60)
+        # differential through the typed exit as well
+        oc = Core.OpaqueClosure(UC.ir_to_ircode(ir))
+        @test oc(true) == 1
+        @test oc(false) == 1
     end
     # (b) irpasses "cfg_simplify with EnterNode + union-typed deletion
     # marker" shape (enter with a scope operand, unreachable catch return,
@@ -876,10 +886,11 @@ end
     # (c) irpasses "domsort with a non-domsorted :leave": the leave/return
     # blocks precede the EnterNode; the fallthrough from the body's leave
     # lands on the catch-destination statement (a block with both a normal
-    # and an exceptional in-edge). The entry converts and verifies, but the
-    # branch into the handler-island block is miscompiled by the lowered
-    # exit (F9): the true path must leave the try and return 1, not take
-    # the pre-enter exit's 2.
+    # and an exceptional in-edge). F9 (fixed): the island entry is the
+    # enter's continuation regardless of statement numbering, so the true
+    # path leaves the try and returns 1 instead of taking the pre-enter
+    # exit's 2; the shared catch dest moves out of the handler island (F10),
+    # which also lets the typed exit convert the shape.
     code78 = Any[
         Core.GotoNode(4),
         Expr(:leave, Core.SSAValue(4)),
@@ -892,25 +903,26 @@ end
     ]
     ir = UC.codeinfo_to_ir(mkci(code78, 2); nargs = 2, name = :row78)
     @test UnifiedIR.verify_ir(ir; level = 1)
-    # the typed exit declines the cross-island-into-handler goto (sound:
-    # driver falls back); the gap stays visible here
-    @test_throws UC.UnsupportedIR UC.ir_to_ircode(ir)
+    @test trycatch_ok(UC.ir_to_codeinfo(ir))
     if trycatch_ok(UC.ir_to_codeinfo(ir))
         g = UC.define_ir_method!(B3BDefs, gensym(:row78), 2, ir)
         @test Base.invokelatest(g, false) == 2
-        @test_broken Base.invokelatest(g, true) == 1   # F9: currently returns 2
-    else
-        @test_broken false   # emitted body not even inference-clean
+        @test Base.invokelatest(g, true) == 1
     end
+    # the typed exit converts the same shape (its former decline of the
+    # goto-into-handler-island fell away with the F10 reassignment)
+    oc = Core.OpaqueClosure(UC.ir_to_ircode(ir))
+    @test oc(true) == 1
+    @test oc(false) == 2
 end
 
 @testset "scope folding (current_scope through the pipeline)" begin
     # irpasses "Test correctness of current_scope folding": behavioral
     # `scope_folding() == 1` asserts stay stock-side (hook-on); the
     # compute_trycatch(::IRCode) legs die with ssair (the Vector{Any} form
-    # survives). The pipeline leg found F8: the LOWERED exit drops the
-    # EnterNode scope operand, so scoped regions execute without
-    # establishing their dynamic scope. The typed exit carries it.
+    # survives). The pipeline leg found F8 (fixed): the LOWERED exit
+    # dropped the EnterNode scope operand, running scoped regions without
+    # their dynamic scope; both exits now carry it.
     tir = UC.typed_ir(scope_folding_probe, Any[])
     @test UnifiedIR.verify_ir(tir; level = 1)
     irc = UC.ir_to_ircode(tir)
@@ -919,19 +931,21 @@ end
         st isa Core.EnterNode && isdefined(st, :scope)
     end >= 1
     ci = UC.ir_to_codeinfo(tir)
-    # F8 static witness: no scoped enter survives the lowered exit
-    @test_broken count(ci.code) do st
+    # F8 static witness: a scoped enter survives the lowered exit
+    @test count(ci.code) do st
         (st isa Core.EnterNode && isdefined(st, :scope)) ||
             (Meta.isexpr(st, :enter) && length(st.args) >= 2)
     end >= 1
-    # F8 behavioral witness: current_scope() observes the ambient scope
-    # instead of the enter's literal 1
+    # F8 behavioral witness: current_scope() observes the enter's literal 1
     g = UC.redefine_through_ir(scope_folding_probe, Tuple{})
-    @test_broken Base.invokelatest(g) === 1
-    # and the user-facing form: a ScopedValue read under @with comes back
-    # as the DEFAULT (the @with scope was silently dropped)
+    @test Base.invokelatest(g) === 1
+    # and the user-facing form: a ScopedValue read under @with sees the
+    # @with value, not the default
     g2 = UC.redefine_through_ir(with_read_53521, Tuple{Int})
-    @test_broken Base.invokelatest(g2, 42) == 42
+    @test Base.invokelatest(g2, 42) == 42
+    # nested scopes: the inner @with shadows and the outer is restored
+    g3 = UC.redefine_through_ir(nested_with_53521, Tuple{Int})
+    @test Base.invokelatest(g3, 7) == (8, 7) == nested_with_53521(7)
 end
 
 @testset "SROA affinity of the definedness check (#52857)" begin

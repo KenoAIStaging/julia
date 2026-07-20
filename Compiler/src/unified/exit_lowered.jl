@@ -88,7 +88,12 @@ function fixgotos!(cx::ExitCtx)
         if k === :goto
             cx.code[idx] = Core.GotoNode(tgt)
         elseif k === :enter
-            cx.code[idx] = Core.EnterNode(tgt)
+            # preserve the scope operand carried on the placeholder (F8: a
+            # rebuilt EnterNode without it runs @with/scoped-tryfinally
+            # bodies without establishing their dynamic scope)
+            en = cx.code[idx]::Core.EnterNode
+            cx.code[idx] = isdefined(en, :scope) ? Core.EnterNode(tgt, en.scope) :
+                                                   Core.EnterNode(tgt)
         else
             g = cx.code[idx]::Core.GotoIfNot
             cx.code[idx] = Core.GotoIfNot(g.cond, tgt)
@@ -437,7 +442,15 @@ function emit_try!(cx::ExitCtx, s::StmtId, loopctxs)
     catchkey = (:catch, s.id)
     joinkey = (:jointry, s.id)
     enteridx = length(cx.code) + 1
-    push!(cx.code, Core.EnterNode(0))
+    # the try op's operand 1, when present, is the dynamic-scope value (the
+    # entry converters store `EnterNode(catch, scope)` / scoped :tryfinally
+    # there and the typed exit re-emits it); thread it into the rebuilt
+    # EnterNode here too (F8)
+    if UnifiedIR.nops(ir, s) >= 1
+        push!(cx.code, Core.EnterNode(0, exit_value(cx, UnifiedIR.getop(ir, s, 1))))
+    else
+        push!(cx.code, Core.EnterNode(0))
+    end
     push!(cx.pending_gotos, (enteridx, :enter, catchkey))
     push!(cx.trystack, Core.SSAValue(enteridx))
     # body: result terminators leave the handler scope then store + jump

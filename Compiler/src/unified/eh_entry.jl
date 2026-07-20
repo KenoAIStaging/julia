@@ -102,16 +102,118 @@ function codeinfo_to_ir_eh(ci::Core.CodeInfo; nargs::Int, name::Symbol)
             blockof[i] = bi
         end
     end
+    # ---- island membership + entry order (F9/F10) ---------------------------
+    function is_node_ancestor_or_self(anc::Int, node::Int)
+        while true
+            node == anc && return true
+            node == 0 && return false
+            node = parent_node(node)
+        end
+    end
+    function normal_succs(bi::Int)
+        hi = bi < nblocks ? leaders[bi + 1] - 1 : n
+        st = code[hi]
+        if st isa Core.GotoNode
+            return Int[blockof[st.label]]
+        elseif st isa Core.GotoIfNot
+            return hi < n ? Int[blockof[st.dest], blockof[hi + 1]] : Int[blockof[st.dest]]
+        elseif st isa Core.ReturnNode
+            return Int[]
+        else
+            # an EnterNode falls through to its continuation (the edge to
+            # catch_dest is exceptional); anything else to the next leader
+            return hi < n ? Int[blockof[hi + 1]] : Int[]
+        end
+    end
+    function uses_the_exception(bi::Int)
+        found = false
+        function scan(@nospecialize(v))
+            found && return
+            v isa Expr || return
+            v.head === :the_exception && (found = true; return)
+            for a in v.args
+                scan(a)
+            end
+        end
+        hi = bi < nblocks ? leaders[bi + 1] - 1 : n
+        for i in leaders[bi]:hi
+            scan(code[i])
+        end
+        return found
+    end
+    # F10: a catch-scope block reachable through a NORMAL edge from outside
+    # the catch subtree (stock's shared catch-dest/join shapes) must not live
+    # in the handler island — the exit converters synthesize the
+    # :pop_exception actions on edges leaving that island, which would put a
+    # pop on the normal path too ("unbalanced try/catch", a segfault when
+    # invoked). Reassign such blocks to the handler pair's parent scope; the
+    # handler island reaches them through a sealed cross-island goto whose
+    # edge carries the pop (synthentry below).
+    blocknode = Int[node_of(leaders[bi]) for bi in 1:nblocks]
+    normal_preds = [Int[] for _ in 1:nblocks]
+    for pb in 1:nblocks, sb in normal_succs(pb)
+        push!(normal_preds[sb], pb)
+    end
+    let changed = true
+        while changed
+            changed = false
+            for bi in 1:nblocks
+                c = blocknode[bi]
+                c > H || continue
+                p = node_of(enter_of[c - H])
+                external = false
+                for pb in normal_preds[bi]
+                    is_node_ancestor_or_self(c, blocknode[pb]) && continue
+                    external = true
+                    # handler protection must not widen: every normal
+                    # predecessor has to sit inside the target scope's subtree
+                    is_node_ancestor_or_self(p, blocknode[pb]) ||
+                        throw(UnsupportedIR("catch-scope block normally reachable from an unrelated scope"))
+                end
+                external || continue
+                uses_the_exception(bi) &&
+                    throw(UnsupportedIR(":the_exception in a normally-reachable catch block"))
+                blocknode[bi] = p
+                changed = true
+            end
+        end
+    end
+    stmtnode(i::Int) = blocknode[blockof[i]]
     node_blocks = Dict{Int,Vector{Int}}()
     for bi in 1:nblocks
-        push!(get!(() -> Int[], node_blocks, node_of(leaders[bi])), bi)
+        push!(get!(() -> Int[], node_blocks, blocknode[bi]), bi)
+    end
+    # F9: the exit converters transfer control to an island's FIRST region,
+    # so each scope's true entry (the enter's continuation / the catch dest)
+    # must be hoisted over any earlier-numbered blocks (non-domsorted shapes
+    # otherwise execute a pre-enter exit block as the island entry).
+    function hoist_entry!(node::Int, entrybi::Int)
+        bs = node_blocks[node]
+        bs[1] == entrybi && return
+        entrybi in bs || throw(UnsupportedIR("island entry block outside its scope"))
+        filter!(!=(entrybi), bs)
+        pushfirst!(bs, entrybi)
+        return
+    end
+    needsynth = Set{Int}()   # catch nodes entered through a synthetic goto
+    for h in 1:H
+        if !isempty(get(node_blocks, h, Int[]))
+            enter_of[h] < n || throw(UnsupportedIR("EnterNode at the end of the body"))
+            hoist_entry!(h, blockof[enter_of[h] + 1])
+        end
+        destbi = blockof[catchdest_of[h]]
+        if blocknode[destbi] == H + h
+            hoist_entry!(H + h, destbi)
+        else
+            push!(needsynth, H + h)   # catch dest reassigned out (F10)
+        end
     end
 
     # ---- cross-scope SSA uses → demoted to cells ----------------------------
     demote = falses(n)
     function scan_ssa(i::Int, @nospecialize(v))
         if v isa Core.SSAValue
-            node_of(v.id) != node_of(i) && (demote[v.id] = true)
+            stmtnode(v.id) != stmtnode(i) && (demote[v.id] = true)
         elseif v isa Expr
             for a in v.args
                 scan_ssa(i, a)
@@ -154,12 +256,22 @@ function codeinfo_to_ir_eh(ci::Core.CodeInfo; nargs::Int, name::Symbol)
         demote[i] && (democell[i] = append_stmt!(b, K"cell", Any; type = Any))
     end
 
-    # pre-create every micro-block region (owners fixed at scope emission)
+    # pre-create every micro-block region (owners fixed at scope emission).
+    # Within one owner the region TABLE order is what the exit converters
+    # see (rs[1] is the island entry), so each node's blocks are created
+    # contiguously in island order — entry first (F9); a catch island whose
+    # dest was reassigned out gets a synthetic entry region first (F10)
     blockregions = Vector{RegionId}(undef, nblocks)
-    for bi in 1:nblocks
-        r = UnifiedIR.Region(UnifiedIR.REGION_BLOCK, NULL_STMT, NULL_REGION)
-        push!(b.ir.regions, r)
-        blockregions[bi] = RegionId(length(b.ir.regions))
+    synthentry = Dict{Int,RegionId}()
+    function newblockregion()
+        push!(b.ir.regions, UnifiedIR.Region(UnifiedIR.REGION_BLOCK, NULL_STMT, NULL_REGION))
+        return RegionId(length(b.ir.regions))
+    end
+    for node in 0:2H
+        node in needsynth && (synthentry[node] = newblockregion())
+        for bi in get(node_blocks, node, Int[])
+            blockregions[bi] = newblockregion()
+        end
     end
 
     ssamap = Vector{Any}(undef, n)
@@ -168,10 +280,11 @@ function codeinfo_to_ir_eh(ci::Core.CodeInfo; nargs::Int, name::Symbol)
 
     function convert_value(@nospecialize(v))::UnifiedIR.Operand
         if v isa Core.SSAValue
-            if demote[v.id] && node_of(v.id) != curnode[]
+            if demote[v.id] && stmtnode(v.id) != curnode[]
                 g = append_stmt!(b, K"cell_get", UnifiedIR.op_stmt(democell[v.id]); type = Any)
                 return UnifiedIR.op_stmt(g)
             end
+            isassigned(ssamap, v.id) || throw(UnsupportedIR("forward SSA reference"))
             o = ssamap[v.id]
             o isa UnifiedIR.Operand || throw(UnsupportedIR("forward SSA reference"))
             return o
@@ -201,13 +314,34 @@ function codeinfo_to_ir_eh(ci::Core.CodeInfo; nargs::Int, name::Symbol)
         return nothing
     end
 
-    goto_block!(bi::Int) =
+    function goto_block!(bi::Int)
+        # sealed cross-island gotos may only target an ancestor island
+        # (§5.5/§5.9) — anything else the exit converters cannot rebalance
+        is_node_ancestor_or_self(blocknode[bi], curnode[]) ||
+            throw(UnsupportedIR("goto into a non-ancestor handler island"))
         append_stmt!(b, K"goto", UnifiedIR.op_block(blockregions[bi]), UnifiedIR.op_inline(0))
+    end
 
     # emit one scope: a cfg op whose blocks are the scope's micro-blocks
     function emit_scope!(node::Int)
         bs = get(node_blocks, node, Int[])
         cfgop = append_stmt!(b, K"cfg"; type = Any)
+        sr = get(synthentry, node, nothing)
+        if sr !== nothing
+            # synthetic island entry: the catch dest lives in an ancestor
+            # island (F10) — enter the handler here and immediately leave
+            # through a sealed cross-island goto; the exit converters put
+            # the :pop_exception on that edge
+            reg = UnifiedIR.getregion(b.ir, sr)
+            reg.owner = cfgop
+            reg.parent = UnifiedIR.current_region(b)
+            reg.first = StmtId(Int(b.ir.body.len) + 1)
+            push!(b.open, sr)
+            curnode[] = node
+            goto_block!(blockof[catchdest_of[node - H]])
+            reg.last = StmtId(Int(b.ir.body.len))
+            pop!(b.open)
+        end
         for bi in bs
             rid = blockregions[bi]
             reg = UnifiedIR.getregion(b.ir, rid)
@@ -261,9 +395,13 @@ function codeinfo_to_ir_eh(ci::Core.CodeInfo; nargs::Int, name::Symbol)
             elseif st isa Core.GotoIfNot
                 cond = convert_value(st.cond)
                 fallbi = blockof[i + 1]
+                destbi = blockof[st.dest]
+                (is_node_ancestor_or_self(blocknode[fallbi], node) &&
+                 is_node_ancestor_or_self(blocknode[destbi], node)) ||
+                    throw(UnsupportedIR("br_if into a non-ancestor handler island"))
                 append_stmt!(b, K"br_if", cond,
                              UnifiedIR.op_block(blockregions[fallbi]), UnifiedIR.op_inline(0),
-                             UnifiedIR.op_block(blockregions[blockof[st.dest]]), UnifiedIR.op_inline(0))
+                             UnifiedIR.op_block(blockregions[destbi]), UnifiedIR.op_inline(0))
                 terminated = true
             elseif st isa Core.ReturnNode
                 if isdefined(st, :val)
