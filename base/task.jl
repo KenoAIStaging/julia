@@ -145,9 +145,13 @@ end
 
 # task states
 
-const task_state_runnable = UInt8(0)
-const task_state_done     = UInt8(1)
-const task_state_failed   = UInt8(2)
+const task_state_runnable  = UInt8(0)
+const task_state_done      = UInt8(1)
+const task_state_failed    = UInt8(2)
+# like _failed, but allows schedule to succeed
+const task_state_cancelled = UInt8(3)
+# like _failed, but the task was forcibly abandoned and may have leaked resources
+const task_state_abandoned = UInt8(4)
 
 @inline function getproperty(t::Task, field::Symbol)
     if field === :state
@@ -159,6 +163,10 @@ const task_state_failed   = UInt8(2)
             return :done
         elseif st === task_state_failed
             return :failed
+        elseif st === task_state_cancelled
+            return :cancelled
+        elseif st === task_state_abandoned
+            return :abandoned
         else
             @assert false "unexpected state"
         end
@@ -250,7 +258,10 @@ true
 !!! compat "Julia 1.3"
     This function requires at least Julia 1.3.
 """
-istaskfailed(t::Task) = ((@atomic :acquire t._state) === task_state_failed)
+function istaskfailed(t::Task)
+    state = (@atomic :acquire t._state)
+    return state === task_state_failed || state === task_state_cancelled || state === task_state_abandoned
+end
 
 Threads.threadid(t::Task) = Int(ccall(:jl_get_task_tid, Int16, (Any,), t)+1)
 function Threads.threadpool(t::Task)
@@ -302,14 +313,18 @@ function task_local_storage(body::Function, key, val)
 end
 
 # just wait for a task to be done, no error propagation
-function _wait(t::Task)
+function _wait(t::Task; expected_cancellation = nothing)
     t === current_task() && throw(ConcurrencyViolationError("deadlock detected: cannot wait on current task"))
     if !istaskdone(t)
         donenotify = t.donenotify::ThreadSynchronizer
         lock(donenotify)
         try
-            while !istaskdone(t)
-                wait(donenotify; waitee=t)
+            # N.B.: We use `pre_sleep_cancellation_request` here because we are
+            # about to sleep anyway, which permits us to ignore (and clear) any
+            # pending yield requests - only a real cancellation request may
+            # interrupt this wait.
+            while !istaskdone(t) && pre_sleep_cancellation_request() === expected_cancellation
+                wait(donenotify; waitee=t, expected_cancellation)
             end
         finally
             unlock(donenotify)
@@ -364,6 +379,29 @@ Throws a `ConcurrencyViolationError` if `t` is the currently running task, to pr
 """
 function wait(t::Task; throw=true)
     _wait(t)
+    cr = cancellation_request_or_yield()
+    if cr !== nothing
+        propagate_cancellation!(t, cr)
+    end
+    if throw && istaskfailed(t)
+        Core.throw(TaskFailedException(t))
+    end
+    nothing
+end
+
+"""
+    wait_nocancel(t::Task)
+
+Like `wait`, but do not propagate cancellation of this task to the waited-on task.
+"""
+function wait_nocancel(t::Task; throw=true)
+    _wait(t)
+    if !istaskdone(t)
+        # The wait was interrupted by a cancellation request against us. We do
+        # not propagate it to `t`, but we must not pretend the wait finished.
+        cr = cancellation_request()
+        cr === nothing || Core.throw(cr)
+    end
     if throw && istaskfailed(t)
         Core.throw(TaskFailedException(t))
     end
@@ -598,6 +636,10 @@ function sync_end(c::Channel{Any})
         r = take!(c)
         if isa(r, Task)
             _wait(r)
+            cr = cancellation_request_or_yield()
+            if cr !== nothing
+                return sync_cancel!(c, r, cr, @isdefined(c_ex) ? c_ex : CompositeException())
+            end
             if istaskfailed(r)
                 if !@isdefined(c_ex)
                     c_ex = CompositeException()
@@ -969,8 +1011,21 @@ const Workqueue = Workqueues[1] # default work queue is thread 1 // TODO: deprec
 workqueue_for(tid::Int) = Workqueues[tid]
 
 function enq_work(t::Task)
-    (t._state === task_state_runnable && t.queue === nothing) || error("schedule: Task not runnable")
+    state = t._state
+    if state === task_state_cancelled
+        # When cancelled, we allow `enq_work`, but simply transition to failed state.
+        # All other task cleanup is already done.
+        state = (@atomicreplace t._state task_state_cancelled => task_state_failed).old
+        # Catch double `schedule` calls on cancelled tasks.
+        state === task_state_cancelled && return
+    end
+    if !(state === task_state_runnable && t.queue === nothing)
+        error("schedule: Task not runnable")
+    end
+    _enq_work(t)
+end
 
+function _enq_work(t::Task)
     # Sticky tasks go into their thread's work queue.
     if t.sticky
         tid = Threads.threadid(t)
@@ -1076,25 +1131,27 @@ true
 """
 function schedule(t::Task, @nospecialize(arg); error=false)
     # schedule a task to be (re)started with the given value or exception
-    t._state === task_state_runnable || Base.error("schedule: Task not runnable")
-    if error
-        # If `t` is registered on a wait queue, claim its wake so that a
-        # concurrent or later `notify` skips its registration (the entry
-        # itself stays linked; the resumed task's wait cleanup unlinks it).
-        @atomicswap t.waiting_on = nothing
-        # A parked task is never in a workqueue and wait registrations do not
-        # go through `t.queue`, so any queue here is a sticky workqueue.
-        q = t.queue
-        q === nothing || list_deletefirst!(q::StickyWorkqueue, t)
-        setfield!(t, :result, arg)
-        setfield!(t, :_isexception, true)
-    else
-        t.queue === nothing || Base.error("schedule: Task not runnable")
-        setfield!(t, :result, arg)
+    state = t._state
+    if state === task_state_runnable
+        if error
+            # If `t` is registered on a wait queue, claim its wake so that a
+            # concurrent or later `notify` skips its registration (the entry
+            # itself stays linked; the resumed task's wait cleanup unlinks it).
+            @atomicswap t.waiting_on = nothing
+            # A parked task is never in a workqueue and wait registrations do not
+            # go through `t.queue`, so any queue here is a sticky workqueue.
+            q = t.queue
+            q === nothing || list_deletefirst!(q::StickyWorkqueue, t)
+            setfield!(t, :result, arg)
+            setfield!(t, :_isexception, true)
+        else
+            t.queue === nothing || Base.error("schedule: Task not runnable")
+            setfield!(t, :result, arg)
+        end
     end
-    # [task] created -scheduled-> wait_time
-    maybe_record_enqueued!(t)
-    enq_work(t)
+    # `enq_work` handles the cancelled-state transition (and rejects the
+    # remaining non-runnable states).
+    schedule(t)
     return t
 end
 
@@ -1154,7 +1211,11 @@ function yieldto(t::Task, @nospecialize(x=nothing))
     # state error instead.
     if t._state === task_state_done
         return x
-    elseif t._state === task_state_failed
+    elseif t._state === task_state_failed || t._state === task_state_abandoned
+        throw(t.result)
+    elseif t._state === task_state_cancelled
+        # Cancelled tasks are allowed to be scheduled (transition to failed)
+        # but not directly yielded to
         throw(t.result)
     end
     # [task] user_time -yield-> wait_time
@@ -1334,4 +1395,278 @@ function maybe_record_enqueued!(t::Task)
         @atomic :monotonic t.first_enqueued_at = time_ns()
     end
     return t
+end
+
+## Cancellation of tasks (request delivery)
+
+function showerror(io::IO, cr::CancellationRequest)
+    print(io, "CancellationRequest: ")
+    if cr === CANCEL_REQUEST_SAFE
+        print(io, "Safe Cancellation (CANCEL_REQUEST_SAFE)")
+    elseif cr === CANCEL_REQUEST_ACK
+        print(io, "Cancellation Acknowledged (CANCEL_REQUEST_ACK)")
+    elseif cr === CANCEL_REQUEST_QUERY
+        print(io, "Cancellation Status Query (CANCEL_REQUEST_QUERY)")
+    else
+        print(io, "Unknown ($(cr.request))")
+    end
+end
+
+function conform_cancellation_request(@nospecialize(cr))
+    if isa(cr, UInt8)
+        return CancellationRequest(cr)
+    end
+    return cr
+end
+
+# This is the slow path of @cancel_check for per-task requests (the token
+# flavor dispatches to `handle_cancellation!(::CancellationTokenSource, st)`).
+@noinline function handle_cancellation!(@nospecialize(_req))
+    req = conform_cancellation_request(_req)
+    if req === CANCEL_REQUEST_YIELD
+        @atomicreplace :sequentially_consistent :monotonic current_task().cancellation_request _req => nothing
+        yield()
+        req = cancellation_request()
+    end
+    req === nothing && return
+    throw(req)
+end
+
+function cancellation_request_raw()
+    ct = current_task()
+    req = @atomic :monotonic ct.cancellation_request
+    req === nothing && return req
+    req = @atomic :acquire ct.cancellation_request
+    return req
+end
+
+"""
+    cancellation_request()
+
+Returns the cancellation request for the current task or `nothing` if no
+cancellation has been requested. If a cancellation request is present, it is
+loaded with acquire semantics.
+"""
+function cancellation_request()
+    cr = cancellation_request_raw()
+    return conform_cancellation_request(cr)
+end
+
+"""
+    cancellation_request_or_yield()
+
+Like [`cancellation_request`](@ref), but specifically handles CANCEL_REQUEST_YIELD
+by calling yield internally and re-checking for cancellation requests.
+"""
+function cancellation_request_or_yield()
+    while true
+        _cr = cancellation_request_raw()
+        cr = conform_cancellation_request(_cr)
+        cr !== CANCEL_REQUEST_YIELD && return cr
+        @atomicreplace :sequentially_consistent :monotonic current_task().cancellation_request _cr => nothing
+        yield()
+    end
+end
+
+"""
+    pre_sleep_cancellation_request()
+
+Like [`cancellation_request_or_yield`](@ref), but indicates the caller is about to sleep,
+so yield requests can be ignored. Additionally, contains necessary synchronization to
+ensure that either the cancellation request is visible, or that any potential
+cancellation task will see the wait registration established by the caller.
+
+Precondition: The caller must have armed a wait registration in
+`current_task().waiting_on`.
+"""
+function pre_sleep_cancellation_request()
+    # Synchronize with atomic_fence_heavy in cancel!
+    Threads.atomic_fence_light()
+
+    while true
+        _cr = cancellation_request_raw()
+        cr = conform_cancellation_request(_cr)
+        cr !== CANCEL_REQUEST_YIELD && return cr
+        @atomicreplace :sequentially_consistent :monotonic current_task().cancellation_request _cr => nothing
+        # The caller is about to sleep, so we are permitted to ignore the yield request.
+    end
+end
+
+"""
+    Core.cancellation_point!()
+
+Like [`cancellation_request`](@ref), but additionally gives the optimizer license
+to establish this point as a cancellation reset point. If safe to do, the runtime
+will attempt to unwind execution to the nearest preceeding cancellation point
+when a cancellation is requested.
+"""
+Core.cancellation_point!
+
+function cancel!(t::Task, crequest=CANCEL_REQUEST_SAFE)
+    # TODO: Raise task priority
+    @atomic :release t.cancellation_request = crequest
+    Threads.atomic_fence_heavy()
+    # Special case: If the task hasn't started yet at this point, we want to set
+    # it up to cancel any waits, but we need to be a bit careful with concurrent
+    # starts of the task.
+    if !istaskstarted(t)
+        t.result = crequest
+        t._isexception = true
+        if (@atomicreplace :sequentially_consistent :monotonic t._state task_state_runnable => task_state_cancelled).success
+            lock(t.donenotify)
+            notify(t.donenotify)
+            unlock(t.donenotify)
+        end
+        return
+    end
+    # Try to interrupt the task. The fence above synchronizes with the
+    # pre-sleep check that runs after a wait registration is armed
+    # (`pre_sleep_cancellation_request`) and guarantees that either:
+    # 1. We observe the armed registration in t.waiting_on, or
+    # 2. The task's pre-sleep check observes our request and withdraws the
+    #    wait itself before sleeping.
+    # Note that both may be true, in which case the task withdraws its
+    # registration and our wake claim below fails harmlessly.
+    #
+    # Claiming the wake follows the WaitEntry protocol: an expected-value CAS
+    # against t.waiting_on, exactly like `notify` (see condition.jl). The
+    # claimed entry stays linked in its wait queue and is unlinked lazily by
+    # the resumed task's wait cleanup or dropped by a later `notify`.
+    #
+    # If there is no armed registration, either
+    # 1. The task is suspended, but not through the wait-registration
+    #    protocol (e.g. it is runnable in a workqueue), or
+    # 2. The task is running.
+    # For a runnable task we leave the request pending (it is observed in
+    # start_task and at cancellation points); for a running task we send the
+    # cancellation signal, which interrupts it if a reset point is
+    # established.
+    if !istaskdone(t)
+        w = @atomic :acquire t.waiting_on
+        # Read the waitee before claiming: while `t` stays parked its entry
+        # can only go from the recorded waitee to `nothing` (a concurrent
+        # `notify` popping it), never to a different waitee, so a successful
+        # claim below makes this read authoritative for the wait we claimed.
+        wq = w isa WaitEntry ? w.queue : nothing
+        if w isa WaitEntry && wq !== nothing && claim_wait(t, w)
+            if wq isa Task
+                # A task-wait is interrupted with a benign wake, leaving the
+                # request pending: the resumed `_wait` loop observes it and
+                # the caller delivers it in context (`wait(t)` forwards the
+                # cancellation into the waited-on task; `sync_end` cancels
+                # and collects its children). The claimed entry stays linked
+                # and is dropped lazily by the waitee's completion notify.
+                schedule(t, nothing)
+            else
+                # The request is being delivered to the task as an exception.
+                schedule(t, conform_cancellation_request(crequest), error=true)
+            end
+        else
+            q = t.queue
+            runnable = q isa StickyWorkqueue && @lock q.lock (t in q.queue)
+            if !runnable
+                tid = Threads.threadid(t)
+                if tid != 0
+                    ccall(:jl_send_cancellation_signal, Cvoid, (Int16,), (tid - 1) % Int16)
+                end
+            end
+        end
+    end
+    if t.sticky
+        # If this task is sticky, it won't be able to run if the task currently
+        # running on its thread is blocking. Use the cancellation mechanism to
+        # try and pre-empt that task.
+        # N.B.: This is a best-effort attempt; the task we end up with may get
+        # descheduled before we get around to cancelling it. However, that's
+        # fine - it's not a correctness issue to deschedule the task. The
+        # important thing is that the thread re-enter the scheduler to pick up
+        # our cancelled task.
+        # In the future, we may want to use the same mechanism for more general
+        # pre-emption, but this helps avoid situations where tasks that have
+        # cancellation points, but no yield points become uncancellable.
+        tid = Threads.threadid(t)
+        if tid != 0
+            ccall(:jl_preempt_thread_task, Cvoid, (Int16,), (tid - 1) % Int16)
+        end
+    end
+end
+
+"""
+    Base.reset_cancellation!()
+
+Resets the cancellation status of the current task.
+This should only be used from the root task after normal operation has been
+resumed (e.g. by returning control to the user).
+"""
+function reset_cancellation!()
+    ct = current_task()
+    @assert ct === roottask
+    @atomic :release ct.cancellation_request = nothing
+end
+
+"""
+    unsafe_abandon!(t::Task, next_task::Task)
+
+Forcibly abandon task `t` and switch it to `next_task`. This sends a signal to
+the thread running `t` that causes it to:
+1. Set its state to `abandoned`
+2. Clean up its stack and exception handlers
+3. Switch to `next_task`
+
+This is used to implement `CANCEL_REQUEST_ABANDON_ALL` where a task needs to be
+frozen without waiting for it to reach a safe cancellation point.
+
+!!! warning
+    This is a dangerous operation. The abandoned task may have acquired locks or
+    other resources that will be leaked, potentially causing deadlocks in future code.
+    It should only be used as a last-resort method to recover a system when tasks
+    are unable to process cancellation.
+
+!!! note
+    This function only works on Unix-like systems. On Windows, it is a no-op.
+    The task must be currently running on a thread for this to have effect.
+"""
+function unsafe_abandon!(t::Task, next_task::Task)
+    ccall(:jl_abandon_task, Cvoid, (Any, Any), t, next_task)
+    return nothing
+end
+
+function propagate_cancellation!(t::Task, crequest)
+    if crequest != CANCEL_REQUEST_SAFE
+        error("Not yet supported")
+    end
+    cancel!(t, crequest)
+    _wait(t; expected_cancellation=crequest)
+end
+
+@noinline function sync_cancel!(c::Channel{Any}, t::Task, @nospecialize(cr), c_ex::CompositeException)
+    if cr !== CANCEL_REQUEST_SAFE
+        error("Not yet supported")
+    end
+    waitees = Any[t]
+    cancel!(t, cr)
+    while isready(c)
+        r = take!(c)
+        isa(r, Task) && cancel!(r, cr)
+        push!(waitees, r)
+    end
+    close(c)
+    for r in waitees
+        if isa(r, Task)
+            _wait(r; expected_cancellation=cr)
+            if istaskfailed(r)
+                push!(c_ex, TaskFailedException(r))
+            end
+        else
+            try
+                wait(r)
+            catch e
+                push!(c_ex, e)
+            end
+        end
+    end
+    if !isempty(c_ex)
+        throw(c_ex)
+    end
+    return nothing
 end

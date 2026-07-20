@@ -77,6 +77,28 @@ should be tried first.
 const CANCEL_REQUEST_SAFE = CancellationRequest(0x0)
 
 """
+    CANCEL_REQUEST_ACK
+
+Set by the task itself to indicate that a (safe) cancellation request was
+received and acknowledged, but that there are dependent tasks for whom
+cancelation is still pending.
+"""
+const CANCEL_REQUEST_ACK = CancellationRequest(0x1)
+
+"""
+    CANCEL_REQUEST_QUERY
+
+Request that the system create an asynchronous report of why the task is currently
+not able to be canceled. The report will be provided in the ->cancelation_request
+field of the current task (as long as this field is still CANCEL_REQUEST_QUERY).
+
+N.B.: Transition to CANCEL_REQUEST_QUERY is only allowed from CANCEL_REQUEST_ACK.
+      Once the waiting task has read the cancelation report, it may set the cancelation
+      request back to CANCEL_REQUEST_ACK.
+"""
+const CANCEL_REQUEST_QUERY = CancellationRequest(0x2)
+
+"""
     CANCEL_REQUEST_ABANDON_EXTERNAL
 
 Request a cancellation that will cease waiting for any external resources
@@ -105,6 +127,16 @@ frozen in place and never scheduled again.
     computationally-heavy code).
 """
 const CANCEL_REQUEST_ABANDON_ALL = CancellationRequest(0x4)
+
+"""
+    CANCEL_REQUEST_YIELD
+
+Request that the task yield to the scheduler at the next cancellation point to
+allow another task to run its cancellation propagation logic. The cancelled task
+itself will reset to ordinary operation before yielding, but may of course be
+canceled by said other task before it resumes operation.
+"""
+const CANCEL_REQUEST_YIELD = CancellationRequest(0x5)
 
 # The state byte of a cancelled source is (STATE_CANCELLED_BIT | severity).
 # The 0x40 bit is reserved (status bytes of compiled cancellation points use
@@ -343,7 +375,15 @@ macro cancel_check()
         # concurrent stop-the-world (compiled cancellation points will emit
         # one as well)
         ccall(:jl_gc_safepoint, Cvoid, ())
+        # the scoped cancellation token ...
         checkcancel(default_cancel_source())
+        # ... and per-task requests (delivered through
+        # `Task.cancellation_request`, see `Base.cancel!(::Task)`). The
+        # builtin must come LAST: it establishes the reset point, and any
+        # non-reset-safe call sequenced after it would force the lowering
+        # pass to clear the just-published reset context again.
+        local req = Core.cancellation_point!()
+        req !== nothing && handle_cancellation!(req)
         nothing
     end
 end
@@ -353,6 +393,9 @@ macro cancel_check(tok)
         local t = $(esc(tok))
         ccall(:jl_gc_safepoint, Cvoid, ())
         checkcancel(t === nothing ? nothing : (t::CancellationToken).source)
+        # see above: the reset-point-establishing builtin must come last
+        local req = Core.cancellation_point!()
+        req !== nothing && handle_cancellation!(req)
         nothing
     end
 end

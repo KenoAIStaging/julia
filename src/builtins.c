@@ -2575,6 +2575,16 @@ JL_CALLABLE(jl_f__equiv_typedef)
 static void (*runtime_fp[num_intrinsics])(void);
 static unsigned intrinsic_nargs[num_intrinsics];
 
+JL_CALLABLE(jl_f_cancellation_point)
+{
+    JL_NARGS(cancellation_point, 0, 0);
+    jl_task_t *ct = jl_current_task;
+    jl_value_t *cr = jl_atomic_load_relaxed(&ct->cancellation_request);
+    if (cr == NULL || cr == jl_nothing)
+        return jl_nothing;
+    return jl_atomic_load_acquire(&ct->cancellation_request);
+}
+
 JL_CALLABLE(jl_f_intrinsic_call)
 {
     enum intrinsic f = (enum intrinsic)*(uint32_t*)jl_data_ptr(F);

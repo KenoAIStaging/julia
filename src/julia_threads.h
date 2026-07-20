@@ -164,6 +164,8 @@ typedef struct _jl_tls_states_t {
     struct _jl_task_t *next_task;
     struct _jl_task_t *previous_task;
     struct _jl_task_t *root_task;
+    // Target task for task abandonment (set before sending abandon signal)
+    struct _jl_task_t *abandon_to;
     struct _jl_timing_block_t *timing_stack;
     // This is the location of our copy_stack
     void *stackbase;
@@ -359,6 +361,9 @@ typedef struct _jl_task_t {
     // A `Base.WaitEntry` cached for reuse across parks (or `nothing`), so the
     // common single-registration park does not allocate. Owned by this task.
     jl_value_t *cached_wait_entry;
+    // Cancellation request - can be an arbitary julia value, but the runtime recognizes
+    // CANCEL_REQUEST_ enum values.
+    _Atomic(jl_value_t *) cancellation_request;
 
 // hidden state:
 
@@ -388,6 +393,9 @@ typedef struct _jl_task_t {
     jl_handler_t *eh;
     // saved thread state
     jl_ucontext_t ctx; // pointer into stkbuf, if suspended
+    // current reset point for cancellation. Technically, we only need volatile
+    // here, but _Atomic makes the intent clearer.
+    volatile _jl_ucontext_t *reset_ctx;
 } jl_task_t;
 
 JL_DLLEXPORT void *jl_get_ptls_states(void);

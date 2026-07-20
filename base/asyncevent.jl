@@ -200,7 +200,9 @@ function _trywait(t::Union{Timer, AsyncCondition})
 end
 
 function wait(t::Union{Timer, AsyncCondition})
-    _trywait(t) || throw(EOFError())
+    ok = _trywait(t)
+    @cancel_check
+    ok || throw(EOFError())
     nothing
 end
 

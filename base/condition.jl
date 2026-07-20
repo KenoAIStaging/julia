@@ -219,10 +219,31 @@ Wait for [`notify`](@ref) on `c` and return the `val` parameter passed to `notif
 If the keyword `first` is set to `true`, the waiter will be put _first_
 in line to wake up on `notify`. Otherwise, `wait` has first-in-first-out (FIFO) behavior.
 """
-function wait(c::GenericCondition; first::Bool=false, waitee=c.waitq)
+function wait(c::GenericCondition; first::Bool=false, waitee=c.waitq,
+              expected_cancellation=nothing)
     ct = current_task()
     assert_havelock(c)
     w = _wait2(c, ct, first; waitee)
+    # We are about to sleep, which permits us to ignore (and clear) pending
+    # yield-type requests - but a real cancellation request must interrupt
+    # the wait before we commit to sleeping. The fence inside pairs with the
+    # heavy fence in `cancel!`: either we observe the request here, or the
+    # canceller observes our armed registration and claims the wake.
+    cr = pre_sleep_cancellation_request()
+    if cr !== expected_cancellation
+        # Withdraw the registration we just armed (with the waitee lock held,
+        # exactly as a normal return would).
+        @atomicreplace ct.waiting_on w => nothing
+        list_deletefirst!(ILLRef(c.waitq, waitee), w)
+        if waitee isa Task
+            # A pending request does not abort a task-wait: return benignly
+            # and let the caller (`wait(t::Task)`, `sync_end`) deliver the
+            # request in context.
+            return nothing
+        end
+        # We are delivering the request to ourselves as an exception.
+        throw(cr)
+    end
     token = unlockall(c.lock)
     ret = try
         wait()
