@@ -907,36 +907,68 @@ function union_split_calls!(ir::UnifiedIR.IR, state::UInferState;
         args = Any[stmt_lattice(ir, UnifiedIR.getop(ir, s, i)) for i in 1:nop]
         f = CC.singleton_type(args[1])
         f === nothing && args[1] isa CC.Const && (f = args[1].val)
-        (f === nothing || f isa Core.Builtin || f isa Core.IntrinsicFunction) && continue
-        ft = f isa Type ? Type{f} : typeof(f)
+        f === nothing && continue
+        f === SPARAM_READ_MARKER && continue   # pseudo-call, not a dispatch site
         argts = Any[CC.widenconst(a) for a in args[2:end]]
         any(t -> t === Union{}, argts) && continue
-        # already statically resolvable: plain inlining handles it
-        resolve_single_match(state, Tuple{ft, argts...}) !== nothing && continue
-        # find a splittable argument: SSA (non-cell_get) Union with one
-        # applicable method per component
         j = 0
         comps = Any[]
-        for i in 2:nop
-            t = argts[i - 1]
-            t isa Union || continue
-            o = UnifiedIR.getop(ir, s, i)
+        if f isa Core.Builtin || f isa Core.IntrinsicFunction
+            # modify-op family only: split the Union-typed VALUE argument so
+            # each arm's op signature resolves to a single match and
+            # devirtualize_modifyops! marks both arms (stock's wrapper
+            # union-split shape — two Expr(:invoke_modify) sites)
+            f === Core.modifyfield! || continue
+            pos = modifyop_positions(f)
+            pos === nothing && continue
+            (minargs, maxargs, op_argi, v_argi) = pos
+            (minargs <= nop <= maxargs) || continue
+            vt = argts[v_argi - 1]
+            vt isa Union || continue
+            o = UnifiedIR.getop(ir, s, v_argi)
             UnifiedIR.optag(o) == UnifiedIR.TAG_STMT || continue
             UnifiedIR.stmt_kind(ir, UnifiedIR.asstmt(o)) === K"cell_get" && continue
-            cs = Base.uniontypes(t)
+            TFw = try
+                CC.widenconst(CC.getfield_tfunc(CC.fallback_lattice, args[2], args[3]))
+            catch
+                continue
+            end
+            opft = CC.widenconst(args[op_argi])
+            (opft isa Type && TFw isa Type && TFw !== Union{} &&
+             !CC.has_free_typevars(TFw) && !CC.has_free_typevars(opft)) || continue
+            cs = Base.uniontypes(vt)
             2 <= length(cs) <= params.max_union_split || continue
-            all(c -> resolve_single_match(state, Tuple{ft, argts[1:i-2]..., c,
-                                                       argts[i:end]...}) !== nothing, cs) || continue
-            j = i
+            all(c -> resolve_single_match(state, Tuple{opft, TFw, c}) !== nothing,
+                cs) || continue
+            j = v_argi
             comps = cs
-            break
-        end
-        if j == 0
-            # no splittable Union argument: try the match-based split
-            # (abstract callsites — stock's union-split devirtualization
-            # with the method-error fallback edge)
-            match_split_call!(ir, s, state, ft, argts) && (nsplit += 1)
-            continue
+        else
+            ft = f isa Type ? Type{f} : typeof(f)
+            # already statically resolvable: plain inlining handles it
+            resolve_single_match(state, Tuple{ft, argts...}) !== nothing && continue
+            # find a splittable argument: SSA (non-cell_get) Union with one
+            # applicable method per component
+            for i in 2:nop
+                t = argts[i - 1]
+                t isa Union || continue
+                o = UnifiedIR.getop(ir, s, i)
+                UnifiedIR.optag(o) == UnifiedIR.TAG_STMT || continue
+                UnifiedIR.stmt_kind(ir, UnifiedIR.asstmt(o)) === K"cell_get" && continue
+                cs = Base.uniontypes(t)
+                2 <= length(cs) <= params.max_union_split || continue
+                all(c -> resolve_single_match(state, Tuple{ft, argts[1:i-2]..., c,
+                                                           argts[i:end]...}) !== nothing, cs) || continue
+                j = i
+                comps = cs
+                break
+            end
+            if j == 0
+                # no splittable Union argument: try the match-based split
+                # (abstract callsites — stock's union-split devirtualization
+                # with the method-error fallback edge)
+                match_split_call!(ir, s, state, ft, argts) && (nsplit += 1)
+                continue
+            end
         end
         xop = UnifiedIR.getop(ir, s, j)
         T1 = comps[1]
