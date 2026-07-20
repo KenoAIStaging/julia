@@ -1324,6 +1324,12 @@ function infer_call(fr::Frame, args::Vector{Any}; sid::Int32 = Int32(0))::UResul
     if f === nothing && ftl isa CC.Const
         f = ftl.val
     end
+    if f === SPARAM_READ_MARKER && length(args) == 2
+        # statement-position static-parameter read (entry marker): the value
+        # is the parameter's lattice element; the maybe-undef UndefVarError
+        # arrives through the operand-effects channel (note_effects!)
+        return UResult(args[2], CC.EFFECTS_TOTAL, Union{})
+    end
     if f isa Core.Builtin
         if f === Core._apply_iterate
             return infer_apply(fr, args; sid)

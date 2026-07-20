@@ -1226,6 +1226,13 @@ function assemble_ircode(cx::TCtx, ir::UnifiedIR.IR, argmap::Dict{Int32,Int}, ro
                                      Core.SSAValue((h::SynthGlobal).ssaidx)
         end
         if k === K"call"
+            if n == 2 && ops[1] isa QuoteNode &&
+               (ops[1]::QuoteNode).value === SPARAM_READ_MARKER
+                # statement-position static-parameter read: the raw
+                # Expr(:static_parameter, i) (or the spliced-in value)
+                # stands alone as its own effectful statement (issue45490)
+                return ops[2]
+            end
             if modmap !== nothing
                 tgt = get(modmap::Dict{Int32,Any}, s.id, nothing)
                 # stock's handle_modifyop!_call! shape: the resolved op target

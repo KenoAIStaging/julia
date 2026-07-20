@@ -553,7 +553,11 @@ function codeinfo_to_ir_eh(ci::Core.CodeInfo; nargs::Int, name::Symbol)
         elseif h === :boundscheck
             record!(i, UnifiedIR.op_stmt(append_stmt!(b, K"boundscheck"; type = Bool)))
         elseif h === :static_parameter
-            ssamap[i] = UnifiedIR.op_sparam(st.args[1]::Int)
+            # statement-carried read (see codeinfo_entry's SPARAM_READ_MARKER)
+            s = append_stmt!(b, K"call",
+                             UnifiedIR.vop(b.ir, SPARAM_READ_MARKER),
+                             UnifiedIR.op_sparam(st.args[1]::Int); type = Any)
+            ssamap[i] = UnifiedIR.op_stmt(s)
         elseif h === :meta || h === :inbounds || h === :loopinfo || h === :aliasscope ||
                h === :popaliasscope || h === :inline || h === :noinline || h === :purity
             ssamap[i] = UnifiedIR.vop(b.ir, nothing)

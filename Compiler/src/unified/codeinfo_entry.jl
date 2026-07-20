@@ -14,6 +14,12 @@ Base.showerror(io::IO, e::UnsupportedIR) = print(io, "UnsupportedIR: ", e.what)
 cglobal lowering, rt Ptr{Cvoid}) encoded on the K\"foreigncall\" kind."
 const FOREIGNGLOBAL_MARKER = Symbol("unified.foreignglobal")
 
+"First-operand marker for a statement-position `Expr(:static_parameter, n)`
+read carried as a K\"call\" (operand 2 = the sparam). The read of a
+maybe-undefined parameter throws UndefVarError, so it must survive as a
+statement (issue45490); the exits re-emit the raw form."
+const SPARAM_READ_MARKER = Symbol("unified.sparam_read")
+
 # ---------------------------------------------------------------------------
 # Statement-level ssaflags carriage (A5/E3)
 # ---------------------------------------------------------------------------
@@ -333,7 +339,13 @@ function codeinfo_to_ir(ci::Core.CodeInfo; nargs::Int, name::Symbol = :f)
             s = append_stmt!(b, K"boundscheck"; type = Bool)
             ssamap[i] = UnifiedIR.op_stmt(s)
         elseif h === :static_parameter
-            ssamap[i] = UnifiedIR.op_sparam(st.args[1]::Int)
+            # a real statement (marker call), not an operand alias: the read
+            # of a maybe-undefined parameter throws UndefVarError at exactly
+            # this position and must not disappear (issue45490)
+            s = append_stmt!(b, K"call",
+                             UnifiedIR.vop(b.ir, SPARAM_READ_MARKER),
+                             UnifiedIR.op_sparam(st.args[1]::Int); type = Any)
+            ssamap[i] = UnifiedIR.op_stmt(s)
         elseif h === :meta || h === :inbounds || h === :loopinfo || h === :aliasscope ||
                h === :popaliasscope || h === :inline || h === :noinline || h === :purity
             ssamap[i] = UnifiedIR.vop(b.ir, nothing)  # carried as flags/columns later

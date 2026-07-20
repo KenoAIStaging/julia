@@ -349,7 +349,14 @@ function emit_stmt!(cx::ExitCtx, s::StmtId, k::UnifiedIR.Kind, loopctxs)
         idx = UnifiedIR.imm_value(UnifiedIR.getop(ir, s, 2))::Int64
         cx.ssaof[s.id] = emitstmt!(cx, Expr(:call, GlobalRef(Core, :getfield), v, Int(idx)))
     elseif k === K"call"
-        cx.ssaof[s.id] = emitstmt!(cx, Expr(:call, exit_values(cx, s, 1)...))
+        vals = exit_values(cx, s, 1)
+        if length(vals) == 2 && vals[1] isa QuoteNode &&
+           (vals[1]::QuoteNode).value === SPARAM_READ_MARKER
+            # statement-carried static-parameter read (see codeinfo_entry)
+            cx.ssaof[s.id] = emitstmt!(cx, vals[2])
+        else
+            cx.ssaof[s.id] = emitstmt!(cx, Expr(:call, vals...))
+        end
     elseif k === K"invoke"
         cx.ssaof[s.id] = emitstmt!(cx, Expr(:invoke, exit_values(cx, s, 1)...))
     elseif k === K"new"
