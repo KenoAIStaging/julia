@@ -808,7 +808,10 @@ function svecify_apply_args!(ir::UnifiedIR.IR)
             n += 1
         end
     end
-    n > 0 && UnifiedIR.dce!(ir)   # the replaced tuple ctors are usually dead now
+    # NB: no DCE here — the pipeline tail runs in the editable layout
+    # (dce! is dense-only; calling it made every rewritten body error into
+    # the stock fallback). The replaced tuple ctors stay as dead statements;
+    # they are effect-free calls codegen ignores.
     return n
 end
 
