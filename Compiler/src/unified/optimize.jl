@@ -167,8 +167,15 @@ chain. Skips identity-bearing constants.
 """
 function materialize_consts!(ir::UnifiedIR.IR)
     n = 0
-    foldable = UnifiedIR.FLAG_CONSISTENT | UnifiedIR.FLAG_EFFECT_FREE |
-               UnifiedIR.FLAG_NOTHROW | UnifiedIR.FLAG_TERMINATES
+    # stock's is_removable_if_unused mask (IR_FLAGS_REMOVABLE): a Const-typed
+    # statement's uses may be forwarded on lattice soundness alone (any
+    # completed value is egal to the Const), and the statement itself deleted
+    # when it is effect-free, nothrow and terminating — :consistent-cy is an
+    # egality contract for FRESH mutable values across executions, which the
+    # identity-bearing-constant check below already excludes (e.g. an invoke
+    # of a `(!c,+e,+n)` callee returning `nothing` must still fold away,
+    # the broadcast_noescape corpus shape)
+    foldable = UnifiedIR.FLAG_REMOVABLE
     for s in UnifiedIR.each_stmt(ir)
         k = UnifiedIR.stmt_kind(ir, s)
         UnifiedIR.result_arity(k) == 1 || continue
