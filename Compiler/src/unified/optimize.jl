@@ -490,6 +490,129 @@ function forward_extracts!(ir::UnifiedIR.IR)
 end
 
 """
+    lift_keyvalue_gets!(ir) -> Int
+
+The stock `lift_keyvalue_get!` port (Core.OptimizedGenerics.KeyValue
+protocol, the PersistentDict corpus): a `KeyValue.get(collection, key)`
+whose collection chain walks through `KeyValue.set` calls resolves to the
+value stored under an egal key — the get becomes `new Wrapper(val)` (the
+`Some{V}` extracted from the get's `Union{Nothing, Wrapper}` return type).
+Chains walk through refines, non-matching sets (their source collection),
+and `select`s whose arms lift to one uniform operand (the stock
+phi-lifting's uniform case; distinct-arm nests are left for a later
+extension). The delete forms (shorter arglists) are unmodeled, as in stock.
+"""
+function lift_keyvalue_gets!(ir::UnifiedIR.IR)
+    kvget = Core.OptimizedGenerics.KeyValue.get
+    kvset = Core.OptimizedGenerics.KeyValue.set
+    n = 0
+    for s in UnifiedIR.each_stmt(ir)
+        k = UnifiedIR.stmt_kind(ir, s)
+        (k === K"invoke" || k === K"call") || continue
+        base = k === K"invoke" ? 2 : 1
+        nop = UnifiedIR.nops(ir, s)
+        nop - base == 2 || continue
+        static_operand_value(ir, UnifiedIR.getop(ir, s, base)) === kvget || continue
+        keyop = UnifiedIR.getop(ir, s, nop)
+        collop = UnifiedIR.getop(ir, s, nop - 1)
+        keyl = stmt_lattice(ir, keyop)
+        # resolve the stored value operand for `keyop` through the chain
+        function kv_walk(co::UnifiedIR.Operand, depth::Int)
+            depth > 32 && return nothing
+            UnifiedIR.optag(co) == UnifiedIR.TAG_STMT || return nothing
+            def = skip_refines(ir, UnifiedIR.asstmt(co))
+            dk = UnifiedIR.stmt_kind(ir, def)
+            if dk === K"select"
+                UnifiedIR.nops(ir, def) == 3 || return nothing
+                v1 = kv_walk(UnifiedIR.getop(ir, def, 2), depth + 1)
+                v1 === nothing && return nothing
+                v2 = kv_walk(UnifiedIR.getop(ir, def, 3), depth + 1)
+                (v2 === nothing || v2 != v1) && return nothing  # uniform arms only
+                return v1
+            end
+            if dk === K"extract"
+                # projection of a multi-result if: walk position k of each arm
+                bo = UnifiedIR.getop(ir, def, 1)
+                UnifiedIR.optag(bo) == UnifiedIR.TAG_STMT || return nothing
+                ifdef = skip_refines(ir, UnifiedIR.asstmt(bo))
+                UnifiedIR.stmt_kind(ir, ifdef) === K"if" || return nothing
+                kidx = Int(UnifiedIR.imm_value(UnifiedIR.getop(ir, def, 2))::Int64)
+                arms = result_arms(ir, ifdef)
+                (arms === nothing || isempty(arms)) && return nothing
+                v0 = nothing
+                for (_, t) in arms
+                    kidx <= UnifiedIR.nops(ir, t) || return nothing
+                    v = kv_walk(UnifiedIR.getop(ir, t, kidx), depth + 1)
+                    v === nothing && return nothing
+                    v0 === nothing ? (v0 = v) : (v == v0 || return nothing)
+                end
+                return v0
+            end
+            if dk === K"if"
+                arms = result_arms(ir, def)
+                (arms === nothing || isempty(arms)) && return nothing
+                v0 = nothing
+                for (_, t) in arms
+                    UnifiedIR.nops(ir, t) == 1 || return nothing
+                    v = kv_walk(UnifiedIR.getop(ir, t, 1), depth + 1)
+                    v === nothing && return nothing
+                    v0 === nothing ? (v0 = v) : (v == v0 || return nothing)
+                end
+                return v0
+            end
+            (dk === K"invoke" || dk === K"call") || return nothing
+            dbase = dk === K"invoke" ? 2 : 1
+            static_operand_value(ir, UnifiedIR.getop(ir, def, dbase)) === kvset ||
+                return nothing
+            dnop = UnifiedIR.nops(ir, def)
+            # set([T,] collection, key, val): three trailing value operands;
+            # shorter forms are the unmodeled deletes
+            dnop - dbase >= 3 || return nothing
+            skop = UnifiedIR.getop(ir, def, dnop - 1)
+            if skop == keyop
+                return UnifiedIR.getop(ir, def, dnop)
+            end
+            skl = stmt_lattice(ir, skop)
+            egal = try
+                CC.egal_tfunc(CC.fallback_lattice, keyl, skl)
+            catch
+                Bool
+            end
+            egal isa CC.Const || return nothing
+            egal.val === true && return UnifiedIR.getop(ir, def, dnop)
+            egal.val === false || return nothing
+            return kv_walk(UnifiedIR.getop(ir, def, dnop - 2), depth + 1)
+        end
+        valop = kv_walk(collop, 0)
+        valop === nothing && continue
+        if UnifiedIR.optag(valop) == UnifiedIR.TAG_STMT
+            UnifiedIR.visible(ir, UnifiedIR.asstmt(valop), s) || continue
+        end
+        # wrapper type: subtract Nothing from the get's declared return
+        rt0 = UnifiedIR.stmt_type(ir, s)
+        rt = CC.widenconst(rt0 === nothing ? Any : rt0)
+        wrapper = try
+            CC.typesubtract(rt, Nothing, 0)
+        catch
+            continue
+        end
+        (wrapper isa DataType && isconcretetype(wrapper) &&
+         fieldcount(wrapper) == 1) || continue
+        vt = CC.widenconst(stmt_lattice(ir, valop))
+        ok = try
+            vt isa Type && CC.:⊑(CC.fallback_lattice, vt, fieldtype(wrapper, 1))
+        catch
+            false
+        end
+        ok || continue
+        UnifiedIR.replace_stmt!(ir, s, K"new", UnifiedIR.vop(ir, wrapper), valop;
+                                type = wrapper)
+        n += 1
+    end
+    return n
+end
+
+"""
     fold_pure_queries!(ir) -> Int
 
 Query-call folding and comparison lifting (stock `lift_comparison!` /
@@ -1316,6 +1439,7 @@ function _optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
         changed += fold_retuples!(ir)
         changed += fold_splatnews!(ir)
         changed += fold_pure_queries!(ir)
+        changed += lift_keyvalue_gets!(ir)
         changed += forward_refines!(ir)
         changed += forward_if_results!(ir)
         changed += UnifiedIR.promote_cells!(ir)
