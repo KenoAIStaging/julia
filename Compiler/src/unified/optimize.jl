@@ -665,6 +665,126 @@ function lift_keyvalue_gets!(ir::UnifiedIR.IR)
     return n
 end
 
+"""The structural arm of stock `_lift_svec_ref`: a
+`Core._compute_sparams(m, args...)` whose method signature mentions its
+(outermost) typevar in exactly one parameter, where the corresponding
+argument was built by `new(apply_type(T′, x), ...)` (or IS an
+`apply_type(T′, x)`-constructed type) with the typevar in the matching
+parameter slot of the same type constructor — then sparam 1 is `x` itself
+(the `NamedTuple{(name,)}(t)` constructor corpus). Returns the forwardable
+operand or `nothing`."""
+function _lift_compute_sparams(ir::UnifiedIR.IR, def::StmtId)
+    UnifiedIR.nops(ir, def) >= 3 || return nothing   # (f, m, args...)
+    m = static_operand_value(ir, UnifiedIR.getop(ir, def, 2))
+    m isa Method || return nothing
+    sig0 = m.sig
+    sig0 isa UnionAll || return nothing
+    tvar = sig0.var
+    sig = sig0.body
+    sig isa DataType || return nothing
+    sig.name === Tuple.name || return nothing
+    params = sig.parameters::Core.SimpleVector
+    i = nothing
+    for j in 1:length(params)
+        if CC.has_typevar(params[j], tvar)
+            i === nothing || return nothing   # exactly one mention
+            i = j
+        end
+    end
+    i === nothing && return nothing
+    arg = params[i]
+    2 + i <= UnifiedIR.nops(ir, def) || return nothing
+    rarg = UnifiedIR.getop(ir, def, 2 + i)
+    UnifiedIR.optag(rarg) == UnifiedIR.TAG_STMT || return nothing
+    argdef = skip_refines(ir, UnifiedIR.asstmt(rarg))
+    if UnifiedIR.stmt_kind(ir, argdef) === K"new"
+        to = UnifiedIR.getop(ir, argdef, 1)
+        UnifiedIR.optag(to) == UnifiedIR.TAG_STMT || return nothing
+        argdef = skip_refines(ir, UnifiedIR.asstmt(to))
+    else
+        # N.B. `Type{X}` is a `TypeEq` instance on this nightly: `isType`
+        # covers both kinds, `type_parameter` projects X
+        au = CC.unwrap_unionall(arg)
+        CC.isType(au) || return nothing
+        arg = CC.type_parameter(au)
+    end
+    (UnifiedIR.stmt_kind(ir, argdef) === K"call" &&
+     UnifiedIR.nops(ir, argdef) == 3) || return nothing
+    static_operand_value(ir, UnifiedIR.getop(ir, argdef, 1)) === Core.apply_type ||
+        return nothing
+    applyTl = stmt_lattice(ir, UnifiedIR.getop(ir, argdef, 2))
+    applyTl isa CC.Const || return nothing
+    applyT = applyTl.val
+    applyT isa UnionAll || return nothing
+    # N.B. valI == 1 only (stock's TODO): the outermost tvar suffices
+    applyTvar = applyT.var
+    applyTbody = CC.unwrap_unionall(applyT.body)
+    arg = CC.unwrap_unionall(arg)
+    (arg isa DataType && applyTbody isa DataType) || return nothing
+    applyTbody.name === arg.name || return nothing
+    length(applyTbody.parameters) == length(arg.parameters) || return nothing
+    for j in 1:length(applyTbody.parameters)
+        if applyTbody.parameters[j] === applyTvar && arg.parameters[j] === tvar
+            return UnifiedIR.getop(ir, argdef, 3)
+        end
+    end
+    return nothing
+end
+
+"""
+    lift_svec_refs!(ir) -> Int
+
+Stock `lift_svec_ref!`: a `Core._svec_ref(vec, idx)` with a Const in-range
+`idx` resolves through a Const `SimpleVector` (element folds), through a
+`Core.svec` call (operand forwards), or — via `_lift_compute_sparams` —
+through the sparam-reconstruction shape the inliner materializes (stock's
+spvals_ssa), letting the reconstruction chain DCE away entirely.
+"""
+function lift_svec_refs!(ir::UnifiedIR.IR)
+    n = 0
+    for s in UnifiedIR.each_stmt(ir)
+        UnifiedIR.stmt_kind(ir, s) === K"call" || continue
+        UnifiedIR.nops(ir, s) == 3 || continue
+        static_operand_value(ir, UnifiedIR.getop(ir, s, 1)) === Core._svec_ref ||
+            continue
+        idxl = stmt_lattice(ir, UnifiedIR.getop(ir, s, 3))
+        (idxl isa CC.Const && idxl.val isa Int) || continue
+        valI = idxl.val::Int
+        valI >= 1 || continue
+        vecop = UnifiedIR.getop(ir, s, 2)
+        vecl = stmt_lattice(ir, vecop)
+        local repl::UnifiedIR.Operand
+        if vecl isa CC.Const && vecl.val isa Core.SimpleVector
+            v = vecl.val::Core.SimpleVector
+            valI <= length(v) || continue
+            repl = UnifiedIR.vop(ir, v[valI])
+        elseif UnifiedIR.optag(vecop) == UnifiedIR.TAG_STMT
+            def = skip_refines(ir, UnifiedIR.asstmt(vecop))
+            UnifiedIR.stmt_kind(ir, def) === K"call" || continue
+            df = static_operand_value(ir, UnifiedIR.getop(ir, def, 1))
+            if df === Core.svec
+                valI <= UnifiedIR.nops(ir, def) - 1 || continue
+                repl = UnifiedIR.getop(ir, def, valI + 1)
+            elseif df === Core._compute_sparams && valI == 1
+                r = _lift_compute_sparams(ir, def)
+                r === nothing && continue
+                repl = r
+            else
+                continue
+            end
+        else
+            continue
+        end
+        if UnifiedIR.optag(repl) == UnifiedIR.TAG_STMT
+            UnifiedIR.visible(ir, UnifiedIR.asstmt(repl), s) || continue
+        end
+        UnifiedIR.replace_stmt!(ir, s, K"refine", repl;
+                                type = stmt_lattice(ir, repl))
+        n += 1
+    end
+    return n
+end
+
 """
     fold_pure_queries!(ir) -> Int
 
@@ -1518,6 +1638,7 @@ function _optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
         changed += fold_splatnews!(ir)
         changed += fold_pure_queries!(ir)
         changed += lift_keyvalue_gets!(ir)
+        changed += lift_svec_refs!(ir)
         changed += dedup_selects!(ir)
         changed += forward_refines!(ir)
         changed += forward_if_results!(ir)
@@ -1569,6 +1690,20 @@ function _optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
         ir = compact_carry_names!(ir)
         UnifiedIR.verify_ir(ir; level = 1)
         changed == 0 && break
+    end
+    if inline && get(ir.meta, :sparam_deferred, false) === true
+        # settled-types sparam materialization (stock ir_prepare_inlining!'s
+        # spvals_ssa regime): sites whose specialization still carries
+        # unbakeable static parameters after the iterative rounds have
+        # refined every type get the `_compute_sparams`/`_svec_ref`
+        # reconstruction splice — deferred to here so an early round's
+        # under-refined match never burns the precise inline (the cleanup
+        # rounds below run the lift/DCE over the spliced result)
+        delete!(ir.meta, :sparam_deferred)
+        infer_ir!(ir, argtypes; state)
+        UnifiedIR.editable(ir)
+        lastspliced += inline_calls2!(ir, state; params, materialize_sparams = true)
+        ir = compact_carry_names!(ir)
     end
     if lastspliced > 0
         # a final round that spliced callee bodies never saw the cleanup

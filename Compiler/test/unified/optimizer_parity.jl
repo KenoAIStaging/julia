@@ -339,6 +339,33 @@ end
 mutable struct OPCFunObj; x::Int; end
 op_cfun_caller(w::OPCFunObj) = op_cfun_assoc(C_NULL, w)
 
+# stock inline.jl "inlining with unmatched type parameters" (issue class of
+# inline:1747): the callee reads a sparam its specialization cannot bake —
+# the inliner must materialize `_compute_sparams`/`_svec_ref`; the
+# constructor callee resolves through a computed Type{...} lattice element
+@eval struct OPOldVal{T}
+    (OV::Type{OPOldVal{T}})() where T = $(Expr(:new, :OV))
+end
+op_f_oldval(x::OPOldVal{i}) where {i} = i
+function op_unmatched_typeparam()
+    r = 0
+    for i = 1:100
+        r += op_f_oldval(OPOldVal{i}())
+    end
+    return r
+end
+
+# stock irpasses.jl named_tuple_elim: the materialized reconstruction must
+# lift away entirely (lift_svec_refs! + the reconstruction transfer facts)
+op_named_tuple_elim(name::Symbol, result) = NamedTuple{(name,)}(result)
+
+# stock inline.jl issue #58915: the staged `merge` callee inlines via its
+# generator EXPANSION and the whole setindex chain folds
+op_f58915(nt) = @inline Base.setindex(nt, 2, :next)
+
+_op_nonbuiltin_call(src) = (@nospecialize(x),) -> Meta.isexpr(x, :call) &&
+    !(OPCC.singleton_type(OPCC.argextype(x.args[1], src, OPCC.VarState[])) isa Core.Builtin)
+
 @testset "optimizer parity: wave-9 sparam reconstruction" begin
     saved = Base.REFLECTION_COMPILER[]
     try
@@ -372,6 +399,28 @@ op_cfun_caller(w::OPCFunObj) = op_cfun_assoc(C_NULL, w)
             @test ncfun == 1
             # behavior: codegen accepts the emitted form
             @test op_cfun_caller(OPCFunObj(1)) === nothing
+        end
+
+        @testset "unmatched-typeparam callee inlines via _compute_sparams" begin
+            src = _code_typed1(op_unmatched_typeparam, ())
+            # stock inline.jl's predicate: no residual zero-arg dynamic call
+            # (the OldVal{i}() constructor through the computed type)
+            @test !any(x -> Meta.isexpr(x, :call) && length(x.args) == 1, src.code)
+            @test op_unmatched_typeparam() == sum(1:100)
+        end
+
+        @testset "reconstruction lift: named-tuple ctor fully eliminates" begin
+            src = _code_typed1(op_named_tuple_elim, (Symbol, Tuple))
+            @test count(x -> _iscall(src, Core._compute_sparams, x), src.code) == 0
+            @test count(x -> _iscall(src, Core._svec_ref, x), src.code) == 0
+            @test count(_op_nonbuiltin_call(src), src.code) == 0
+            @test op_named_tuple_elim(:x, (1,)) === (x = 1,)
+        end
+
+        @testset "staged callee inlines its expansion (issue #58915)" begin
+            src = _code_typed1(op_f58915, (@NamedTuple{next::UInt32, prev::UInt32},))
+            @test count(x -> Meta.isexpr(x, :invoke), src.code) == 0
+            @test count(_op_nonbuiltin_call(src), src.code) == 0
         end
     finally
         OPUnified.disable_pipeline!()

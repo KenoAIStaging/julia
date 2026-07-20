@@ -610,6 +610,56 @@ function callsite_noub(fr::Frame, s::StmtId, e::CC.Effects)
     return e
 end
 
+"""Stock inlining marks its `Core._compute_sparams` / `Core._svec_ref`
+sparam-reconstruction insertions removable-if-unused and never re-infers
+them; this pipeline DOES re-infer spliced bodies every round (the flag
+column republishes inference's effects projection), so the transfer must
+re-derive those facts or the reconstruction could never be DCE'd once
+`lift_svec_refs!` forwards its uses (stock `lift_svec_ref!`'s NamedTuple
+constructor corpus). `_compute_sparams(::Method, args...)` is
+`(+e,+n,+t)` with rt `SimpleVector` — the inliner emits it for the very
+call that dispatched, so the runtime env intersection is non-empty; a
+`_svec_ref(sp, idx)` whose vector IS such a `_compute_sparams` result is
+in-bounds whenever `idx <= unionall_depth(method.sig)` (rt: the declared
+statement type — the inliner seeded it from `sptypes_from_meth_instance`,
+which this structural shape keeps valid; stock trusts the same
+`insert_spval!` type unrevisited). Returns `nothing` for any other call."""
+function sparam_reconstruction_transfer(fr::Frame, s::StmtId)
+    ir = fr.ir
+    n = UnifiedIR.nops(ir, s)
+    n >= 3 || return nothing
+    # the inliner interns the builtin itself (vop) — a cheap pool check
+    # prunes every ordinary call before any lattice work
+    fo = UnifiedIR.getop(ir, s, 1)
+    UnifiedIR.optag(fo) == UnifiedIR.TAG_CONST || return nothing
+    f = UnifiedIR.getconst(ir, fo)
+    (f === Core._compute_sparams || f === Core._svec_ref) || return nothing
+    eff() = CC.Effects(CC.EFFECTS_TOTAL; consistent = CC.ALWAYS_FALSE)
+    if f === Core._compute_sparams
+        ml = opl(fr, UnifiedIR.getop(ir, s, 2))
+        (ml isa CC.Const && ml.val isa Method) || return nothing
+        return (Core.SimpleVector, eff(), Union{})
+    elseif f === Core._svec_ref && n == 3
+        idxl = opl(fr, UnifiedIR.getop(ir, s, 3))
+        (idxl isa CC.Const && idxl.val isa Int) || return nothing
+        vecop = UnifiedIR.getop(ir, s, 2)
+        UnifiedIR.optag(vecop) == UnifiedIR.TAG_STMT || return nothing
+        def = UnifiedIR.asstmt(vecop)
+        (UnifiedIR.stmt_kind(ir, def) === K"call" &&
+         UnifiedIR.nops(ir, def) >= 3) || return nothing
+        dfo = UnifiedIR.getop(ir, def, 1)
+        (UnifiedIR.optag(dfo) == UnifiedIR.TAG_CONST &&
+         UnifiedIR.getconst(ir, dfo) === Core._compute_sparams) || return nothing
+        ml = opl(fr, UnifiedIR.getop(ir, def, 2))
+        (ml isa CC.Const && ml.val isa Method) || return nothing
+        1 <= (idxl.val::Int) <= CC.unionall_depth((ml.val::Method).sig) ||
+            return nothing
+        t0 = UnifiedIR.stmt_type(ir, s)
+        return (t0 === nothing ? Any : t0, eff(), Union{})
+    end
+    return nothing
+end
+
 function _transfer(fr::Frame, s::StmtId, k::UnifiedIR.Kind)
     ir = fr.ir
     if k === K"call"
@@ -626,6 +676,8 @@ function _transfer(fr::Frame, s::StmtId, k::UnifiedIR.Kind)
             cond isa Tuple && return (cond[1], cond[2]::CC.Effects)
             return (cond, CC.EFFECTS_TOTAL)
         end
+        spr = sparam_reconstruction_transfer(fr, s)
+        spr === nothing || return spr
         args = Any[widenucond(a) for a in opls(fr, s, 1)]
         r = infer_call(fr, args; sid = s.id)
         r = apply_intercond(fr, s, 1, r)

@@ -466,10 +466,34 @@ function resolve_inline_target(ir::UnifiedIR.IR, s::StmtId, k::UnifiedIR.Kind, s
                 return nothing
             end
             ft0 = CC.widenconst(args[1])
-            (ft0 isa DataType && isconcretetype(ft0) && !(ft0 <: Type) &&
-             !(ft0 <: Core.Builtin) && !(ft0 <: Core.IntrinsicFunction) &&
-             !(ft0 <: Core.OpaqueClosure)) || return nothing
-            ftt = ft0
+            if ft0 isa DataType && isconcretetype(ft0) && !(ft0 <: Type) &&
+               !(ft0 <: Core.Builtin) && !(ft0 <: Core.IntrinsicFunction) &&
+               !(ft0 <: Core.OpaqueClosure)
+                ftt = ft0
+            else
+                # non-const TYPE callee (a constructor through a computed
+                # type — the `OldVal{i}()` shape): dispatch resolves on the
+                # `Type{...}` lattice element itself. A single fully-covering
+                # match then specializes with TypeVar sparams (stock's
+                # allow_typevars=true single-match revisit); any sparam READS
+                # in the body ride the pinned bake or the _compute_sparams
+                # materialization below.
+                tt = CC.unwrap_unionall(ft0)
+                if tt isa DataType && CC.isType(tt)
+                    ftt = ft0
+                elseif CC.isTypeEq(tt)
+                    # this nightly's exact-type lattice element: rebuild the
+                    # dispatchable Type{...} form over the same environment
+                    p = CC.type_parameter(tt)
+                    ftt = try
+                        Base.rewrap_unionall(Type{p}, ft0)
+                    catch
+                        return nothing
+                    end
+                else
+                    return nothing
+                end
+            end
         else
             ftt = f isa Type ? Type{f} : typeof(f)
         end
@@ -512,20 +536,22 @@ function bakeable_sparam(@nospecialize(v))
     return v
 end
 
-"""Does the callee body read (`TAG_SPARAM` operand) a static parameter whose
-baked value is `_unbakeable`? Unused parameters do not block inlining
-(their values are never materialized by `splice_body!`)."""
-function reads_unbakeable_sparam(callee::UnifiedIR.IR, spvals::Vector{Any})
+"""Collect the indices of callee-body `TAG_SPARAM` reads whose baked value
+is `_unbakeable` (unique, insertion order). Unused parameters never block
+inlining (their values are not materialized by `splice_body!`). Returns
+`nothing` for an out-of-range read (env-depth mismatch — never inline)."""
+function unbakeable_sparam_reads(callee::UnifiedIR.IR, spvals::Vector{Any})
+    out = Int[]
     for s in UnifiedIR.each_stmt(callee)
         for j in 1:UnifiedIR.nops(callee, s)
             o = UnifiedIR.getop(callee, s, j)
             UnifiedIR.optag(o) == UnifiedIR.TAG_SPARAM || continue
             idx = Int(UnifiedIR.payload(o))
-            idx <= length(spvals) || return true
-            spvals[idx] === _unbakeable && return true
+            idx <= length(spvals) || return nothing
+            spvals[idx] === _unbakeable && !(idx in out) && push!(out, idx)
         end
     end
-    return false
+    return out
 end
 
 """Substitute the callee method's static parameters into the STRUCTURAL
@@ -574,7 +600,7 @@ function instantiate_foreign_type_slots!(callee::UnifiedIR.IR, m::Method,
                 static || return false
                 t2 = Core.svec(Any[inst(x) for x in t]...)
             else
-                ((t isa Type || t isa TypeVar) && CC.has_free_typevars(t)) || continue
+                CC.has_free_typevars(t) || continue
                 static || return false
                 t2 = inst(t)
             end
@@ -613,7 +639,8 @@ cost heuristic, and marked with the site's inbounds context
 (`mark_inbounds_context!`). Returns the number of sites inlined.
 """
 function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
-                        params::InlineParams = InlineParams())
+                        params::InlineParams = InlineParams(),
+                        materialize_sparams::Bool = false)
     UnifiedIR.check_state(ir, UnifiedIR.LAYOUT_EDITABLE, "inline_calls2!")
     caller_mi = get(ir.meta, :method_instance, nothing)
     caller_m = caller_mi isa Core.MethodInstance ? caller_mi.def : nothing
@@ -626,9 +653,6 @@ function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
         target = resolve_inline_target(ir, s, k, state)
         target === nothing && continue
         m, mi, invoke_call = target
-        # a staged method's runnable body is the generator's EXPANSION;
-        # `uncompressed_ir(m)` below is not it — never inline those
-        isdefined(m, :generator) && continue
         argofs = k === K"invoke" ? 1 : 0
         if invoke_call
             m.isva && continue
@@ -643,12 +667,25 @@ function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
             Int(m.nargs) == UnifiedIR.nops(ir, s) - argofs || continue
         end
         caller_m === m && continue                        # direct self-recursion
-        src = try
-            Base.uncompressed_ir(m)
-        catch
-            nothing
+        src = if isdefined(m, :generator)
+            # a staged method's runnable body is the generator's EXPANSION
+            # for THIS specialization (stock retrieve_ir_for_inlining via
+            # retrieve_code_info); expansion needs sufficiently concrete
+            # specTypes — failures decline, so the f59018 abstract-specTypes
+            # class keeps its dynamic call
+            try
+                CC.retrieve_code_info(mi, state.cfg.world)
+            catch
+                nothing
+            end
+        else
+            try
+                Base.uncompressed_ir(m)
+            catch
+                nothing
+            end
         end
-        src === nothing && continue
+        src isa Core.CodeInfo || continue
         site_inline = UnifiedIR.stmt_flag(ir, s) & UnifiedIR.FLAG_INLINE != 0
         # stock: a callsite `@inline` overrides the callee's declared
         # `@noinline` (the force_inline_explicit/f42078 family) and admits
@@ -670,7 +707,46 @@ function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
         # diagonal-typevar methods are the common never-reads case), and
         # pinned markers (lb === ub) still have a unique bakeable value
         spvals = Any[bakeable_sparam(v) for v in mi.sparam_vals]
-        reads_unbakeable_sparam(callee_ir, spvals) && continue
+        spneeded = unbakeable_sparam_reads(callee_ir, spvals)
+        spneeded === nothing && continue      # env-depth mismatch
+        spstates = nothing
+        if !isempty(spneeded)
+            # settled-types phase only: stock inlines on FINAL inference
+            # results, while these rounds iterate — materializing against a
+            # round-1 under-refined specialization (marker sparams from a
+            # still-Any argument) would burn the precise inline the next
+            # rounds get for free (the UEA SafeRef corpus). The deferral is
+            # recorded so the driver only pays the settled-phase inference
+            # when a candidate actually exists.
+            if !materialize_sparams
+                ir.meta[:sparam_deferred] = true
+                continue
+            end
+            # runtime sparam reconstruction (stock ir_prepare_inlining!'s
+            # spvals_ssa + insert_spval!): `Core._compute_sparams` re-derives
+            # the environment from the very arguments that dispatched here and
+            # `Core._svec_ref` projects each needed entry — materialized at
+            # the splice site below. Admitted only for plain-value reads of
+            # guaranteed-defined parameters (stock's throw_undef_if_not
+            # machinery for maybe-undef ones is not ported: decline).
+            m.is_for_opaque_closure && continue
+            # a site whose RESULT is unused keeps its call: stock carries the
+            # callee's optimized-IR nothrow flags through the splice so the
+            # whole reconstruction chain DCEs; this pipeline re-infers the
+            # spliced body and cannot re-prove nothrow for the resulting
+            # apply_type/new chain (the SparamUnused effects corpus), while
+            # the un-inlined call's interprocedural effects DO prove the
+            # site removable-if-unused — leave that path in charge
+            UnifiedIR.use_counts(ir)[s.id] > 0 || continue
+            spstates = try
+                CC.sptypes_from_meth_instance(mi)
+            catch
+                nothing
+            end
+            (spstates isa Vector{CC.VarState} &&
+             length(spstates) >= maximum(spneeded) &&
+             !any(i -> spstates[i].undef, spneeded)) || continue
+        end
         instantiate_foreign_type_slots!(callee_ir, m, mi.sparam_vals) || continue
         if !site_inline
             # stock: never inline error paths — a Union{}-returning callee
@@ -755,6 +831,34 @@ function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
                 type = pol.env,
                 flag = UnifiedIR.FLAG_REMOVABLE | UnifiedIR.FLAG_NOUB)
             argmap[1] = UnifiedIR.op_stmt(capt)
+        end
+        if !isempty(spneeded)
+            spstates = spstates::Vector{CC.VarState}
+            # stock's `Expr(:call, Core._compute_sparams, def, argexprs...)`:
+            # built over the RAW caller-side value operands (pre va-fixup)
+            spops = UnifiedIR.Operand[UnifiedIR.vop(ir, Core._compute_sparams),
+                                      UnifiedIR.vop(ir, m)]
+            if invoke_call
+                push!(spops, UnifiedIR.getop(ir, s, 2))
+                for i in 4:UnifiedIR.nops(ir, s)
+                    push!(spops, UnifiedIR.getop(ir, s, i))
+                end
+            else
+                for i in (argofs + 1):UnifiedIR.nops(ir, s)
+                    push!(spops, UnifiedIR.getop(ir, s, i))
+                end
+            end
+            spssa = UnifiedIR.insert_before!(ir, s, K"call", spops...;
+                type = Core.SimpleVector,
+                flag = UnifiedIR.FLAG_REMOVABLE | UnifiedIR.FLAG_NOUB)
+            for idx in spneeded
+                vs = UnifiedIR.insert_before!(ir, s, K"call",
+                    UnifiedIR.vop(ir, Core._svec_ref), UnifiedIR.op_stmt(spssa),
+                    UnifiedIR.vop(ir, idx);
+                    type = spstates[idx].typ,
+                    flag = UnifiedIR.FLAG_REMOVABLE | UnifiedIR.FLAG_NOUB)
+                spvals[idx] = UnifiedIR.op_stmt(vs)
+            end
         end
         UnifiedIR.splice_body!(ir, s, callee_ir; argmap, sparams = spvals)
         inlined += 1
