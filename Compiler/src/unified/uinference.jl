@@ -203,6 +203,43 @@ the cap is a fixed constant, so a tower verdict still depends only on
 const TOWER_FRAME_CAP = Base.RefValue(0)
 const TOWER_FRAME_BUDGET = Base.RefValue(250)
 
+"""Cumulative wall-clock (ns) per driver pipeline phase plus tower/serve
+counters — the cold-walk cost profile (`Compiler/bench/unified_coldwalk.jl`
+prints it). Plain non-atomic fields: single-writer benchmarking currency,
+approximate under threads, never consulted for semantics."""
+mutable struct DriverPhaseNS
+    entry::Int      # retrieve_code_info + entry conversion + frame setup
+    infer::Int      # the root infer_ir! pass
+    optimize::Int   # optimize_ir! (incl. its re-inference rounds and towers)
+    devirt::Int     # devirtualize_calls!/devirtualize_modifyops!
+    exit::Int       # ir_to_ircode + ir_to_codeinf! + inlining-cost model
+    cost_tower::Int # inline2_cost_uncached (callee pricing optimizations)
+    fx_tower::Int   # opt_callee_effects_uncached
+    ea_tower::Int   # ea_opt_summary_uncached
+    ci_serves::Int  # callee frames served from cached CodeInstances
+    bodies::Int     # driver_infer passes completing without Fallback
+end
+const DRIVER_PHASES = DriverPhaseNS(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+
+function reset_driver_phases!()
+    p = DRIVER_PHASES
+    p.entry = p.infer = p.optimize = p.devirt = p.exit = 0
+    p.cost_tower = p.fx_tower = p.ea_tower = 0
+    p.ci_serves = p.bodies = 0
+    return nothing
+end
+
+function print_driver_phases(io::IO = Base.stdout)
+    p = DRIVER_PHASES
+    ms(x) = string(round(x / 1e6; digits = 1), "ms")
+    println(io, "driver phases (", p.bodies, " bodies): entry ", ms(p.entry),
+            "  infer ", ms(p.infer), "  optimize ", ms(p.optimize),
+            "  devirt ", ms(p.devirt), "  exit ", ms(p.exit))
+    println(io, "  towers: cost ", ms(p.cost_tower), "  fx ", ms(p.fx_tower),
+            "  ea ", ms(p.ea_tower), "  ci_serves ", p.ci_serves)
+    return nothing
+end
+
 mutable struct UInferState
     cfg::UInferConfig
     cache::Dict{Core.MethodInstance,Any}        # mi -> UResult (rettype + effects)
