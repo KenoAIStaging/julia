@@ -350,5 +350,6 @@ include("optimizer_parity.jl")
 include("port_ssair.jl")
 include("port_compact.jl")
 include("port_interpreter_exec.jl")
+include("port_irpasses.jl")
 
 include("escape.jl")
