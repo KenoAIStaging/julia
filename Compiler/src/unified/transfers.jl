@@ -2411,6 +2411,21 @@ function infer_method(fr::Frame, match::Core.MethodMatch, args::Vector{Any})::UR
     return r
 end
 
+"""Stock `most_general_argtypes`' per-parameter refinement for sig-derived
+argument lattices: singleton types seed as their `Const` instance and
+egality-pinned type arguments (`TypeEgal{T}`, `isconstType`) seed as
+`Const(T)` — getfield/isdefined/fieldcount folds on such arguments need the
+`Const` element (stock's cache-entry argtypes carry exactly this)."""
+function seed_arglattice(@nospecialize(t))
+    t isa Type || return t
+    if t isa DataType && Base.issingletontype(t)
+        return CC.Const(t.instance)
+    elseif CC.isconstType(t)
+        return CC.Const(CC.type_parameter(t))
+    end
+    return t
+end
+
 function method_arglattice(m::Method, mi::Core.MethodInstance, args::Vector{Any})
     nparams = Int(m.nargs)
     argl = Vector{Any}(undef, nparams)
@@ -2442,6 +2457,7 @@ function method_arglattice(m::Method, mi::Core.MethodInstance, args::Vector{Any}
         for i in 1:(nparams - 1)
             argl[i] = i <= length(ps) ? Base.rewrap_unionall(ps[i], spec) : Any
             argl[i] isa Type || (argl[i] = Any)
+            argl[i] = seed_arglattice(argl[i])
         end
         # vararg tuple lattice: precise when the trailing sig is concrete
         rest = Any[Base.rewrap_unionall(ps[i], spec) for i in nparams:length(ps)]
@@ -2457,6 +2473,7 @@ function method_arglattice(m::Method, mi::Core.MethodInstance, args::Vector{Any}
     for i in 1:nparams
         argl[i] = i <= length(ps) ? Base.rewrap_unionall(ps[i], spec) : Any
         argl[i] isa Type || (argl[i] = Any)
+        argl[i] = seed_arglattice(argl[i])
     end
     return argl
 end
