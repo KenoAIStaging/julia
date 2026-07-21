@@ -1200,7 +1200,7 @@ function fold_apply_iterates!(ir::UnifiedIR.IR)
             v = lat isa CC.Const ? lat.val : nothing
             if v isa Core.SimpleVector || v isa Tuple
                 for j in 1:length(v)
-                    push!(elems, UnifiedIR.vop(ir, v[j]))
+                    push!(elems, const_vop(ir, v[j]))
                 end
                 total += length(v)
             else

@@ -482,4 +482,33 @@ end
     end
 end
 
+# A Const whose VALUE is a StmtId/Operand (self-hosting: the pipeline
+# compiling UnifiedIR's own code) must materialize as a POOL CONSTANT —
+# `vop`'s StmtId pass-through encodes it as a statement REFERENCE, which
+# for id 0 crashed use_counts (the wrap_in_if! BoundsError under
+# activate!) and for any other id silently aliases an arbitrary statement.
+const OPUIR = OPUnified.UnifiedIR
+op_stmtid_null() = OPUIR.NULL_STMT
+op_stmtid_pair() = (op_stmtid_null(), Int32(7))
+op_stmtid_three() = OPUIR.StmtId(Int32(3))
+op_stmtid_use3() = (op_stmtid_three(), op_stmtid_three())
+
+@testset "optimizer parity: wave-11 Const-StmtId materialization" begin
+    for (f, expect) in ((op_stmtid_pair, (OPUIR.NULL_STMT, Int32(7))),
+                        (op_stmtid_use3, (OPUIR.StmtId(Int32(3)), OPUIR.StmtId(Int32(3)))))
+        ir = OPUnified.typed_ir(f, Any[])
+        # no statement operand may reference id 0, and the executed result
+        # must be the VALUE tuple (pre-fix: BoundsError during optimize for
+        # the null id; a stmt-graph alias for nonzero ids)
+        for s in OPUIR.each_stmt(ir)
+            OPUIR.is_tombstone(ir, s) && continue
+            for i in 1:OPUIR.nops(ir, s)
+                o = OPUIR.getop(ir, s, i)
+                @test !(OPUIR.optag(o) == OPUIR.TAG_STMT && OPUIR.payload(o) == 0)
+            end
+        end
+        @test f() === expect
+    end
+end
+
 end # module UnifiedOptimizerParityTests

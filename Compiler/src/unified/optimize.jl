@@ -105,6 +105,19 @@ function refine_effects!(ir::UnifiedIR.IR; interp = CC.NativeInterpreter())
     return n
 end
 
+"""Const-VALUE operand builder: like `vop`, but never reinterprets IR-typed
+VALUES as IR references. `vop`'s `StmtId`/`Operand` pass-throughs exist for
+callers holding actual references; a lattice-Const being materialized may
+BE a `StmtId`/`Operand` value when the pipeline compiles UnifiedIR's own
+code (self-hosting), and encoding it through `vop` silently rewires the
+statement graph — `Const(StmtId(0))` produced the wrap_in_if! BoundsError
+under activate!, any other id aliases an arbitrary statement (wave 11)."""
+function const_vop(ir::UnifiedIR.IR, @nospecialize(v))
+    (v isa UnifiedIR.StmtId || v isa UnifiedIR.Operand) &&
+        return UnifiedIR.op_constidx(UnifiedIR.intern_const!(ir.body, v))
+    return UnifiedIR.vop(ir, v)
+end
+
 "Constant value of an operand, or nothing (statements consult the type column)."
 function static_operand_value(ir::UnifiedIR.IR, o::UnifiedIR.Operand)
     t = UnifiedIR.optag(o)
@@ -189,7 +202,7 @@ function materialize_consts!(ir::UnifiedIR.IR)
         # K"value" requires a pool constant (its schema is OC_CONST)
         co = UnifiedIR.op_constidx(UnifiedIR.intern_const!(ir.body, v))
         UnifiedIR.replace_stmt!(ir, s, K"value", co; type = t)
-        UnifiedIR.replace_uses!(ir, s => UnifiedIR.vop(ir, v))
+        UnifiedIR.replace_uses!(ir, s => const_vop(ir, v))
         n += 1
     end
     n > 0 && UnifiedIR.flush_renames!(ir)
@@ -335,7 +348,7 @@ function const_struct_field_op(ir::UnifiedIR.IR, @nospecialize(v), fidx::Int)
     v === nothing && return nothing
     ismutable(v) && return nothing
     (1 <= fidx <= nfields(v) && isdefined(v, fidx)) || return nothing
-    return UnifiedIR.vop(ir, getfield(v, fidx))
+    return const_vop(ir, getfield(v, fidx))
 end
 
 "Rewrite the field-`fidx` load `s` over per-arm constructed values
@@ -441,7 +454,7 @@ function forward_extracts!(ir::UnifiedIR.IR)
                 v0 === nothing ? (v0 = v) : (v === v0 || (uniform = false; break))
             end
             if uniform && v0 !== nothing
-                UnifiedIR.replace_stmt!(ir, s, K"refine", UnifiedIR.vop(ir, v0);
+                UnifiedIR.replace_stmt!(ir, s, K"refine", const_vop(ir, v0);
                                         type = UnifiedIR.stmt_type(ir, s))
                 n += 1
                 continue
@@ -770,7 +783,7 @@ function lift_svec_refs!(ir::UnifiedIR.IR)
         if vecl isa CC.Const && vecl.val isa Core.SimpleVector
             v = vecl.val::Core.SimpleVector
             valI <= length(v) || continue
-            repl = UnifiedIR.vop(ir, v[valI])
+            repl = const_vop(ir, v[valI])
         elseif UnifiedIR.optag(vecop) == UnifiedIR.TAG_STMT
             def = skip_refines(ir, UnifiedIR.asstmt(vecop))
             UnifiedIR.stmt_kind(ir, def) === K"call" || continue
