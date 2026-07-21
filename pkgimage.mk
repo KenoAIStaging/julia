@@ -33,6 +33,32 @@ $(BUILDDIR)/stdlib/%.image: $(JULIAHOME)/stdlib/Project.toml $(JULIAHOME)/stdlib
 $(BUILDDIR)/stdlib/release.image: $(build_private_libdir)/sys.$(SHLIB_EXT)
 $(BUILDDIR)/stdlib/debug.image: $(build_private_libdir)/sys-debug.$(SHLIB_EXT)
 
+# ---- stdlib caches for the unified sysimage (unifiedir bootstrap stage) ----
+# Structural twin of the stock cache build above, run under sys-unified so
+# every pkgimage is compiled by the UnifiedIR compiler port baked into that
+# image.  Caches land in the same $(DEPOTDIR)/compiled bundled depot and
+# coexist with the stock set: the cache filename slug hashes
+# JLOptions().image_file and loading validates the recorded Base build_id,
+# so each sysimage only accepts its own caches.
+# UNIFIED_CACHE_PKGS optionally names root packages; the driver then builds
+# only their dependency closure (subset validation) and the stamp is not
+# written, so a later full run is not masked.
+release-unified: $(BUILDDIR)/stdlib/release-unified.image
+debug-unified: $(BUILDDIR)/stdlib/debug-unified.image
+
+$(BUILDDIR)/stdlib/release-unified.image: UNIFIED_SYS := $(build_private_libdir)/sys-unified.$(SHLIB_EXT)
+$(BUILDDIR)/stdlib/debug-unified.image: UNIFIED_SYS := $(build_private_libdir)/sys-unified-debug.$(SHLIB_EXT)
+
+$(BUILDDIR)/stdlib/release-unified.image $(BUILDDIR)/stdlib/debug-unified.image: \
+		$(JULIAHOME)/stdlib/Project.toml $(JULIAHOME)/stdlib/Manifest.toml \
+		$(INDEPENDENT_STDLIBS_SRCS) $(JULIAHOME)/contrib/unified_stdlib_caches.jl | $(DEPOTDIR)/compiled
+	@$(call PRINT_JULIA, JULIA_CPU_TARGET="sysimage" $(call spawn,$(JULIA_EXECUTABLE)) --sysimage $(call cygpath_w,$(UNIFIED_SYS)) --startup-file=no \
+		$(call cygpath_w,$(JULIAHOME)/contrib/unified_stdlib_caches.jl) $(UNIFIED_CACHE_PKGS))
+	$(if $(UNIFIED_CACHE_PKGS),@echo "unified-caches: subset build; stamp not written",touch $@)
+
+$(BUILDDIR)/stdlib/release-unified.image: $(build_private_libdir)/sys-unified.$(SHLIB_EXT)
+$(BUILDDIR)/stdlib/debug-unified.image: $(build_private_libdir)/sys-unified-debug.$(SHLIB_EXT)
+
 clean:
 	rm -rf $(DEPOTDIR)/compiled
 	rm -f $(BUILDDIR)/stdlib/*.image

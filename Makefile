@@ -149,6 +149,14 @@ julia-sysimg-JL-release julia-sysimg-JL-debug : julia-sysimg-JL-% : julia-sysimg
 julia-sysimg-unified-release julia-sysimg-unified-debug : julia-sysimg-unified-% : julia-sysimg-% julia-stdlib | $(build_private_libdir)
 	@$(MAKE) $(QUIET_MAKE) -C $(BUILDROOT) -f sysimage.mk sysimg-unified-$*
 
+# stdlib pkgimage caches compiled under the unified image (pkgimage.mk twin
+# of stdlibs-cache-%).  Set UNIFIED_CACHE_PKGS="Test ..." for a dependency-
+# closure subset build.
+.PHONY: julia-stdlib-caches-unified julia-stdlib-caches-unified-release julia-stdlib-caches-unified-debug
+julia-stdlib-caches-unified: julia-stdlib-caches-unified-release
+julia-stdlib-caches-unified-release julia-stdlib-caches-unified-debug : julia-stdlib-caches-unified-% : julia-sysimg-unified-%
+	@$(MAKE) $(QUIET_MAKE) -C $(BUILDROOT) -f pkgimage.mk $*-unified
+
 # Useful for cross-bootstrapping
 .PHONY: julia-sysbase-release julia-sysbase-debug
 julia-sysbase-release julia-sysbase-debug : julia-sysbase-% : julia-src-% $(TOP_LEVEL_PKG_LINK_TARGETS) julia-stdlib julia-base julia-cli-% | $(build_private_libdir)
