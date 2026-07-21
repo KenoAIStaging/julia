@@ -716,6 +716,17 @@ end
     end
 end
 
+@testset "^C escalation severity ladder" begin
+    # Escalation helper: severity ladder for repeat ^C.
+    @test Base.escalated_sigint_severity(nothing) === CANCEL_REQUEST_SAFE
+    @test Base.escalated_sigint_severity(UInt8(0x00)) === CANCEL_REQUEST_SAFE # fresh C-side ^C marker
+    @test Base.escalated_sigint_severity(CANCEL_REQUEST_SAFE) === CANCEL_REQUEST_ABANDON_EXTERNAL
+    @test Base.escalated_sigint_severity(CancellationRequest(0x80)) === CANCEL_REQUEST_ABANDON_EXTERNAL
+    @test Base.escalated_sigint_severity(CANCEL_REQUEST_ABANDON_EXTERNAL) === CANCEL_REQUEST_ABANDON_ALL
+    @test Base.escalated_sigint_severity(CancellationRequest(0x83)) === CANCEL_REQUEST_ABANDON_ALL
+    @test Base.escalated_sigint_severity(CANCEL_REQUEST_ABANDON_ALL) === CANCEL_REQUEST_ABANDON_ALL
+end
+
 @testset "acknowledged requests do not re-trigger" begin
     t = @async begin
         try
