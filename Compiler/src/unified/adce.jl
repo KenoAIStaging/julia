@@ -266,8 +266,11 @@ function fold_uniform_block_args!(ir::UnifiedIR.IR)
                 uniform || continue
                 cnt = UnifiedIR.use_counts(ir)[a.id]
                 cnt > 0 || continue
+                # const_vop: v0 is a lattice VALUE — a GlobalRef (or IR-typed
+                # value under self-hosting) must intern as a pool constant,
+                # not re-encode as a binding read / statement reference
                 UnifiedIR.replace_uses_where!(u -> !UnifiedIR.is_tombstone(ir, u), ir,
-                                              a => UnifiedIR.vop(ir, v0))
+                                              a => const_vop(ir, v0))
                 n += 1
             end
         end

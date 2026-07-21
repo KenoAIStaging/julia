@@ -511,4 +511,52 @@ op_stmtid_use3() = (op_stmtid_three(), op_stmtid_three())
     end
 end
 
+# A GlobalRef VALUE (QuoteNode(GlobalRef) literal at entry, or a lattice
+# Const(GlobalRef) materialized by the optimizer) is DATA — e.g.
+# `invokelatest_gr`'s world-latest call target, the exact TOML Printer
+# precompile shape — and must never be conflated with a semantic binding
+# READ (TAG_GLOBAL). Pre-fix the entry's QuoteNode unwrap and const_vop
+# both routed it through `vop`'s read form, so the pipeline resolved the
+# binding and passed the bound VALUE:
+#   MethodError: no method matching invokelatest_gr(::typeof(f), ...)
+module OPGRData
+    is_even(x::Int) = x % 2 == 0
+    # TOML Printer shape: bare-symbol callee -> QuoteNode(GlobalRef) literal
+    call_latest(x) = Base.@invokelatest is_even(x)
+end
+@eval op_gr_lit(x) = Base.invokelatest_gr($(QuoteNode(GlobalRef(OPGRData, :is_even))), x)
+const OP_GRC = GlobalRef(OPGRData, :is_even)
+op_gr_const(x) = Base.invokelatest_gr(OP_GRC, x)          # Const-binding fold leg
+struct OPHoldGR; g::GlobalRef; end
+const OP_HGR = OPHoldGR(GlobalRef(OPGRData, :is_even))
+op_gr_field(x) = Base.invokelatest_gr(OP_HGR.g, x)        # getfield-fold leg
+op_gr_tuple() = (GlobalRef(OPGRData, :is_even), 1)        # plain data position
+
+@testset "optimizer parity: wave-12 GlobalRef-as-data vs binding read" begin
+    for (f, args, want) in ((op_gr_lit, (4,), true),
+                            (OPGRData.call_latest, (3,), false),
+                            (op_gr_const, (4,), true),
+                            (op_gr_field, (3,), false),
+                            (op_gr_tuple, (), (GlobalRef(OPGRData, :is_even), 1)))
+        ir = OPUnified.typed_ir(f, Any[map(typeof, args)...])
+        # no read-form (globals-table) operand may name the data target
+        for s in OPUIR.each_stmt(ir)
+            OPUIR.is_tombstone(ir, s) && continue
+            for i in 1:OPUIR.nops(ir, s)
+                o = OPUIR.getop(ir, s, i)
+                if OPUIR.optag(o) == OPUIR.TAG_GLOBAL
+                    g = ir.body.globals[OPUIR.payload(o)]
+                    @test !(g.mod === OPGRData && g.name === :is_even)
+                end
+            end
+        end
+        # and the exited body must execute with the GlobalRef ARGUMENT
+        # intact (pre-fix: the resolved function object -> MethodError)
+        irc = OPUnified.ir_to_ircode(ir)
+        irc.argtypes[1] = Tuple{}
+        oc = Core.OpaqueClosure(irc)
+        @test isequal(oc(args...), want)
+    end
+end
+
 end # module UnifiedOptimizerParityTests

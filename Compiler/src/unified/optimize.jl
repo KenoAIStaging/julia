@@ -111,9 +111,13 @@ callers holding actual references; a lattice-Const being materialized may
 BE a `StmtId`/`Operand` value when the pipeline compiles UnifiedIR's own
 code (self-hosting), and encoding it through `vop` silently rewires the
 statement graph — `Const(StmtId(0))` produced the wrap_in_if! BoundsError
-under activate!, any other id aliases an arbitrary statement (wave 11)."""
+under activate!, any other id aliases an arbitrary statement (wave 11).
+Likewise `vop`'s `GlobalRef` routing targets the globals table — the
+binding-READ form — but a `Const(GlobalRef)` VALUE is data (e.g.
+`invokelatest_gr`'s target, the TOML Printer miscompile, wave 12): it must
+intern as a pool CONSTANT or downstream folding resolves the binding."""
 function const_vop(ir::UnifiedIR.IR, @nospecialize(v))
-    (v isa UnifiedIR.StmtId || v isa UnifiedIR.Operand) &&
+    (v isa UnifiedIR.StmtId || v isa UnifiedIR.Operand || v isa GlobalRef) &&
         return UnifiedIR.op_constidx(UnifiedIR.intern_const!(ir.body, v))
     return UnifiedIR.vop(ir, v)
 end

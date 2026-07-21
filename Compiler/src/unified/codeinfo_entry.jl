@@ -178,7 +178,11 @@ function codeinfo_to_ir(ci::Core.CodeInfo; nargs::Int, name::Symbol = :f)
         elseif v isa GlobalRef
             return UnifiedIR.vop(b.ir, v)
         elseif v isa QuoteNode
-            return UnifiedIR.vop(b.ir, v.value)
+            # the payload is a first-class VALUE: a quoted GlobalRef is data
+            # (e.g. invokelatest_gr's target), never a binding read — route
+            # through const_vop, which forces the constant pool for the
+            # classes `vop` would reinterpret as IR references/reads
+            return const_vop(b.ir, v.value)
         elseif v isa Expr
             v.head === :static_parameter && return UnifiedIR.op_sparam(v.args[1]::Int)
             throw(UnsupportedIR("nested Expr operand $(v.head)"))

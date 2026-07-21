@@ -317,7 +317,9 @@ function codeinfo_to_ir_eh(ci::Core.CodeInfo; nargs::Int, name::Symbol)
         elseif v isa GlobalRef
             return UnifiedIR.vop(b.ir, v)
         elseif v isa QuoteNode
-            return UnifiedIR.vop(b.ir, v.value)
+            # first-class VALUE payload — a quoted GlobalRef is data, never
+            # a binding read (see codeinfo_entry.jl's convert_value)
+            return const_vop(b.ir, v.value)
         elseif v isa Expr
             v.head === :static_parameter && return UnifiedIR.op_sparam(v.args[1]::Int)
             throw(UnsupportedIR("nested Expr operand $(v.head)"))
