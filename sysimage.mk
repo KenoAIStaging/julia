@@ -148,7 +148,7 @@ $$(build_private_libdir)/sysbase$1-o.a $$(build_private_libdir)/sysbase$1-bc.a :
 	fi )
 	@mv $$@.tmp $$@
 build_sysbase_$1 := $$(or $$(CROSS_BOOTSTRAP_SYSBASE),$$(build_private_libdir)/sysbase$1.$$(SHLIB_EXT))
-$$(build_private_libdir)/sys$1-o.a $$(build_private_libdir)/sys$1-bc.a : $$(build_private_libdir)/sys$1-%.a : $$(build_sysbase_$1) $$(SYS_STAGE_SCRIPT)
+$$(build_private_libdir)/sys$1-o.a $$(build_private_libdir)/sys$1-bc.a : $$(build_private_libdir)/sys$1-%.a : $$(build_sysbase_$1) $$(SYS_STAGE_DEPS) $$(SYS_STAGE_STAMP)
 	@$$(call PRINT_JULIA, cd $$(JULIAHOME)/base && \
 	if ! JULIA_BINDIR=$$(call cygpath_w,$(build_bindir)) \
 		 WINEPATH="$$(call cygpath_w,$$(build_bindir));$$$$WINEPATH" \
@@ -181,8 +181,22 @@ UNIFIED_BOOT_SRCS := $(shell find $(JULIAHOME)/Compiler/src/unified $(JULIAHOME)
 # persists into the image) the precompile workload.
 ifeq ($(UNIFIED_SYSIMAGE),1)
 SYS_STAGE_SCRIPT := $(JULIAHOME)/Compiler/src/unified/bootstrap_driver.jl
+# the driver bakes the unified/ port sources into the image and then runs
+# the stock generate_precompile workload, so the sys image must rebuild
+# when any of them change
+SYS_STAGE_DEPS := $(SYS_STAGE_SCRIPT) $(JULIAHOME)/contrib/generate_precompile.jl $(UNIFIED_BOOT_SRCS)
 else
 SYS_STAGE_SCRIPT := $(JULIAHOME)/contrib/generate_precompile.jl
+SYS_STAGE_DEPS := $(SYS_STAGE_SCRIPT)
+endif
+
+# make only compares file timestamps, so toggling UNIFIED_SYSIMAGE alone
+# would leave an existing sys.so of the other flavor looking up to date;
+# record the flavor in a stamp (rewritten only when it changes) and make
+# the sys stage depend on it
+SYS_STAGE_STAMP := $(build_private_libdir)/sys_stage_flavor
+ifneq ($(shell cat $(SYS_STAGE_STAMP) 2>/dev/null),$(notdir $(SYS_STAGE_SCRIPT)))
+$(shell mkdir -p $(build_private_libdir) && echo $(notdir $(SYS_STAGE_SCRIPT)) > $(SYS_STAGE_STAMP))
 endif
 
 define UNIFIED_sysimg_builder
