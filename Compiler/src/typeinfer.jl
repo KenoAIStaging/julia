@@ -1512,6 +1512,10 @@ struct UnifiedHooks
     typeinf_code::Any
     infer_effects::Any
     infer_exception_type::Any
+    # route C-driven inference (jl_typeinf_func -> typeinf_ext_toplevel)
+    # through the hooks as well; reflection-only consumers leave this off
+    # so runtime compilation stays on the stock path
+    global_mode::Bool
 end
 const UNIFIED_HOOKS = RefValue{Any}(nothing)
 
@@ -1791,7 +1795,7 @@ end
 
 function typeinf_ext_toplevel(interp::AbstractInterpreter, mi::MethodInstance, source_mode::UInt8)
     let hooks = unified_hooks(interp)
-        if hooks !== nothing
+        if hooks !== nothing && hooks.global_mode
             ci = hooks.typeinf_ext_toplevel(interp, mi, source_mode)
             ci isa CodeInstance && return ci
         end

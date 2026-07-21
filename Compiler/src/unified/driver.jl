@@ -1399,10 +1399,21 @@ activation, `code_typed`/`infer_effects` show unified results; combined
 with [`activate!`](@ref)'s jl_set_typeinf_func flip, ALL runtime inference
 routes here. Undo with [`disable_pipeline!`](@ref).
 """
-function enable_pipeline!()
+function enable_pipeline!(; global_mode::Bool = false)
     Compiler.UNIFIED_HOOKS[] = Compiler.UnifiedHooks(
         unified_typeinf, unified_typeinf_code,
-        unified_infer_effects, unified_infer_exception_type)
+        unified_infer_effects, unified_infer_exception_type, global_mode)
+    if global_mode
+        # C-driven inference reaches the hooks through jl_typeinf_func,
+        # which is pinned at the sysimage-frozen jl_typeinf_world — older
+        # than this module, so hook calls from that entry MethodError
+        # (interpreter-fallback storms + interpreted-cfunction crashes).
+        # Re-register the stock entry to refresh the pinned world, as
+        # activate_codegen! does. Reflection-only mode never consults the
+        # hooks from that entry, so no refresh is needed (or wanted: test
+        # harnesses measure reflection results against stock execution).
+        ccall(:jl_set_typeinf_func, Cvoid, (Any,), Compiler.typeinf_ext_toplevel)
+    end
     return nothing
 end
 

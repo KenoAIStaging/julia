@@ -276,7 +276,7 @@ function activate!(; mode::Symbol = :native)
     #    stdlib typeinf_ext_toplevel — whose entry consults UNIFIED_HOOKS
     Compiler.activate!(; reflection = false, codegen = true)
     # 3. hooks on: from here every inference request tries unified first
-    enable_pipeline!()
+    enable_pipeline!(global_mode = true)
     GLOBAL_MODE[] = true
     return nothing
 end
