@@ -686,7 +686,6 @@ JL_DLLEXPORT void jl_membarrier(void) {
 }
 
 // Task abandonment callback - defined in task.c
-extern JL_NORETURN void jl_abandon_task_cb(void);
 
 // Interrupt the target thread's current task at its cancellation reset point,
 // if it has one established (used for task cancellation).

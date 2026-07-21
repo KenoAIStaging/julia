@@ -733,7 +733,7 @@ static void deliver_sigint_notification(void) JL_NOTSAFEPOINT
 // cancellation request on the root task, arm the escalation timer, and
 // notify the sigint listener task, which drives the cancellation state
 // machine. Callable from non-Julia threads.
-void jl_sigint_request_cancellation(void) JL_NOTSAFEPOINT
+static void jl_sigint_request_cancellation(void) JL_NOTSAFEPOINT
 {
     jl_ptls_t ptls2 = jl_atomic_load_relaxed(&jl_all_tls_states)[0];
     // Only plant a fresh SAFE request if there is no active request. Repeat
