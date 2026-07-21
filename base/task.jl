@@ -524,16 +524,33 @@ function _wait_multiple(tasks::Vector{Task}, throwexc::Bool=false, all::Bool=fal
         end
     end
 
-    while nremaining > 0
-        exception && failfast && break
-        i = take!(chan)
-        t = tasks[i]
-        waiter_tasks[i] = sentinel
-        done_mask[i] = true
-        exception |= istaskfailed(t)
-        nremaining -= 1
-        # stop early if requested
-        all || break
+    try
+        while nremaining > 0
+            exception && failfast && break
+            i = take!(chan)
+            t = tasks[i]
+            waiter_tasks[i] = sentinel
+            done_mask[i] = true
+            exception |= istaskfailed(t)
+            nremaining -= 1
+            # stop early if requested
+            all || break
+        end
+    catch
+        # The wait was interrupted (e.g. by cancellation of the current task):
+        # deregister our waiter tasks before propagating.
+        for i in findall(.~done_mask)
+            waiter = waiter_tasks[i]
+            waiter === sentinel && continue
+            donenotify = tasks[i].donenotify::ThreadSynchronizer
+            w = @atomic :acquire waiter.waiting_on
+            if w isa WaitEntry
+                @atomicreplace waiter.waiting_on w => nothing
+                @lock donenotify list_deletefirst!(waitqueue(tasks[i]), w)
+            end
+        end
+        close(chan)
+        rethrow()
     end
 
     close(chan)
@@ -1553,17 +1570,11 @@ Core.cancellation_point!
 # request at its next cancellation point.
 cancel_wait!(@nospecialize(waitee), t::Task, @nospecialize(creq)) = false
 
-function cancel_wait!(q::StickyWorkqueue, t::Task, @nospecialize(creq))
-    # Tasks in a workqueue are runnable - we do not cancel anything, the
-    # pending request is observed when the task runs (it counts as delivered:
-    # the task observes it in start_task before running user code).
-    lock(q.lock)
-    try
-        return (t in q.queue)
-    finally
-        unlock(q.lock)
-    end
-end
+# Tasks in a workqueue are runnable, not waiting: there is no wait to
+# interrupt, and the task will only observe the request once it runs (at task
+# start or its next cancellation point), so the request does not count as
+# delivered.
+cancel_wait!(q::StickyWorkqueue, t::Task, @nospecialize(creq)) = false
 
 """
     cancel!(t::Task, crequest=CANCEL_REQUEST_SAFE)
@@ -1715,6 +1726,18 @@ frozen without waiting for it to reach a safe cancellation point.
 """
 function unsafe_abandon!(t::Task, next_task::Task)
     ccall(:jl_abandon_task, Cvoid, (Any, Any), t, next_task)
+    if t.state === :abandoned
+        # An abandoned task never goes through the regular task completion
+        # path, so wake up anyone waiting on it. (The waiters observe the
+        # already-stored abandoned state; they do not touch the task's stack.
+        # The root task's donenotify may be `nothing`.)
+        donenotify = t.donenotify
+        if donenotify isa ThreadSynchronizer
+            lock(donenotify)
+            notify(donenotify)
+            unlock(donenotify)
+        end
+    end
     return nothing
 end
 
