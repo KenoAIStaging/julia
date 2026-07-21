@@ -146,6 +146,22 @@ end
     @test inherited === tok
 end
 
+@testset "source churn survives the weak-processing sweep" begin
+    # A page full of dead, already-unlinked sources must be freeable
+    # wholesale (this used to trip the sweep's freedall assertion once the
+    # post-sweep pass had unlinked the corpses; see gc_sweep_page).
+    root = CancellationTokenSource()
+    for outer in 1:20
+        for i in 1:2000
+            CancellationTokenSource(CancellationToken(root))
+        end
+        GC.gc(false)
+    end
+    GC.gc(true)
+    GC.gc(false)
+    @test Base.iscancelled(CancellationToken(root)) == false
+end
+
 @testset "cancellation points" begin
     # @cancel_check with no scoped token is a no-op
     @test with(() -> (Base.@cancel_check; :ran), CANCEL_TOKEN => nothing) === :ran

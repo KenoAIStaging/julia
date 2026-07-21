@@ -1042,8 +1042,18 @@ static void gc_sweep_page(gc_page_profiler_serializer_t *s, jl_gc_pool_t *p, jl_
         // pool object found on a task stack, including slots past lim_newpages on the
         // currently-active bump-pointer page. Those slots are unconditionally treated
         // as garbage by the sweep (line above: `(char*)v >= lim_newpages`), so
-        // freedall=1 is valid when this is the active newpages page.
-        assert(!freedall || lim_newpages < data + GC_PAGE_SZ);
+        // freedall=1 is valid when this is the active newpages page. It is also
+        // valid on a page walked only for its weak-processing flag: such a page
+        // has no marked objects to begin with and may turn out to hold no
+        // still-linked corpses either (e.g. they were unlinked by an earlier
+        // post-sweep pass), in which case every cell is freed.
+        assert(!freedall || lim_newpages < data + GC_PAGE_SZ || has_weakproc);
+        if (freedall) {
+            // Nothing needing weak processing survives on a fully-freed page;
+            // drop the sticky flag so future sweeps can take the wholesale
+            // fast path again.
+            pg->has_weak_processing = 0;
+        }
         pg->has_marked = has_marked;
         pg->has_young = has_young;
         if (pfl_begin) {
