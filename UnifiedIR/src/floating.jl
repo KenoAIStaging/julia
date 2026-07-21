@@ -4,8 +4,7 @@
 struct CausalityError <: Exception
     cycle::Vector{StmtId}
 end
-Base.showerror(io::IO, e::CausalityError) =
-    print(io, "CausalityError: instantaneous cycle through ", join(e.cycle, " → "))
+# (showerror method in print.jl — display code loads post-Base, load_syntax!)
 
 "Is this statement reorderable (§4.3): REMOVABLE mask, or dialect-declared?"
 function reorderable(ir::IR, s::StmtId)
@@ -27,11 +26,11 @@ function float!(ir::IR)
     flush_renames!(ir)
     for s in each_stmt(ir)
         reorderable(ir, s) ||
-            error("float!: %$(s.id) ($(kindname(stmt_kind(ir, s)))) is not reorderable (pure-but-throwing or potentially nonterminating operations may not float)")
+            error(LazyString("float!: %", s.id, " (", kindname(stmt_kind(ir, s)), ") is not reorderable (pure-but-throwing or potentially nonterminating operations may not float)"))
         owns_regions(stmt_kind(ir, s)) &&
-            error("float!: %$(s.id) owns regions; floating control structure is guard-only")
+            error(LazyString("float!: %", s.id, " owns regions; floating control structure is guard-only"))
         is_terminator(stmt_kind(ir, s)) &&
-            error("float!: %$(s.id) is a terminator")
+            error(LazyString("float!: %", s.id, " is a terminator"))
     end
     ir.owner.state = LAYOUT_FLOATING
     ir.meta[:floating_node] = true
@@ -75,13 +74,13 @@ function schedule!(ir::IR; strategy::Symbol = :asap)
 
     # region-grouped scheduling: recursively schedule each region's units
     # (member stmts + child regions), topologically by external deps.
-    children = Dict{Int32,Vector{Int32}}()
+    children = IdDict{Int32,Vector{Int32}}()
     for (ri, reg) in enumerate(ir.regions)
         reg.dead && continue
         isnull(reg.parent) && continue
         push!(get!(() -> Int32[], children, reg.parent.id), Int32(ri))
     end
-    members = Dict{Int32,Vector{Int32}}()
+    members = IdDict{Int32,Vector{Int32}}()
     for i in 1:n
         body.kind[i] === KIND_DELETED && continue
         push!(get!(() -> Int32[], members, body.region[i].id), Int32(i))
@@ -100,7 +99,7 @@ function schedule!(ir::IR; strategy::Symbol = :asap)
     end
 
     order = Int32[]                     # emitted old ids, in new order
-    spans = Dict{Int32,Tuple{Int,Int}}() # old region id -> (first,last) new pos
+    spans = IdDict{Int32,Tuple{Int,Int}}() # old region id -> (first,last) new pos
 
     function schedule_region!(ri::Int32)
         firstpos = length(order) + 1
@@ -113,8 +112,8 @@ function schedule!(ir::IR; strategy::Symbol = :asap)
             push!(units, (:region, r))
         end
         # unit deps: stmt ids outside the unit
-        unit_of_stmt = Dict{Int32,Int}()
-        stmtsets = Dict{Int,Vector{Int32}}()
+        unit_of_stmt = IdDict{Int32,Int}()
+        stmtsets = IdDict{Int,Vector{Int32}}()
         for (ui, (t, id)) in enumerate(units)
             ss = t === :stmt ? Int32[id] : region_stmtset(id)
             stmtsets[ui] = ss
@@ -122,10 +121,10 @@ function schedule!(ir::IR; strategy::Symbol = :asap)
                 unit_of_stmt[s] = ui
             end
         end
-        pending = Dict{Int,Set{Int}}()  # unit -> units it waits on (within this region)
-        rdeps = Dict{Int,Vector{Int}}()
+        pending = IdDict{Int,BitSet}()  # unit -> units it waits on (within this region)
+        rdeps = IdDict{Int,Vector{Int}}()
         for (ui, ss) in stmtsets
-            waits = Set{Int}()
+            waits = BitSet()
             for s in ss, d in deps[s]
                 du = get(unit_of_stmt, d, 0)
                 (du != 0 && du != ui) && push!(waits, du)
@@ -136,8 +135,8 @@ function schedule!(ir::IR; strategy::Symbol = :asap)
             push!(get!(() -> Int[], rdeps, w), ui)
         end
         # Kahn with deterministic tie-break (smallest original id first)
-        ready = sort([ui for (ui, w) in pending if isempty(w)];
-                     by = ui -> minimum(stmtsets[ui]; init = Int32(typemax(Int32))))
+        unitkey(ui) = _minimum_init(stmtsets[ui], Int32(typemax(Int32)))
+        ready = _sort!([ui for (ui, w) in pending if isempty(w)]; by = unitkey)
         emitted = 0
         while !isempty(ready)
             ui = popfirst!(ready)
@@ -152,8 +151,7 @@ function schedule!(ir::IR; strategy::Symbol = :asap)
                 delete!(pending[w], ui)
                 if isempty(pending[w])
                     # insert keeping deterministic order
-                    pos = searchsortedfirst(ready, w;
-                        by = x -> minimum(stmtsets[x]; init = Int32(typemax(Int32))))
+                    pos = _searchsortedfirst_by(ready, w, unitkey)
                     insert!(ready, pos, w)
                 end
             end
@@ -166,7 +164,7 @@ function schedule!(ir::IR; strategy::Symbol = :asap)
                     push!(cyc, StmtId(s))
                 end
             end
-            throw(CausalityError(sort!(cyc; by = s -> s.id)))
+            throw(CausalityError(_sort!(cyc; by = s -> s.id)))
         end
         spans[ri] = (firstpos, length(order))
         return nothing
@@ -186,7 +184,7 @@ function schedule!(ir::IR; strategy::Symbol = :asap)
     end
 
     newconsts = Any[]; newconstmap = IdDict{Any,Int}()
-    newglobals = GlobalRef[]; newglobalmap = Dict{GlobalRef,Int}()
+    newglobals = GlobalRef[]; newglobalmap = IdDict{GlobalRef,Int}()
     const_map = zeros(Int32, length(body.constants))
     global_map = zeros(Int32, length(body.globals))
     newpool = Operand[]

@@ -64,7 +64,7 @@ mutable struct AttrGraph{Cols}
 end
 
 AttrGraph(cols) = AttrGraph{typeof(cols)}(0, Kind[], UInt64[], Operand[], cols)
-AttrGraph() = AttrGraph(Dict{Symbol,Any}())
+AttrGraph() = AttrGraph(IdDict{Symbol,Any}())
 
 "Sibling handle sharing row/pool storage, with a different column set."
 with_cols(g::AttrGraph, cols) =
@@ -293,7 +293,7 @@ hasattrcol(g::AttrGraph{<:NamedTuple}, name::Symbol) = haskey(g.cols, name)
 
 "Ensure a Dict-mode attribute column exists (`mk()` constructs the container)."
 ensure_attrcol!(g::AttrGraph{<:AbstractDict{Symbol}}, name::Symbol,
-                mk = () -> Dict{Int,Any}()) = get!(mk, g.cols, name)
+                mk = () -> IdDict{Int,Any}()) = get!(mk, g.cols, name)
 
 delete_attrcol!(g::AttrGraph{<:AbstractDict{Symbol}}, name::Symbol) = delete!(g.cols, name)
 
@@ -307,7 +307,7 @@ delattrnode!(g::AttrGraph, id::Integer, name::Symbol) =
 # Dict-shaped columns participate in the standard §3.5 compaction protocol
 # too (a Dict column in an IR universe compacts like SparseCol does).
 function col_compact!(c::AbstractDict{<:Integer}, old_of_new::Vector{Int32})
-    new_of_old = Dict{Int,Int}(Int(old_of_new[i]) => i for i in 1:length(old_of_new))
+    new_of_old = IdDict{Int,Int}(Int(old_of_new[i]) => i for i in 1:length(old_of_new))
     entries = collect(c)
     empty!(c)
     for (k, v) in entries
@@ -371,7 +371,7 @@ function compact_graph!(g::AttrGraph, roots;
     live = falses(n)
     stack = Int[]
     function mark!(id::Int)
-        (1 <= id <= n) || throw(ArgumentError("node id $id out of range 1:$n"))
+        (1 <= id <= n) || throw(ArgumentError(LazyString("node id ", id, " out of range 1:", n)))
         if !live[id]
             live[id] = true
             push!(stack, id)
@@ -382,8 +382,10 @@ function compact_graph!(g::AttrGraph, roots;
     end
     while !isempty(stack)
         id = pop!(stack)
-        for c in child_ids(g, id)
-            mark!(Int(c))
+        # (bootstrap dialect: decode the pool range directly — `child_ids`'s
+        # `view` porcelain is post-Base)
+        for j in children_range(g, id)
+            mark!(_edge_id(g.operands[j]))
         end
         if attr_refs !== nothing
             foreachcol(g.cols) do name, col
@@ -413,7 +415,7 @@ function compact_graph!(g::AttrGraph, roots;
     newpool = Operand[]
     remap_edge = o -> begin
         m = remap[_edge_id(o)]
-        m == 0 && error("compact_graph!: live node has dead child $(_edge_id(o))")
+        m == 0 && error(LazyString("compact_graph!: live node has dead child ", _edge_id(o)))
         _edge_word(m)
     end
     for old in 1:n

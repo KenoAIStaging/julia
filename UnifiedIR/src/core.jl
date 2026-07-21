@@ -5,8 +5,29 @@
 # Regions (§3.3)
 # ---------------------------------------------------------------------------
 
-@enum RegionKind::UInt8 REGION_BODY REGION_ARM REGION_GUARD REGION_LOOP_BODY REGION_HANDLER REGION_BLOCK
-@enum Activation::UInt8 ACT_IMMEDIATE ACT_DEFERRED ACT_RESUME
+# (Bootstrap dialect: UInt8-wrapper structs + named consts in place of @enum —
+# see compat.jl.)
+struct RegionKind
+    x::UInt8
+end
+const REGION_BODY      = RegionKind(0x00)
+const REGION_ARM       = RegionKind(0x01)
+const REGION_GUARD     = RegionKind(0x02)
+const REGION_LOOP_BODY = RegionKind(0x03)
+const REGION_HANDLER   = RegionKind(0x04)
+const REGION_BLOCK     = RegionKind(0x05)
+const _REGION_KIND_NAMES = (:REGION_BODY, :REGION_ARM, :REGION_GUARD,
+                            :REGION_LOOP_BODY, :REGION_HANDLER, :REGION_BLOCK)
+Base.show(io::IO, k::RegionKind) = print(io, _REGION_KIND_NAMES[Int(k.x) + 1])
+
+struct Activation
+    x::UInt8
+end
+const ACT_IMMEDIATE = Activation(0x00)
+const ACT_DEFERRED  = Activation(0x01)
+const ACT_RESUME    = Activation(0x02)
+const _ACTIVATION_NAMES = (:ACT_IMMEDIATE, :ACT_DEFERRED, :ACT_RESUME)
+Base.show(io::IO, a::Activation) = print(io, _ACTIVATION_NAMES[Int(a.x) + 1])
 
 mutable struct Region
     kind::RegionKind
@@ -54,13 +75,13 @@ mutable struct IRBody{Cols}
     constants::Vector{Any}
     constmap::IdDict{Any,Int}     # egal interning (§13.8)
     globals::Vector{GlobalRef}
-    globalmap::Dict{GlobalRef,Int}
+    globalmap::IdDict{GlobalRef,Int}
 end
 
 IRBody(cols) = IRBody{typeof(cols)}(AttrGraph(cols), Any[], UInt32[],
                                     NTuple{3,Int32}[], RegionId[],
                                     Any[], IdDict{Any,Int}(),
-                                    GlobalRef[], Dict{GlobalRef,Int}())
+                                    GlobalRef[], IdDict{GlobalRef,Int}())
 
 @inline function Base.getproperty(b::IRBody, name::Symbol)
     if name === :len || name === :kind || name === :ops || name === :operands ||
@@ -88,20 +109,33 @@ Base.propertynames(b::IRBody) =
 # ---------------------------------------------------------------------------
 
 mutable struct AnalysisCache
-    entries::Dict{Any,Any}     # key = (analysis type, config)
+    # key = (analysis type, config). Egal-keyed (bootstrap dialect + compiler
+    # hygiene): keys must be Symbols, Strings, or egal-comparable bits
+    # values — a MUTABLE config object (e.g. a Vector) is keyed by identity,
+    # not content.
+    entries::IdDict{Any,Any}
     stmt_epoch::UInt64
     region_epoch::UInt64
     type_epoch::UInt64
     flag_epoch::UInt64
     layout_epoch::UInt64
 end
-AnalysisCache() = AnalysisCache(Dict{Any,Any}(), 0, 0, 0, 0, 0)
+AnalysisCache() = AnalysisCache(IdDict{Any,Any}(), 0, 0, 0, 0, 0)
 
 # ---------------------------------------------------------------------------
 # Layout states and the IR handle (§2.2, §3.1)
 # ---------------------------------------------------------------------------
 
-@enum LayoutState::UInt8 LAYOUT_BUILDER LAYOUT_DENSE LAYOUT_EDITABLE LAYOUT_FLOATING
+struct LayoutState
+    x::UInt8
+end
+const LAYOUT_BUILDER  = LayoutState(0x00)
+const LAYOUT_DENSE    = LayoutState(0x01)
+const LAYOUT_EDITABLE = LayoutState(0x02)
+const LAYOUT_FLOATING = LayoutState(0x03)
+const _LAYOUT_STATE_NAMES = (:LAYOUT_BUILDER, :LAYOUT_DENSE, :LAYOUT_EDITABLE,
+                             :LAYOUT_FLOATING)
+Base.show(io::IO, st::LayoutState) = print(io, _LAYOUT_STATE_NAMES[Int(st.x) + 1])
 
 mutable struct BodyOwner
     state::LayoutState
@@ -131,7 +165,7 @@ mutable struct IR{Cols}
     edit::Union{Nothing,EditState}
     pending::Vector{Pair{StmtId,Operand}}   # queued replace_uses!
     cache::AnalysisCache
-    meta::Dict{Symbol,Any}    # :name, :module, source linetable, etc.
+    meta::IdDict{Symbol,Any}  # :name, :module, source linetable, etc.
 end
 
 const NOCOLS = NamedTuple()
@@ -142,11 +176,11 @@ nstmts(ir::IR) = Int(ir.body.len)
 nregions(ir::IR) = length(ir.regions)
 
 function check_state(ir::IR, want::LayoutState, what::String)
-    layout(ir) === want || error("$what requires $(want) layout state; IR is in $(layout(ir))")
+    layout(ir) === want || error(LazyString(what, " requires ", want, " layout state; IR is in ", layout(ir)))
     return nothing
 end
 function check_state(ir::IR, want::Tuple{Vararg{LayoutState}}, what::String)
-    layout(ir) in want || error("$what requires one of $(want); IR is in $(layout(ir))")
+    layout(ir) in want || error(LazyString(what, " requires one of ", want, "; IR is in ", layout(ir)))
     return nothing
 end
 
@@ -185,11 +219,11 @@ function getop(ir::IR, s::StmtId, i::Integer)::Operand
     w = ir.body.ops[s.id]
     if is_ops_inline(w)
         a = inline_arity(w)
-        1 <= i <= a || throw(BoundsError("operand $i of $(a)-ary inline stmt"))
+        1 <= i <= a || throw(BoundsError(LazyString("operand ", i, " of ", a, "-ary inline stmt")))
         return i == 1 ? op_stmt(inline_stmt(w)) : op_inline(inline_imm(w))
     else
         len = ops_len(w)
-        1 <= i <= len || throw(BoundsError("operand $i of $(len)-ary stmt"))
+        1 <= i <= len || throw(BoundsError(LazyString("operand ", i, " of ", len, "-ary stmt")))
         return ir.body.operands[ops_offset(w) + i]
     end
 end
@@ -204,11 +238,11 @@ function setop!(ir::IR, s::StmtId, i::Integer, o::Operand)
             imm = Int(imm_value(o))
             ir.body.ops[s.id] = ops_inline(inline_stmt(ir.body.ops[s.id]), imm, inline_arity(w))
         else
-            error("cannot store $(optag(o))-tagged operand into inline slot $i")
+            error(LazyString("cannot store ", optag(o), "-tagged operand into inline slot ", i))
         end
     else
         len = ops_len(w)
-        1 <= i <= len || throw(BoundsError("operand $i of $(len)-ary stmt"))
+        1 <= i <= len || throw(BoundsError(LazyString("operand ", i, " of ", len, "-ary stmt")))
         ir.body.operands[ops_offset(w) + i] = o
     end
     ir.cache.stmt_epoch += 1
@@ -293,7 +327,7 @@ function op_value(ir::IR, o::Operand)
     t == TAG_CONST && return (:const, ir.body.constants[payload(o)])
     t == TAG_GLOBAL && return (:global, ir.body.globals[payload(o)])
     t == TAG_SPARAM && return (:sparam, Int(payload(o)))
-    error("operand tag $t is not a value operand")
+    error(LazyString("operand tag ", t, " is not a value operand"))
 end
 
 # ---------------------------------------------------------------------------
@@ -425,11 +459,12 @@ function island_visible(ir::IR, def::StmtId, use_at::StmtId)
 end
 
 """
-    island_dominators(ir, cfgop) -> Dict{RegionId,Set{RegionId}}
+    island_dominators(ir, cfgop) -> IdDict{RegionId,IdSet{RegionId}}
 
 Dominator sets over one island's block graph (entry = first owned block;
-edges from terminator edge bundles). Set-based iteration — islands are small
-and the result is a candidate `AnalysisCache` entry.
+edges from terminator edge bundles); each entry maps an entry-reachable block
+to its dominator blocks. BitSet-based iteration over local block indices —
+islands are small and the result is a candidate `AnalysisCache` entry.
 """
 function island_dominators(ir::IR, cfgop::StmtId)
     blocks = RegionId[]
@@ -437,57 +472,84 @@ function island_dominators(ir::IR, cfgop::StmtId)
         reg.owner == cfgop && reg.kind === REGION_BLOCK && !reg.dead &&
             push!(blocks, RegionId(i))
     end
-    isempty(blocks) && return Dict{RegionId,Set{RegionId}}()
-    succs = Dict{RegionId,Vector{RegionId}}()
-    for b in blocks
+    dom = IdDict{RegionId,IdSet{RegionId}}()
+    isempty(blocks) && return dom
+    nb = length(blocks)
+    lidx = IdDict{Int32,Int}()          # region id -> local block index
+    for (i, b) in enumerate(blocks)
+        lidx[b.id] = i
+    end
+    # local successor lists; cross-island successors (sealed exits, §5.5) are
+    # not part of the local graph
+    succs = Vector{Vector{Int}}(undef, nb)
+    for (bi, b) in enumerate(blocks)
+        ss = Int[]
         t = region_terminator(ir, b)
-        ss = RegionId[]
         if t !== nothing && (stmt_kind(ir, t) === K"goto" || stmt_kind(ir, t) === K"br_if" ||
                              stmt_kind(ir, t) === K"switch" || stmt_kind(ir, t) === K"await")
             for (dest, _) in edge_bundles(ir, t)
-                push!(ss, dest)
+                si = get(lidx, dest.id, 0)
+                si == 0 || push!(ss, si)
             end
         end
-        succs[b] = ss
+        succs[bi] = ss
     end
-    entry = blocks[1]
-    ownset = Set{RegionId}(blocks)
     # dominators are defined over the entry-reachable subgraph of THIS island;
-    # cross-island successors (sealed exits, §5.5) are not part of the local
-    # graph. Unreachable blocks get no entry (use sites vacuously visible).
-    reach = Set{RegionId}([entry])
-    stack = RegionId[entry]
+    # unreachable blocks get no entry (use sites vacuously visible).
+    reach = falses(nb)
+    reach[1] = true
+    stack = Int[1]
     while !isempty(stack)
-        b = pop!(stack)
-        for s in succs[b]
-            s in ownset || continue
-            s in reach || (push!(reach, s); push!(stack, s))
+        bi = pop!(stack)
+        for si in succs[bi]
+            reach[si] || (reach[si] = true; push!(stack, si))
         end
     end
-    rblocks = [b for b in blocks if b in reach]
-    dom = Dict{RegionId,Set{RegionId}}(entry => Set([entry]))
-    all_set = Set(rblocks)
-    for b in rblocks
-        b == entry && continue
-        dom[b] = copy(all_set)
+    all_set = BitSet()
+    for bi in 1:nb
+        reach[bi] && push!(all_set, bi)
     end
-    preds = Dict{RegionId,Vector{RegionId}}(b => RegionId[] for b in rblocks)
-    for b in rblocks, s in succs[b]
-        (s in ownset && s in reach) && push!(preds[s], b)
+    ldom = Vector{BitSet}(undef, nb)
+    ldom[1] = BitSet((1,))
+    for bi in 2:nb
+        reach[bi] && (ldom[bi] = copy(all_set))
+    end
+    preds = [Int[] for _ in 1:nb]
+    for bi in 1:nb
+        reach[bi] || continue
+        for si in succs[bi]
+            reach[si] && push!(preds[si], bi)
+        end
     end
     changed = true
     while changed
         changed = false
-        for b in rblocks
-            b == entry && continue
-            ps = preds[b]
-            newset = isempty(ps) ? Set([b]) :
-                     union(Set([b]), intersect((dom[p] for p in ps)...))
-            if newset != dom[b]
-                dom[b] = newset
+        for bi in 2:nb
+            reach[bi] || continue
+            ps = preds[bi]
+            newset = if isempty(ps)
+                BitSet((bi,))
+            else
+                t = copy(ldom[ps[1]])
+                for k in 2:length(ps)
+                    intersect!(t, ldom[ps[k]])
+                end
+                push!(t, bi)
+                t
+            end
+            if newset != ldom[bi]
+                ldom[bi] = newset
                 changed = true
             end
         end
+    end
+    for bi in 1:nb
+        reach[bi] || continue
+        s = IdSet{RegionId}()
+        for li in ldom[bi]
+            push!(s, blocks[li])
+        end
+        dom[blocks[bi]] = s
     end
     return dom
 end

@@ -62,7 +62,7 @@ op_sparam(i::Integer) = mkoperand(TAG_SPARAM, i)
 
 function op_inline(x::Int64)
     # signed 56-bit range check
-    (-(Int64(1) << 55) <= x < (Int64(1) << 55)) || throw(ArgumentError("immediate out of range: $x"))
+    (-(Int64(1) << 55) <= x < (Int64(1) << 55)) || throw(ArgumentError(LazyString("immediate out of range: ", x)))
     mkoperand(TAG_INLINE, (UInt64(IMM_INT) << 56) | (x % UInt64 & ((UInt64(1) << 56) - 1)))
 end
 op_inline(x::Bool) = mkoperand(TAG_INLINE, (UInt64(IMM_BOOL) << 56) | UInt64(x))
@@ -109,7 +109,7 @@ function ops_inline(stmt::StmtId, imm::Union{Nothing,Int}, arity::Int)
     @assert 1 <= arity <= 2
     immbits = imm === nothing ? UInt64(0) : (UInt64(imm % UInt32) & 0xffffff)
     if imm !== nothing
-        (-(1 << 23) <= imm < (1 << 23)) || throw(ArgumentError("inline immediate out of range: $imm"))
+        (-(1 << 23) <= imm < (1 << 23)) || throw(ArgumentError(LazyString("inline immediate out of range: ", imm)))
     end
     OPS_INLINE_BIT | (UInt64(arity) << 61) | (immbits << 32) | (UInt64(stmt.id % UInt32))
 end

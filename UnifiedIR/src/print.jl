@@ -2,6 +2,12 @@
 # subset round-trips against structural equality; unsupported constants print
 # as opaque markers the parser rejects cleanly.
 
+# Error display for the core's exception types (defined here rather than at
+# their structs: `Base.showerror` does not exist at the basecompiler stage).
+Base.showerror(io::IO, e::VerifyError) = print(io, "VerifyError: ", e.msg)
+Base.showerror(io::IO, e::CausalityError) =
+    print(io, "CausalityError: instantaneous cycle through ", join(e.cycle, " → "))
+
 "Print `ir` to `io` (or return a String with no io argument)."
 function print_ir(io::IO, ir::IR; name::Union{Nothing,Symbol} = nothing)
     fname = something(name, get(ir.meta, :name, :f))

@@ -95,7 +95,7 @@ using UnifiedIR: AttrGraph, KIND_UNSET, OPS_LEAF, newrow!, newnode!, setchildren
         setattrnode!(g, a, :name, "root")
         @test getattrnode(g, a, :name, nothing) == "root"
         @test getattrnode(g, b, :name, :missing) === :missing
-        @test getattrcol(g, :name) isa Dict{Int,Any}
+        @test getattrcol(g, :name) isa IdDict{Int,Any}
         # sibling view shares node storage but not the column set
         g2 = with_cols(g, Dict{Symbol,Any}())
         @test nnodes(g2) == 2
@@ -123,7 +123,9 @@ using UnifiedIR: AttrGraph, KIND_UNSET, OPS_LEAF, newrow!, newnode!, setchildren
         @test is_leaf(g, 2) && is_leaf(g, 4)
         @test [node_kind(g, i) for i in 1:4] == UnifiedIR.Kind.(1:4)
         col = getattrcol(g, :tag)
-        @test col == Dict{Int,Any}(1 => 10, 2 => 20, 3 => 30, 4 => 40)
+        # default attr columns are IdDict-backed (bootstrap dialect); note
+        # Base defines Dict == IdDict as false, so compare like-for-like
+        @test col == IdDict{Int,Any}(1 => 10, 2 => 20, 3 => 30, 4 => 40)
     end
 
     @testset "compact_graph!: renumbering + orphaned pool reclamation" begin
@@ -157,7 +159,7 @@ using UnifiedIR: AttrGraph, KIND_UNSET, OPS_LEAF, newrow!, newnode!, setchildren
         @test remap == Int32[1, 2, 0, 3, 4]
         @test nnodes(g) == 4
         col = getattrcol(g, :src)
-        @test col == Dict{Int,Any}(2 => 3)   # node 2 kept id 2; ref 4 => new id 3
+        @test col == IdDict{Int,Any}(2 => 3) # node 2 kept id 2; ref 4 => new id 3
         @test collect(child_ids(g, 3)) == [4]
     end
 

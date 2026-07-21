@@ -2,11 +2,14 @@
 # L1: SSA/region semantics (visibility, terminators, arities, activations).
 
 struct VerifyError <: Exception
-    msg::String
+    # AbstractString: verifier messages are LazyStrings (bootstrap dialect —
+    # they materialize at display time, not at throw time)
+    msg::AbstractString
 end
-Base.showerror(io::IO, e::VerifyError) = print(io, "VerifyError: ", e.msg)
+# (showerror method in print.jl — display code loads post-Base, load_syntax!)
 
-verr(msg...) = throw(VerifyError(string(msg...)))
+verr(msg::AbstractString) = throw(VerifyError(msg))
+verr(msg...) = throw(VerifyError(LazyString(msg...)))
 
 """
     verify_ir(ir; level=1)
@@ -26,7 +29,7 @@ function verify_l0(ir::IR)
     # column lengths agree
     for (name, v) in ((:kind, body.kind), (:ops, body.ops), (:type, body.type),
                       (:flag, body.flag), (:debug, body.debug), (:region, body.region))
-        length(v) == n || verr("column $name length $(length(v)) != len $n")
+        length(v) == n || verr(LazyString("column ", name, " length ", length(v), " != len ", n))
     end
     # kinds registered; operand words well-formed; result-arity discipline
     for i in 1:n
@@ -34,45 +37,45 @@ function verify_l0(ir::IR)
         info = try
             kindinfo(k)
         catch
-            verr("stmt %$i: unregistered kind $k")
+            verr(LazyString("stmt %", i, ": unregistered kind ", k))
         end
         k === KIND_DELETED && continue
         s = StmtId(i)
         w = body.ops[i]
         if is_ops_inline(w)
-            has_inline_ops(k) || verr("stmt %$i ($(info.qualified)): inline ops word on non-inline kind")
+            has_inline_ops(k) || verr(LazyString("stmt %", i, " (", info.qualified, "): inline ops word on non-inline kind"))
         else
             off, len = ops_offset(w), ops_len(w)
-            off + len <= length(body.operands) || verr("stmt %$i: operand range out of pool bounds")
+            off + len <= length(body.operands) || verr(LazyString("stmt %", i, ": operand range out of pool bounds"))
         end
         nop = nops(ir, s)
         (nop >= info.minops && (info.maxops < 0 || nop <= info.maxops)) ||
-            verr("stmt %$i ($(info.qualified)): arity $nop outside [$(info.minops), $(info.maxops)]")
+            verr(LazyString("stmt %", i, " (", info.qualified, "): arity ", nop, " outside [", info.minops, ", ", info.maxops, "]"))
         for j in 1:nop
             o = getop(ir, s, j)
             t = optag(o)
             if t == TAG_STMT
-                1 <= payload(o) <= n || verr("stmt %$i operand $j: stmt reference out of range")
+                1 <= payload(o) <= n || verr(LazyString("stmt %", i, " operand ", j, ": stmt reference out of range"))
                 target = StmtId(payload(o) % Int32)
                 body.kind[target.id] === KIND_DELETED &&
-                    verr("stmt %$i operand $j: use of tombstoned %$(target.id)")
+                    verr(LazyString("stmt %", i, " operand ", j, ": use of tombstoned %", target.id))
                 result_arity(body.kind[target.id]) == 0 &&
-                    verr("stmt %$i operand $j: reference to zero-result stmt %$(target.id)")
+                    verr(LazyString("stmt %", i, " operand ", j, ": reference to zero-result stmt %", target.id))
             elseif t == TAG_CONST
-                1 <= payload(o) <= length(body.constants) || verr("stmt %$i: constant index out of range")
+                1 <= payload(o) <= length(body.constants) || verr(LazyString("stmt %", i, ": constant index out of range"))
             elseif t == TAG_GLOBAL
-                1 <= payload(o) <= length(body.globals) || verr("stmt %$i: global index out of range")
+                1 <= payload(o) <= length(body.globals) || verr(LazyString("stmt %", i, ": global index out of range"))
             elseif t == TAG_REGION || t == TAG_BLOCK
-                1 <= payload(o) <= length(ir.regions) || verr("stmt %$i: region reference out of range")
+                1 <= payload(o) <= length(ir.regions) || verr(LazyString("stmt %", i, ": region reference out of range"))
             end
         end
         # escape-hatch constants must be reference-free leaves (§3.2)
         if k === K"value"
             v = getconst(ir, getop(ir, s, 1))
-            refbearing_value(v) && verr("stmt %$i: K\"value\" payload embeds IR references without a codec")
+            refbearing_value(v) && verr(LazyString("stmt %", i, ": K\"value\" payload embeds IR references without a codec"))
         end
         # regions column in range
-        1 <= body.region[i].id <= length(ir.regions) || verr("stmt %$i: region out of range")
+        1 <= body.region[i].id <= length(ir.regions) || verr(LazyString("stmt %", i, ": region out of range"))
     end
     # region table
     nr = length(ir.regions)
@@ -84,33 +87,33 @@ function verify_l0(ir::IR)
             isnull(reg.parent) || verr("root region has a parent")
             isnull(reg.owner) || verr("root region has an owner")
         else
-            (1 <= reg.parent.id <= nr) || verr("region ^r$ri: parent out of range")
+            (1 <= reg.parent.id <= nr) || verr(LazyString("region ^r", ri, ": parent out of range"))
             # acyclicity: walk up with a step bound
             steps = 0
             p = reg.parent
             while !isnull(p)
                 steps += 1
-                steps > nr && verr("region parent chain cycle at ^r$ri")
+                steps > nr && verr(LazyString("region parent chain cycle at ^r", ri))
                 p = getregion(ir, p).parent
             end
         end
         if is_guard(reg)
-            isnull(reg.owner) || verr("guard region ^r$ri has an owner")
+            isnull(reg.owner) || verr(LazyString("guard region ^r", ri, " has an owner"))
         elseif ri != 1
-            isnull(reg.owner) && verr("ordered region ^r$ri has no owner")
+            isnull(reg.owner) && verr(LazyString("ordered region ^r", ri, " has no owner"))
             owns_regions(stmt_kind(ir, reg.owner)) ||
-                verr("region ^r$ri: owner kind $(kindname(stmt_kind(ir, reg.owner))) does not own regions")
+                verr(LazyString("region ^r", ri, ": owner kind ", kindname(stmt_kind(ir, reg.owner)), " does not own regions"))
             stmt_region(ir, reg.owner) == reg.parent ||
-                verr("region ^r$ri: owner's region is not the parent")
+                verr(LazyString("region ^r", ri, ": owner's region is not the parent"))
         end
         if !is_guard(reg) && !isnull(reg.cond)
-            verr("owned region ^r$ri stores a condition (guard regions only)")
+            verr(LazyString("owned region ^r", ri, " stores a condition (guard regions only)"))
         end
         # region_args lead the region and match args list
         for a in reg.args
-            (1 <= a.id <= n) || verr("region ^r$ri: arg out of range")
-            body.kind[a.id] === K"region_arg" || verr("region ^r$ri: arg %$(a.id) is not a region_arg")
-            body.region[a.id] == RegionId(ri) || verr("region ^r$ri: arg %$(a.id) not in region")
+            (1 <= a.id <= n) || verr(LazyString("region ^r", ri, ": arg out of range"))
+            body.kind[a.id] === K"region_arg" || verr(LazyString("region ^r", ri, ": arg %", a.id, " is not a region_arg"))
+            body.region[a.id] == RegionId(ri) || verr(LazyString("region ^r", ri, ": arg %", a.id, " not in region"))
         end
     end
     if layout(ir) === LAYOUT_DENSE || layout(ir) === LAYOUT_BUILDER
@@ -136,21 +139,21 @@ function verify_l0_dense(ir::IR)
         lo, hi = reg.first.id, reg.last.id
         if hi < lo
             # empty region: illegal for ordered regions in sealed dense state
-            layout(ir) === LAYOUT_DENSE && verr("region ^r$ri is empty")
+            layout(ir) === LAYOUT_DENSE && verr(LazyString("region ^r", ri, " is empty"))
             continue
         end
-        (1 <= lo <= hi <= n) || verr("region ^r$ri: span [$lo, $hi] out of range")
+        (1 <= lo <= hi <= n) || verr(LazyString("region ^r", ri, ": span [", lo, ", ", hi, "] out of range"))
         # every stmt in span belongs to this region or a (transitive) descendant
         for i in lo:hi
             r = body.region[i]
-            is_ancestor(ir, RegionId(ri), r) || verr("stmt %$i inside span of ^r$ri but not a descendant")
+            is_ancestor(ir, RegionId(ri), r) || verr(LazyString("stmt %", i, " inside span of ^r", ri, " but not a descendant"))
         end
         # region_args lead
         args_done = false
         for i in lo:hi
             body.region[i] == RegionId(ri) || continue
             if body.kind[i] === K"region_arg"
-                args_done && verr("region ^r$ri: region_arg %$i after non-arg stmts")
+                args_done && verr(LazyString("region ^r", ri, ": region_arg %", i, " after non-arg stmts"))
             else
                 args_done = true
             end
@@ -167,10 +170,10 @@ function verify_l0_dense(ir::IR)
                 is_terminator(body.kind[i]) && (nterm += 1)
             end
             if RegionId(ri) != root_region(ir) || rootbody_needs_terminator(ir)
-                lastdirect == 0 && verr("region ^r$ri has no statements")
+                lastdirect == 0 && verr(LazyString("region ^r", ri, " has no statements"))
                 is_terminator(body.kind[lastdirect]) ||
-                    verr("region ^r$ri does not end in a terminator")
-                nterm == 1 || verr("region ^r$ri has $nterm terminators (want exactly 1)")
+                    verr(LazyString("region ^r", ri, " does not end in a terminator"))
+                nterm == 1 || verr(LazyString("region ^r", ri, " has ", nterm, " terminators (want exactly 1)"))
             end
         end
     end
@@ -184,7 +187,7 @@ function verify_l0_dense(ir::IR)
             for rid in owned_regions(ir, s)
                 reg = getregion(ir, rid)
                 reg.first.id == pos ||
-                    verr("stmt %$i: owned region ^r$(rid.id) starts at $(reg.first.id), expected $pos")
+                    verr(LazyString("stmt %", i, ": owned region ^r", rid.id, " starts at ", reg.first.id, ", expected ", pos))
                 pos = reg.last.id + 1
             end
         end
@@ -211,17 +214,17 @@ function verify_l0_editable(ir::IR)
         seen = 0
         while i != 0
             seen += 1
-            seen > n && verr("region ^r$ri: list cycle")
-            body.region[i] == RegionId(ri) || verr("region ^r$ri list contains foreign stmt %$i")
-            e.prev[i] == prev || verr("region ^r$ri: prev link broken at %$i")
+            seen > n && verr(LazyString("region ^r", ri, ": list cycle"))
+            body.region[i] == RegionId(ri) || verr(LazyString("region ^r", ri, " list contains foreign stmt %", i))
+            e.prev[i] == prev || verr(LazyString("region ^r", ri, ": prev link broken at %", i))
             if prev != 0
-                e.okey[prev] < e.okey[i] || verr("region ^r$ri: okey not increasing at %$i")
+                e.okey[prev] < e.okey[i] || verr(LazyString("region ^r", ri, ": okey not increasing at %", i))
             end
             prev = i
             i = e.next[i]
         end
         reg.last.id == prev || (reg.first.id == 0 && reg.last.id == 0) ||
-            verr("region ^r$ri: tail mismatch")
+            verr(LazyString("region ^r", ri, ": tail mismatch"))
     end
     return true
 end
@@ -242,13 +245,13 @@ function verify_l1(ir::IR)
         def = asstmt(o)
         if site isa StmtOperand
             visible(ir, def, site.user) ||
-                verr("stmt %$(site.user.id) operand $(site.opidx): $(def) is not visible (§5.1)")
+                verr(LazyString("stmt %", site.user.id, " operand ", site.opidx, ": ", def, " is not visible (§5.1)"))
         elseif site isa GuardCondition
             # guard condition must be visible at the region's parent scope
             reg = getregion(ir, site.region)
             dr = stmt_region(ir, def)
             is_ancestor(ir, dr, reg.parent) ||
-                verr("guard ^r$(site.region.id): condition $(def) not defined in an ancestor region")
+                verr(LazyString("guard ^r", site.region.id, ": condition ", def, " not defined in an ancestor region"))
         end
     end
 
@@ -261,30 +264,30 @@ function verify_l1(ir::IR)
             tgt = asregion(getop(ir, s, 1))
             treg = getregion(ir, tgt)
             treg.kind === REGION_LOOP_BODY ||
-                verr("%$i: $(kindname(k)) target ^r$(tgt.id) is not a loop body")
+                verr(LazyString("%", i, ": ", kindname(k), " target ^r", tgt.id, " is not a loop body"))
             is_ancestor(ir, tgt, stmt_region(ir, s)) ||
-                verr("%$i: $(kindname(k)) targets non-ancestor region ^r$(tgt.id)")
+                verr(LazyString("%", i, ": ", kindname(k), " targets non-ancestor region ^r", tgt.id))
             # activation boundary: target must be within the same activation
             activation_root(ir, stmt_region(ir, s)) == activation_root(ir, tgt) ||
-                verr("%$i: $(kindname(k)) crosses an activation boundary")
+                verr(LazyString("%", i, ": ", kindname(k), " crosses an activation boundary"))
             if k === K"continue"
                 nvals = nops(ir, s) - 2
                 nvals == length(treg.args) ||
-                    verr("%$i: continue carries $nvals values for $(length(treg.args)) carried args")
+                    verr(LazyString("%", i, ": continue carries ", nvals, " values for ", length(treg.args), " carried args"))
             end
         elseif k === K"return"
             ar = activation_root(ir, stmt_region(ir, s))
             ar == root_region(ir) || getregion(ir, ar).activation !== ACT_IMMEDIATE ||
-                verr("%$i: return outside function/closure body")
+                verr(LazyString("%", i, ": return outside function/closure body"))
         elseif k === K"result" && !floating
             reg = getregion(ir, stmt_region(ir, s))
             isnull(reg.owner) && stmt_region(ir, s) != root_region(ir) &&
-                verr("%$i: `result` terminator in ownerless region")
+                verr(LazyString("%", i, ": `result` terminator in ownerless region"))
             # result-feeding class (§5.7): a closure body never feeds its
             # owner — the closure's value is the closure itself; body exits
             # are `return`/`unreachable` only
             !isnull(reg.owner) && stmt_kind(ir, reg.owner) === K"closure" &&
-                verr("%$i: `result` in a closure body (closure bodies exit via return/unreachable)")
+                verr(LazyString("%", i, ": `result` in a closure body (closure bodies exit via return/unreachable)"))
         elseif k === K"goto" || k === K"br_if" || k === K"switch" || k === K"await"
             # every BLOCK operand must target a block region of the same (or
             # ancestor, for goto) cfg island; edge arity checked below.
@@ -294,7 +297,7 @@ function verify_l1(ir::IR)
             verify_edges(ir, s)
             for (dest, _) in edge_bundles(ir, s)
                 activation_root(ir, stmt_region(ir, s)) == activation_root(ir, dest) ||
-                    verr("%$i: $(kindname(k)) edge crosses an activation boundary")
+                    verr(LazyString("%", i, ": ", kindname(k), " edge crosses an activation boundary"))
             end
         elseif k === K"closure"
             # §5.7 closure-op discipline: exactly one live owned region, a
@@ -302,20 +305,20 @@ function verify_l1(ir::IR)
             # INLINE flags word (bit 1 = isva)
             rs = [r for r in owned_regions(ir, s) if !getregion(ir, r).dead]
             length(rs) == 1 ||
-                verr("%$i: closure owns $(length(rs)) live regions (want exactly 1)")
+                verr(LazyString("%", i, ": closure owns ", length(rs), " live regions (want exactly 1)"))
             breg = getregion(ir, rs[1])
             breg.kind === REGION_BODY ||
-                verr("%$i: closure region ^r$(rs[1].id) is not a body region")
+                verr(LazyString("%", i, ": closure region ^r", rs[1].id, " is not a body region"))
             breg.activation === ACT_DEFERRED ||
-                verr("%$i: closure region ^r$(rs[1].id) is not ACT_DEFERRED")
+                verr(LazyString("%", i, ": closure region ^r", rs[1].id, " is not ACT_DEFERRED"))
             nops(ir, s) <= 1 ||
-                verr("%$i: closure takes at most one (flags) operand, got $(nops(ir, s))")
+                verr(LazyString("%", i, ": closure takes at most one (flags) operand, got ", nops(ir, s)))
             if nops(ir, s) == 1
                 o = getop(ir, s, 1)
                 (optag(o) == TAG_INLINE && imm_value(o) isa Int64) ||
-                    verr("%$i: closure operand must be an INLINE integer flags word")
+                    verr(LazyString("%", i, ": closure operand must be an INLINE integer flags word"))
                 (imm_value(o)::Int64 & CLOSURE_FLAG_ISVA) != 0 && isempty(breg.args) &&
-                    verr("%$i: isva closure has no region args to pack into")
+                    verr(LazyString("%", i, ": isva closure has no region args to pack into"))
             end
         end
         # cell-class boundary rule (§3.3/§6): a cell op reaching a frame
@@ -331,12 +334,12 @@ function verify_l1(ir::IR)
                 cell = asstmt(o)
                 ck = stmt_kind(ir, cell)
                 (ck === K"cell" || ck === K"cell_shared") ||
-                    verr("%$i: $(kindname(k)) cell operand %$(cell.id) is not a cell")
+                    verr(LazyString("%", i, ": ", kindname(k), " cell operand %", cell.id, " is not a cell"))
                 if ck === K"cell"
                     ur = activation_root(ir, stmt_region(ir, s))
                     ur == activation_root(ir, stmt_region(ir, cell)) ||
                         getregion(ir, ur).activation !== ACT_DEFERRED ||
-                        verr("%$i: frame cell %$(cell.id) referenced across an ",
+                        verr(LazyString("%", i, ": frame cell %", cell.id, " referenced across an "),
                              "activation boundary (frame cells are activation-local; ",
                              "use cell_shared)")
                 end
@@ -351,7 +354,7 @@ function verify_l1(ir::IR)
         (reg.dead || is_guard(reg)) && continue
         reg.activation === ACT_DEFERRED || continue
         (!isnull(reg.owner) && stmt_kind(ir, reg.owner) === K"closure") ||
-            verr("region ^r$ri: ACT_DEFERRED region not owned by a closure")
+            verr(LazyString("region ^r", ri, ": ACT_DEFERRED region not owned by a closure"))
     end
 
     # cfg edge bundles match destination block args (§5.5)
@@ -361,9 +364,9 @@ function verify_l1(ir::IR)
         s = StmtId(i)
         for (dest, args) in edge_bundles(ir, s)
             dreg = getregion(ir, dest)
-            dreg.kind === REGION_BLOCK || verr("%$i: edge target ^r$(dest.id) is not a block")
+            dreg.kind === REGION_BLOCK || verr(LazyString("%", i, ": edge target ^r", dest.id, " is not a block"))
             length(args) == length(dreg.args) ||
-                verr("%$i: edge to ^r$(dest.id) carries $(length(args)) args for $(length(dreg.args)) block args")
+                verr(LazyString("%", i, ": edge to ^r", dest.id, " carries ", length(args), " args for ", length(dreg.args), " block args"))
         end
     end
 
@@ -388,11 +391,11 @@ function verify_l1(ir::IR)
                  stmt_kind(ir, asstmt(v)) === K"gc_preserve_begin") || (allbegin = false)
             end
             (anystore && allbegin) ||
-                verr("%$i: gc_preserve_end cell token is not begin-only")
+                verr(LazyString("%", i, ": gc_preserve_end cell token is not begin-only"))
             continue
         end
         stmt_kind(ir, tok) === K"gc_preserve_begin" ||
-            verr("%$i: gc_preserve_end token is not a gc_preserve_begin")
+            verr(LazyString("%", i, ": gc_preserve_end token is not a gc_preserve_begin"))
         if stmt_region(ir, tok) != stmt_region(ir, s)
             # legal when the begin is visible at the end (ancestor region, or
             # dominating island block); EH scope recovery can also place the
@@ -410,7 +413,7 @@ function verify_l1(ir::IR)
                     end
                     r1 = reg1.parent
                 end
-                sharedtry || verr("%$i: gc_preserve pair split across regions")
+                sharedtry || verr(LazyString("%", i, ": gc_preserve pair split across regions"))
             end
         end
     end
@@ -421,7 +424,7 @@ end
 
 function verify_edges(ir::IR, s::StmtId)
     for (dest, _) in edge_bundles(ir, s)
-        1 <= dest.id <= length(ir.regions) || verr("%$(s.id): edge target out of range")
+        1 <= dest.id <= length(ir.regions) || verr(LazyString("%", s.id, ": edge target out of range"))
     end
 end
 
@@ -476,7 +479,7 @@ function verify_floating_acyclic(ir::IR)
     color = zeros(UInt8, n)   # 0 white, 1 gray, 2 black
     function visit(i::Int)
         color[i] == 2 && return
-        color[i] == 1 && verr("floating: instantaneous dependency cycle through %$i")
+        color[i] == 1 && verr(LazyString("floating: instantaneous dependency cycle through %", i))
         color[i] = 1
         s = StmtId(i)
         k = body.kind[i]

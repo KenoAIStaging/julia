@@ -77,7 +77,7 @@ function compact!(ir::IR)
     newconsts = Any[]
     newconstmap = IdDict{Any,Int}()
     newglobals = GlobalRef[]
-    newglobalmap = Dict{GlobalRef,Int}()
+    newglobalmap = IdDict{GlobalRef,Int}()
     const_map = zeros(Int32, length(body.constants))
     global_map = zeros(Int32, length(body.globals))
 
@@ -85,11 +85,11 @@ function compact!(ir::IR)
         t = optag(o)
         if t == TAG_STMT
             m = stmt_map[payload(o)]
-            m == 0 && error("compact!: live reference to dropped statement %$(payload(o))")
+            m == 0 && error(LazyString("compact!: live reference to dropped statement %", payload(o)))
             return op_stmt(StmtId(m))
         elseif t == TAG_REGION || t == TAG_BLOCK
             m = region_map[payload(o)]
-            m == 0 && error("compact!: live reference to dropped region ^r$(payload(o))")
+            m == 0 && error(LazyString("compact!: live reference to dropped region ^r", payload(o)))
             return mkoperand(t, m)
         elseif t == TAG_CONST
             v = body.constants[payload(o)]

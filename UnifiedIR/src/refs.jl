@@ -2,7 +2,19 @@
 # structure participates in visit_refs/remap_refs with a role; renaming points
 # produce a RemapSet over all compactable namespaces.
 
-@enum RefRole::UInt8 REF_SSA_USE REF_OWNER_LINK REF_ARG_DEF REF_CONTROL_TARGET REF_LAYOUT_ANCHOR
+# (Bootstrap dialect: UInt8-wrapper struct + named consts in place of @enum —
+# see compat.jl.)
+struct RefRole
+    x::UInt8
+end
+const REF_SSA_USE        = RefRole(0x00)
+const REF_OWNER_LINK     = RefRole(0x01)
+const REF_ARG_DEF        = RefRole(0x02)
+const REF_CONTROL_TARGET = RefRole(0x03)
+const REF_LAYOUT_ANCHOR  = RefRole(0x04)
+const _REF_ROLE_NAMES = (:REF_SSA_USE, :REF_OWNER_LINK, :REF_ARG_DEF,
+                         :REF_CONTROL_TARGET, :REF_LAYOUT_ANCHOR)
+Base.show(io::IO, r::RefRole) = print(io, _REF_ROLE_NAMES[Int(r.x) + 1])
 
 "A use site: statement operand or ownerless-guard condition (§3.2)."
 abstract type UseSite end
@@ -34,11 +46,11 @@ function remap(rs::RemapSet, o::Operand)::Operand
     t = optag(o)
     if t == TAG_STMT
         n = rs.stmt[payload(o)]
-        n == 0 && error("remap: reference to dropped statement %$(payload(o))")
+        n == 0 && error(LazyString("remap: reference to dropped statement %", payload(o)))
         return op_stmt(StmtId(n))
     elseif t == TAG_BLOCK || t == TAG_REGION
         n = rs.region[payload(o)]
-        n == 0 && error("remap: reference to dropped region ^r$(payload(o))")
+        n == 0 && error(LazyString("remap: reference to dropped region ^r", payload(o)))
         return mkoperand(t, n)
     elseif t == TAG_CONST
         n = rs.konst[payload(o)]

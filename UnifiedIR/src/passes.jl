@@ -174,7 +174,7 @@ function promote_cells!(ir::IR)
         (escaped || isempty(stores)) && continue
         # cell_new re-undefines: only news preceding every store (the newvar
         # declaration pattern) are harmless; anything else keeps memory form
-        firststore = minimum(s -> s.id, stores)
+        firststore = _minimum(s -> s.id, stores)
         all(nw -> nw.id < firststore, news) || continue
         # Island uses are fine for the DOMINATING case: `dominates_for_cell`
         # only walks region nesting, so a store proves dominance either from

@@ -40,7 +40,7 @@ function new_region!(ir::IR, owner::StmtId, kind::RegionKind;
                      activation::Activation = ACT_IMMEDIATE)
     check_state(ir, LAYOUT_EDITABLE, "new_region!")
     owns_regions(stmt_kind(ir, owner)) ||
-        error("new_region!: kind $(kindname(stmt_kind(ir, owner))) does not own regions")
+        error(LazyString("new_region!: kind ", kindname(stmt_kind(ir, owner)), " does not own regions"))
     reg = Region(kind, owner, stmt_region(ir, owner); activation)
     push!(ir.regions, reg)
     ir.cache.region_epoch += 1
@@ -142,7 +142,10 @@ function wrap_in_if!(ir::IR, first::StmtId, last::StmtId, cond::Value;
         end
     end
     # escaping defs: run members with a result used outside the run subtree
-    inside = Set{Int32}(s.id for s in run)
+    inside = BitSet()
+    for s in run
+        push!(inside, Int(s.id))
+    end
     function in_subtree(u::StmtId)
         u.id in inside && return true
         rr = stmt_region(ir, u)
@@ -176,7 +179,7 @@ function wrap_in_if!(ir::IR, first::StmtId, last::StmtId, cond::Value;
         end
     else
         else_arm === nothing &&
-            error("wrap_in_if!: $(length(escaping)) defs escape the run; supply an else_arm (diverging or producing matching result arity) — §4.2 precondition")
+            error(LazyString("wrap_in_if!: ", length(escaping), " defs escape the run; supply an else_arm (diverging or producing matching result arity) — §4.2 precondition"))
         er = new_region!(ir, ifop, REGION_ARM)
         else_arm(ir, er)
         region_terminator(ir, er) === nothing && error("wrap_in_if!: else_arm did not terminate")
@@ -230,11 +233,14 @@ function wrap_in_loop!(ir::IR, first::StmtId, last::StmtId, cond::Value)
             getregion(ir, rid).parent = bodyr
         end
     end
-    inside = Set{Int32}(s.id for s in run)
+    inside = BitSet()
+    for s in run
+        push!(inside, Int(s.id))
+    end
     each_ssa_use(ir) do site, used
         site isa StmtOperand || return
         used.id in inside && !(site.user.id in inside) &&
-            error("wrap_in_loop!: def %$(used.id) escapes the wrapped run")
+            error(LazyString("wrap_in_loop!: def %", used.id, " escapes the wrapped run"))
     end
     push_stmt!(ir, bodyr, K"continue", op_region(bodyr), cond isa Operand ? cond : op_stmt(cond))
     ir.cache.region_epoch += 1
@@ -256,7 +262,7 @@ tuple results through their `extract`s). The result terminator and the owner are
 function inline_region!(ir::IR, owner::StmtId, keep::RegionId)
     check_state(ir, LAYOUT_EDITABLE, "inline_region!")
     keepreg = getregion(ir, keep)
-    keepreg.owner == owner || error("inline_region!: ^r$(keep.id) is not owned by %$(owner.id)")
+    keepreg.owner == owner || error(LazyString("inline_region!: ^r", keep.id, " is not owned by %", owner.id))
     isempty(keepreg.args) || error("inline_region!: cannot inline a region with region args")
     term = region_terminator(ir, keep)
     parent = stmt_region(ir, owner)
@@ -298,7 +304,7 @@ function inline_region!(ir::IR, owner::StmtId, keep::RegionId)
         end
         counts = use_counts(ir)
         counts[owner.id] == 0 ||
-            error("inline_region!: tuple result of %$(owner.id) escapes beyond extracts")
+            error(LazyString("inline_region!: tuple result of %", owner.id, " escapes beyond extracts"))
     end
     # kill remaining regions and the owner itself
     kill_stmt!(ir, owner)
@@ -328,7 +334,7 @@ function splice_body!(ir::IR, at::StmtId, callee::IR; argmap::Vector{Operand},
         error("splice_body!: column universes differ; convert_universe the callee first (§3.5)")
     croot = getregion(callee, root_region(callee))
     length(argmap) == length(croot.args) ||
-        error("splice_body!: argmap length $(length(argmap)) != callee params $(length(croot.args))")
+        error(LazyString("splice_body!: argmap length ", length(argmap), " != callee params ", length(croot.args)))
     # single-return check + collect
     nret = 0
     retstmt = NULL_STMT
@@ -337,21 +343,21 @@ function splice_body!(ir::IR, at::StmtId, callee::IR; argmap::Vector{Operand},
         nret += 1
         retstmt = StmtId(i)
     end
-    nret <= 1 || error("splice_body!: callee has $nret returns; normalize to one first (v1)")
+    nret <= 1 || error(LazyString("splice_body!: callee has ", nret, " returns; normalize to one first (v1)"))
     (nret == 1 && stmt_region(callee, retstmt) == root_region(callee)) ||
         nret == 0 || error("splice_body!: early return in callee (v1 requires root-level return)")
 
-    stmtmap = Dict{Int32,Operand}()   # callee stmt -> caller operand
+    stmtmap = IdDict{Int32,Operand}()   # callee stmt -> caller operand
     for (i, a) in enumerate(croot.args)
         stmtmap[a.id] = argmap[i]
     end
-    regionmap = Dict{Int32,RegionId}(1 => stmt_region(ir, at))
+    regionmap = IdDict{Int32,RegionId}(Int32(1) => stmt_region(ir, at))
 
     function remap_op(o::Operand)::Operand
         t = optag(o)
         if t == TAG_STMT
             r = get(stmtmap, asstmt(o).id, nothing)
-            r === nothing && error("splice_body!: forward or unmapped reference %$(payload(o)) in callee")
+            r === nothing && error(LazyString("splice_body!: forward or unmapped reference %", payload(o), " in callee"))
             return r
         elseif t == TAG_CONST
             return op_constidx(intern_const!(ir.body, callee.body.constants[payload(o)]))
@@ -359,7 +365,7 @@ function splice_body!(ir::IR, at::StmtId, callee::IR; argmap::Vector{Operand},
             return op_globalidx(intern_global!(ir.body, callee.body.globals[payload(o)]))
         elseif t == TAG_SPARAM
             idx = Int(payload(o))
-            idx <= length(sparams) || error("splice_body!: unsubstituted static parameter $idx")
+            idx <= length(sparams) || error(LazyString("splice_body!: unsubstituted static parameter ", idx))
             return vop(ir, sparams[idx])
         elseif t == TAG_REGION || t == TAG_BLOCK
             rid = get(regionmap, Int32(payload(o)), nothing)

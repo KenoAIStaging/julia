@@ -15,7 +15,7 @@ function editable(ir::IR)
     prev = zeros(Int32, n)
     okey = zeros(UInt64, n)
     # thread per-region lists from dense spans; okey = global position
-    lastin = Dict{Int32,Int32}()   # region id -> last member seen
+    lastin = IdDict{Int32,Int32}()   # region id -> last member seen
     for i in 1:n
         okey[i] = UInt64(i) << 32
         r = ir.body.region[i].id
@@ -25,7 +25,7 @@ function editable(ir::IR)
         lastin[r] = Int32(i)
     end
     # region first/last become list head/tail (heads: first member in span)
-    heads = Dict{Int32,Int32}()
+    heads = IdDict{Int32,Int32}()
     for i in n:-1:1
         heads[ir.body.region[i].id] = Int32(i)
     end

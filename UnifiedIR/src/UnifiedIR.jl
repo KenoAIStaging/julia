@@ -58,28 +58,61 @@ export Kind, StmtId, RegionId, Value, Operand, IR, Builder, RemapSet,
     # test dialect interpreter
     interpret, UClosure
 
-include("kinds.jl")
-include("operands.jl")
-include("columns.jl")
-include("attrgraph.jl")
-include("core.jl")
-include("tree.jl")
-include("refs.jl")
-include("builder.jl")
-include("stmts.jl")
-include("verify.jl")
-include("dense.jl")
-include("editable.jl")
-include("surgery.jl")
-include("compact.jl")
-include("floating.jl")
-include("analysis.jl")
-include("passes.jl")
-include("promote.jl")
-include("testdialect.jl")
-include("print.jl")
-include("parse.jl")
-include("interp.jl")
+# During the Base bootstrap, includes resolve against the build CWD, not
+# this file; route the module's own includes through the DATAROOT path scheme
+# Base_compiler.jl itself uses (the Compiler.jl bootstrap-include pattern).
+const _BOOTSTRAPPING = !Base.isdefined(Base, :end_base_include)
+_include_src(x::String) =
+    Base.include(@__MODULE__, _BOOTSTRAPPING ?
+        Base.strcat(Base.strcat(Base.DATAROOT, "julia/UnifiedIR/src/"), x) : x)
+
+# The compiler-needed core, in the bootstrap dialect (see compat.jl): these
+# files load during the basecompiler bootstrap stage, under the partial Base
+# of COMPILER_SRCS.
+_include_src("compat.jl")
+_include_src("kinds.jl")
+_include_src("operands.jl")
+_include_src("columns.jl")
+_include_src("attrgraph.jl")
+_include_src("core.jl")
+_include_src("refs.jl")
+_include_src("builder.jl")
+_include_src("stmts.jl")
+_include_src("verify.jl")
+_include_src("dense.jl")
+_include_src("editable.jl")
+_include_src("surgery.jl")
+_include_src("compact.jl")
+_include_src("floating.jl")
+_include_src("analysis.jl")
+_include_src("passes.jl")
+_include_src("promote.jl")
+
+# The debug/syntax layer needs the full Base vocabulary (IO, `view`, sort
+# keywords, runtime string interpolation). During the Base bootstrap only the
+# core above loads at the basecompiler stage; base/Base.jl finishes the
+# module with `load_syntax!()` just before JuliaSyntax bootstraps on the
+# substrate (the Compiler `load_irshow!` staging pattern). Every other load
+# context (the LOAD_PATH package instance) loads eagerly below.
+const _SYNTAX_SRCS = ("tree.jl", "testdialect.jl", "print.jl", "parse.jl",
+                      "interp.jl")
+const _syntax_loaded = Base.RefValue(false)
+
+function load_syntax!()
+    _syntax_loaded[] && return nothing
+    _syntax_loaded[] = true
+    for f in _SYNTAX_SRCS
+        _include_src(f)
+    end
+    # upgrade the kind-registry lock shim now that ReentrantLock exists
+    # (post-Base, external dialects may register at runtime from any thread)
+    REGISTRY.lock isa Base.ReentrantLock || (REGISTRY.lock = Base.ReentrantLock())
+    return nothing
+end
+
+if !(parentmodule(@__MODULE__) === Base && !Base.isdefined(Base, :end_base_include))
+    load_syntax!()
+end
 
 function __init__()
     # Session-local kind numbering: re-register the test dialect on load.

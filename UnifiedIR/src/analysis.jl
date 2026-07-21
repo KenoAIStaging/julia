@@ -55,14 +55,14 @@ layouts (membership is region ancestry, not span position).
 """
 function closure_environment(ir::IR, s::StmtId)
     stmt_kind(ir, s) === K"closure" ||
-        error("closure_environment: %$(s.id) is not a closure")
+        error(LazyString("closure_environment: %", s.id, " is not a closure"))
     rs = [r for r in owned_regions(ir, s) if !getregion(ir, r).dead]
     values = StmtId[]
     cells = StmtId[]
     isempty(rs) && return (values = values, cells = cells)
     body = rs[1]
     inside(r::RegionId) = is_ancestor(ir, body, r)
-    seen = Set{Int32}()
+    seen = BitSet()
     for t in each_stmt(ir)
         inside(stmt_region(ir, t)) || continue
         for j in 1:nops(ir, t)
@@ -70,8 +70,8 @@ function closure_environment(ir::IR, s::StmtId)
             optag(o) == TAG_STMT || continue
             d = asstmt(o)
             inside(stmt_region(ir, d)) && continue
-            d.id in seen && continue
-            push!(seen, d.id)
+            Int(d.id) in seen && continue
+            push!(seen, Int(d.id))
             k = stmt_kind(ir, d)
             if k === K"cell" || k === K"cell_shared"
                 push!(cells, d)
@@ -80,8 +80,8 @@ function closure_environment(ir::IR, s::StmtId)
             end
         end
     end
-    sort!(values; by = x -> x.id)
-    sort!(cells; by = x -> x.id)
+    _sort!(values; by = x -> x.id)
+    _sort!(cells; by = x -> x.id)
     return (values = values, cells = cells)
 end
 
@@ -93,7 +93,7 @@ terminators feeding its results.
 """
 function exit_index(ir::IR)
     get_analysis!(ir, :exit_index; deps = (:stmt, :region, :layout)) do ir
-        idx = Dict{StmtId,Vector{StmtId}}()
+        idx = IdDict{StmtId,Vector{StmtId}}()
         for s in each_stmt(ir)
             k = stmt_kind(ir, s)
             if k === K"break" || k === K"continue"

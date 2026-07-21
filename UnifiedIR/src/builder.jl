@@ -18,7 +18,7 @@ function Builder(; cols = NOCOLS, argtypes::Vector{Any} = Any[],
     ir = IR{typeof(cols)}(BodyOwner(LAYOUT_BUILDER, 0), IRBody(cols), Region[],
                           argtypes, sptypes, (UInt64(0), typemax(UInt64)),
                           nothing, Pair{StmtId,Operand}[], AnalysisCache(),
-                          Dict{Symbol,Any}(:name => name))
+                          IdDict{Symbol,Any}(:name => name))
     root = Region(REGION_BODY, NULL_STMT, NULL_REGION)
     root.first = StmtId(1)
     push!(ir.regions, root)
@@ -75,9 +75,9 @@ function append_stmt!(b::Builder, k::Kind, args...;
 end
 
 function check_arity(info::KindInfo, n::Int)
-    n >= info.minops || error("kind $(info.qualified): expected at least $(info.minops) operands, got $n")
+    n >= info.minops || error(LazyString("kind ", info.qualified, ": expected at least ", info.minops, " operands, got ", n))
     info.maxops >= 0 && n > info.maxops &&
-        error("kind $(info.qualified): expected at most $(info.maxops) operands, got $n")
+        error(LazyString("kind ", info.qualified, ": expected at most ", info.maxops, " operands, got ", n))
     return nothing
 end
 
@@ -93,7 +93,7 @@ function open_region!(b::Builder, owner::StmtId;
                       activation::Activation = ACT_IMMEDIATE)
     b.finished && error("builder already finished")
     owns_regions(stmt_kind(b.ir, owner)) || stmt_kind(b.ir, owner) === K"closure" ||
-        error("kind $(kindname(stmt_kind(b.ir, owner))) does not own regions")
+        error(LazyString("kind ", kindname(stmt_kind(b.ir, owner)), " does not own regions"))
     stmt_region(b.ir, owner) == current_region(b) ||
         error("open_region!: owner must be in the current open region")
     r = Region(kind, owner, current_region(b); activation)
@@ -133,7 +133,7 @@ subset).
 """
 function finish!(b::Builder; verify::Bool = true)
     b.finished && error("builder already finished")
-    length(b.open) == 1 || error("finish!: $(length(b.open) - 1) region(s) still open")
+    length(b.open) == 1 || error(LazyString("finish!: ", length(b.open) - 1, " region(s) still open"))
     root = getregion(b.ir, RegionId(1))
     root.last = StmtId(Int(b.ir.body.len))
     b.finished = true

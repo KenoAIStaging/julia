@@ -15,7 +15,7 @@ function replace_stmt!(ir::IR, id::StmtId, k::Kind, args...;
     oldinfo, newinfo = kindinfo(old), kindinfo(k)
     # footprint checks
     (oldinfo.result == 0) == (newinfo.result == 0) ||
-        error("replace_stmt!: result-arity footprint change ($(oldinfo.qualified) -> $(newinfo.qualified))")
+        error(LazyString("replace_stmt!: result-arity footprint change (", oldinfo.qualified, " -> ", newinfo.qualified, ")"))
     oldinfo.is_terminator == newinfo.is_terminator ||
         error("replace_stmt!: terminator footprint change")
     oldinfo.owns_regions == newinfo.owns_regions ||
@@ -53,12 +53,12 @@ function delete_stmt!(ir::IR, id::StmtId)
     check_state(ir, (LAYOUT_DENSE, LAYOUT_EDITABLE), "delete_stmt!")
     k = stmt_kind(ir, id)
     k === KIND_DELETED && return id
-    owns_regions(k) && error("delete_stmt!: %$(id.id) owns regions (use editable surgery)")
-    is_terminator(k) && error("delete_stmt!: %$(id.id) is a terminator")
-    k === K"region_arg" && error("delete_stmt!: %$(id.id) is a region_arg")
+    owns_regions(k) && error(LazyString("delete_stmt!: %", id.id, " owns regions (use editable surgery)"))
+    is_terminator(k) && error(LazyString("delete_stmt!: %", id.id, " is a terminator"))
+    k === K"region_arg" && error(LazyString("delete_stmt!: %", id.id, " is a region_arg"))
     for reg in ir.regions
         is_guard(reg) && reg.cond == id &&
-            error("delete_stmt!: %$(id.id) is a guard-region condition")
+            error(LazyString("delete_stmt!: %", id.id, " is a guard-region condition"))
     end
     body = ir.body
     body.kind[id.id] = KIND_DELETED
@@ -88,14 +88,14 @@ end
 function flush_renames!(ir::IR)
     isempty(ir.pending) && return ir
     # build resolved map with chain collapsing
-    m = Dict{Int32,Operand}()
+    m = IdDict{Int32,Operand}()
     for (old, new) in ir.pending
         m[old.id] = new
     end
     function resolve(o::Operand, seen::Vector{Int32})
         while optag(o) == TAG_STMT && haskey(m, asstmt(o).id)
             sid = asstmt(o).id
-            sid in seen && error("replace_uses!: rename cycle through %$sid")
+            sid in seen && error(LazyString("replace_uses!: rename cycle through %", sid))
             push!(seen, sid)
             o = m[sid]
         end

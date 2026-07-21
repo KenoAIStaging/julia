@@ -25,7 +25,7 @@ kind_uint(k::Kind) = reinterpret(UInt16, k)
 
 function Kind(x::Integer)
     if x < 0 || x > typemax(UInt16)
-        throw(ArgumentError("Kind out of range: $x"))
+        throw(ArgumentError(LazyString("Kind out of range: ", x)))
     end
     return Base.bitcast(Kind, convert(UInt16, x))
 end
@@ -59,7 +59,21 @@ const CLOSURE_FLAG_ISVA = Int64(1)   # bit 1: trailing region_arg packs varargs
 
 # Operand classes for schema declarations. OC_VALUE admits any value-producing
 # operand word (STMT/CONST/INLINE/GLOBAL/SPARAM); the others are exact-tag.
-@enum OpClass::UInt8 OC_VALUE OC_STMT OC_REGION OC_BLOCK OC_CONST OC_IMM OC_ANY
+# (Bootstrap dialect: UInt8-wrapper struct + named consts in place of @enum —
+# see compat.jl.)
+struct OpClass
+    x::UInt8
+end
+const OC_VALUE  = OpClass(0x00)
+const OC_STMT   = OpClass(0x01)
+const OC_REGION = OpClass(0x02)
+const OC_BLOCK  = OpClass(0x03)
+const OC_CONST  = OpClass(0x04)
+const OC_IMM    = OpClass(0x05)
+const OC_ANY    = OpClass(0x06)
+const _OPCLASS_NAMES = (:OC_VALUE, :OC_STMT, :OC_REGION, :OC_BLOCK, :OC_CONST,
+                        :OC_IMM, :OC_ANY)
+Base.show(io::IO, c::OpClass) = print(io, _OPCLASS_NAMES[Int(c.x) + 1])
 
 struct OperandSpec
     name::Symbol
@@ -87,22 +101,32 @@ mutable struct Dialect
     id::UInt16
     mod::Any                        # owning module (Module; or Symbol placeholder)
     kinds::Vector{KindInfo}         # opcode-indexed (opcode 0 => index 1)
-    byname::Dict{Symbol,UInt16}     # opname -> opcode
-    aliases::Dict{Symbol,UInt16}    # range markers (BEGIN_/END_): name -> opcode
+    byname::IdDict{Symbol,UInt16}   # opname -> opcode
+    aliases::IdDict{Symbol,UInt16}  # range markers (BEGIN_/END_): name -> opcode
 end
 
 mutable struct KindRegistry
     opcode_bits::Int
     dialects::Vector{Union{Dialect,Nothing}}  # dialect id d => index d+1 (sparse:
                                               #   reserved ids may be claimed out of order)
-    byname::Dict{Symbol,UInt16}     # dialect name -> dialect id
+    byname::IdDict{Symbol,UInt16}   # dialect name -> dialect id
     # session bindings for external-dialect `K"…"` literals (§3.4):
-    bindings::Dict{Symbol,Base.RefValue{Kind}}   # qualified name -> kind
-    lock::ReentrantLock
+    bindings::IdDict{Symbol,Base.RefValue{Kind}}   # qualified name -> kind
+    # Bootstrap lock shim: `nothing` until the full Base vocabulary exists
+    # (registration during bootstrap is single-threaded); `load_syntax!`
+    # upgrades it to a `ReentrantLock` so post-Base runtime registration of
+    # external dialects is thread-safe.
+    lock::Any
 end
 
-const REGISTRY = KindRegistry(10, Union{Dialect,Nothing}[], Dict{Symbol,UInt16}(),
-                              Dict{Symbol,Base.RefValue{Kind}}(), ReentrantLock())
+const REGISTRY = KindRegistry(10, Union{Dialect,Nothing}[], IdDict{Symbol,UInt16}(),
+                              IdDict{Symbol,Base.RefValue{Kind}}(), nothing)
+
+function _registry_locked(f, reg::KindRegistry)
+    l = reg.lock
+    l === nothing && return f()
+    return lock(f, l)
+end
 
 # Dialect ids 0 (core) .. FIRST_DYNAMIC_DIALECT-1 are statically reservable —
 # the bootstrap stack (core + the vendored syntax dialects) claims fixed ids
@@ -134,9 +158,9 @@ end
 
 function kindinfo(k::Kind)::KindInfo
     dia = dialect(k)
-    dia === nothing && throw(ArgumentError("unregistered dialect in kind $(kind_uint(k))"))
+    dia === nothing && throw(ArgumentError(LazyString("unregistered dialect in kind ", kind_uint(k))))
     oc = opcode(k)
-    oc < length(dia.kinds) || throw(ArgumentError("unregistered opcode $oc in dialect $(dia.name)"))
+    oc < length(dia.kinds) || throw(ArgumentError(LazyString("unregistered opcode ", oc, " in dialect ", dia.name)))
     return dia.kinds[oc + 1]
 end
 
@@ -152,11 +176,11 @@ dialect gets the next free session-local id. `mod` records the owning module
 """
 function register_dialect!(name::Symbol; id::Union{Nothing,Integer} = nothing,
                            mod = nothing)
-    lock(REGISTRY.lock) do
+    _registry_locked(REGISTRY) do
         if haskey(REGISTRY.byname, name)
             d = REGISTRY.dialects[REGISTRY.byname[name] + 1]::Dialect
             id === nothing || d.id == id ||
-                error("kind registry: dialect $name already registered with id $(d.id), not $id")
+                error(LazyString("kind registry: dialect ", name, " already registered with id ", d.id, ", not ", id))
             mod === nothing || (d.mod = mod)
             return d
         end
@@ -167,14 +191,14 @@ function register_dialect!(name::Symbol; id::Union{Nothing,Integer} = nothing,
             end
         else
             0 <= id < FIRST_DYNAMIC_DIALECT ||
-                error("kind registry: reserved dialect ids are 0..$(FIRST_DYNAMIC_DIALECT-1), got $id")
+                error(LazyString("kind registry: reserved dialect ids are 0..", FIRST_DYNAMIC_DIALECT-1, ", got ", id))
             did = UInt16(id)
             did + 1 <= length(REGISTRY.dialects) && REGISTRY.dialects[did + 1] !== nothing &&
-                error("kind registry: dialect id $id already claimed by $(REGISTRY.dialects[did+1].name)")
+                error(LazyString("kind registry: dialect id ", id, " already claimed by ", REGISTRY.dialects[did+1].name))
         end
         did <= max_dialect_id() ||
             error("kind registry: dialect capacity exhausted (widen the bit split)")
-        d = Dialect(name, did, mod, KindInfo[], Dict{Symbol,UInt16}(), Dict{Symbol,UInt16}())
+        d = Dialect(name, did, mod, KindInfo[], IdDict{Symbol,UInt16}(), IdDict{Symbol,UInt16}())
         while length(REGISTRY.dialects) < did + 1
             push!(REGISTRY.dialects, nothing)
         end
@@ -193,10 +217,10 @@ range predicates work. Aliases resolve by name but have no `KindInfo` of
 their own. Idempotent.
 """
 function alias_kind!(d::Dialect, name::Symbol, oc::Integer)
-    lock(REGISTRY.lock) do
+    _registry_locked(REGISTRY) do
         d.aliases[name] = UInt16(oc)
         qualified = d.id == 0 ? name : Symbol(string(d.name), ".", string(name))
-        get!(REGISTRY.bindings, qualified, Ref(KIND_UNREGISTERED))[] = make_kind(d.id, oc)
+        get!(REGISTRY.bindings, qualified, Base.RefValue{Kind}(KIND_UNREGISTERED))[] = make_kind(d.id, oc)
         return make_kind(d.id, oc)
     end
 end
@@ -251,7 +275,7 @@ resolve along per-package search paths.)
 function Kind(s::AbstractString)
     if _qualified_dialect(s) !== nothing
         k = resolve_kind(s, ())
-        k === nothing && error("unknown Kind name $(repr(s))")
+        k === nothing && error(LazyString("unknown Kind name ", repr(s)))
         return k
     end
     sym = Symbol(s)
@@ -267,7 +291,7 @@ function Kind(s::AbstractString)
             oc === nothing || return make_kind(UInt16(0), oc)
         end
     end
-    error("unknown Kind name $(repr(s))")
+    error(LazyString("unknown Kind name ", repr(s)))
 end
 
 # --------------------------- display & serialization -----------------------
@@ -291,7 +315,7 @@ end
 "Owning module of a kind's dialect (recorded at registration)."
 function Base.parentmodule(k::Kind)
     dia = dialect(k)
-    dia === nothing && throw(ArgumentError("unregistered dialect in kind $(kind_uint(k))"))
+    dia === nothing && throw(ArgumentError(LazyString("unregistered dialect in kind ", kind_uint(k))))
     return dia.mod::Module
 end
 
@@ -322,56 +346,61 @@ function register_kind!(d::Dialect, name::Symbol;
                         minops::Integer = length(schema),
                         varargs::Bool = false,
                         inline_ops::Bool = false)
-    lock(REGISTRY.lock) do
+    _registry_locked(REGISTRY) do
         if haskey(d.byname, name)
             oc = d.byname[name]
             return make_kind(d.id, oc)
         end
         oc = UInt16(length(d.kinds))
         oc < (UInt16(1) << REGISTRY.opcode_bits) ||
-            error("kind registry: opcode capacity exhausted in dialect $(d.name)")
+            error(LazyString("kind registry: opcode capacity exhausted in dialect ", d.name))
         qualified = d.id == 0 ? name : Symbol(string(d.name), ".", string(name))
         if inline_ops
             # §3.2 eligibility: exactly one STMT operand plus at most one raw
             # immediate — never CONST/REGION/BLOCK/GLOBAL.
-            nstmt = count(p -> p.second === OC_STMT || p.second === OC_VALUE, schema)
-            nimm = count(p -> p.second === OC_IMM, schema)
+            nstmt = _count(p -> p.second === OC_STMT || p.second === OC_VALUE, schema)
+            nimm = _count(p -> p.second === OC_IMM, schema)
             (nstmt == 1 && nimm <= 1 && nstmt + nimm == length(schema) && !varargs) ||
-                error("kind $qualified: inline_ops requires exactly one STMT + ≤1 immediate")
+                error(LazyString("kind ", qualified, ": inline_ops requires exactly one STMT + ≤1 immediate"))
         end
         info = KindInfo(name, qualified, d.id, oc, Int8(result), terminator,
                         owns_regions, is_delay, effects,
-                        [OperandSpec(p.first, p.second) for p in schema],
+                        # typed comprehension: this runs at load time, before
+                        # `Base._return_type` is bound (bootstrap dialect)
+                        OperandSpec[OperandSpec(p.first, p.second) for p in schema],
                         Int32(minops), varargs ? Int32(-1) : Int32(length(schema)),
                         inline_ops)
         push!(d.kinds, info)
         d.byname[name] = oc
         k = make_kind(d.id, oc)
-        get!(REGISTRY.bindings, qualified, Ref(KIND_UNREGISTERED))[] = k
+        get!(REGISTRY.bindings, qualified, Base.RefValue{Kind}(KIND_UNREGISTERED))[] = k
         return k
     end
 end
 
 "Session binding for a qualified kind name (external-dialect `K\"…\"` literals)."
 function kindref(qualified::Symbol)
-    lock(REGISTRY.lock) do
-        get!(REGISTRY.bindings, qualified, Ref(KIND_UNREGISTERED))
+    _registry_locked(REGISTRY) do
+        get!(REGISTRY.bindings, qualified, Base.RefValue{Kind}(KIND_UNREGISTERED))
     end
 end
 
 function lookup_kind(qualified::AbstractString)
     r = kindref(Symbol(qualified))[]
-    r === KIND_UNREGISTERED && error("kind \"$qualified\" is not registered")
+    r === KIND_UNREGISTERED && error(LazyString("kind \"", qualified, "\" is not registered"))
     return r
 end
 
 # `K"opname"` / `K"dialect.opname"` literal macro. Core-dialect literals are
 # compile-time constants; external-dialect literals read the session binding.
+# Registered core names are resolved first (they never contain dots), so no
+# string scan runs at expansion time (bootstrap dialect: `occursin` is
+# post-Base); any other literal — qualified or not — expands to the session
+# binding, which reports unregistered names at first use.
 macro K_str(s)
-    if !occursin('.', s)
+    oc = get(CORE_DIALECT.byname, Symbol(s), nothing)
+    if oc !== nothing
         # core dialect: resolve now, splice the constant
-        oc = get(CORE_DIALECT.byname, Symbol(s), nothing)
-        oc === nothing && error("unknown core kind K\"$s\"")
         return make_kind(UInt16(0), oc)
     else
         qsym = QuoteNode(Symbol(s))
@@ -381,7 +410,7 @@ end
 
 @inline function check_kindref(r::Base.RefValue{Kind}, name::String)
     k = r[]
-    k === KIND_UNREGISTERED && error("kind \"$name\" used before its dialect was registered")
+    k === KIND_UNREGISTERED && error(LazyString("kind \"", name, "\" used before its dialect was registered"))
     return k
 end
 

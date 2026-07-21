@@ -47,3 +47,35 @@ using Test
     @test verify_ir(ir2; level = 1)
     @test interpret(ir2, 41) == 42
 end
+
+@testset "analysis cache: egal-keyed memo (bootstrap dialect)" begin
+    # The AnalysisCache is IdDict-backed (egal keys — the bootstrap dialect
+    # has no Dict, and compiler data structures must not call user-extensible
+    # hash/isequal). Symbol and bits-tuple keys — the "(analysis type,
+    # config)" scheme — must hit the memo across freshly constructed keys.
+    b = Builder(name = :memo)
+    a = append_stmt!(b, K"region_arg"; type = Int64)
+    append_stmt!(b, K"return", a)
+    ir = finish!(b)
+    nruns = Base.RefValue(0)
+    compute = _ -> (nruns[] += 1; nruns[])
+    key1 = (:memo_probe, 3)              # bits tuple, rebuilt at each use site
+    @test UnifiedIR.get_analysis!(compute, ir, key1) == 1
+    @test UnifiedIR.get_analysis!(compute, ir, (:memo_probe, 3)) == 1  # egal hit
+    @test UnifiedIR.get_analysis!(compute, ir, (:memo_probe, 4)) == 2  # distinct
+    @test UnifiedIR.get_analysis!(compute, ir, :memo_probe) == 3       # Symbol key
+    @test UnifiedIR.get_analysis!(compute, ir, :memo_probe) == 3
+    # epoch invalidation still applies per declared deps
+    ir.cache.stmt_epoch += 1
+    @test UnifiedIR.get_analysis!(compute, ir, key1) == 4
+    # Strings are egal-by-content in Julia, so String keys are drift-free
+    # too. The one semantic shift from the pre-bootstrap Dict backing:
+    # MUTABLE keys (e.g. Vectors) were content-keyed (hash/isequal) and are
+    # now identity-keyed. Not part of the contract — documented drift.
+    v1 = [1, 2]
+    v2 = [1, 2]
+    @test isequal(v1, v2) && v1 !== v2
+    @test UnifiedIR.get_analysis!(compute, ir, v1) == 5
+    @test UnifiedIR.get_analysis!(compute, ir, v2) == 6   # identity miss
+    @test UnifiedIR.get_analysis!(compute, ir, v1) == 5   # identity hit
+end

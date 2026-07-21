@@ -134,7 +134,7 @@ function promote_block_cells!(ir::IR)
             end
         end
         (ok && !isempty(stores)) || continue
-        firststore = minimum(s -> s.id, stores)
+        firststore = _minimum(s -> s.id, stores)
         all(nw -> nw.id < firststore, news) || continue   # declaration news only
         reaching(g) = begin
             best = NULL_STMT
@@ -207,7 +207,7 @@ function _may_reach(ir::IR, t::StmtId, site::StmtId; iteration_local::Bool = fal
         push!(A, r)
         r = getregion(ir, r).parent
     end
-    idxof = Dict{Int32,Int}(a.id => i for (i, a) in enumerate(A))
+    idxof = IdDict{Int32,Int}(a.id => i for (i, a) in enumerate(A))
     r = stmt_region(ir, site)
     prev = NULL_REGION
     while !isnull(r)
@@ -404,7 +404,7 @@ body store take the carried arg, never the pre-loop store. Editable state.
 # :loop_break, :if_thread) — :if_thread marks structural value threading
 # through enclosing arms (region-form plumbing with no classical-phi
 # counterpart; expected to be "extra" relative to iterated-DF placement).
-const PROMOTION_TRACE = Ref{Union{Nothing,Vector{Tuple{Symbol,Int,Int}}}}(nothing)
+const PROMOTION_TRACE = Base.RefValue{Union{Nothing,Vector{Tuple{Symbol,Int,Int}}}}(nothing)
 @inline _trace!(kind::Symbol, anchor::StmtId, cell::StmtId) =
     (t = PROMOTION_TRACE[]; t === nothing || push!(t, (kind, Int(anchor.id), Int(cell.id))); nothing)
 # :island_phi anchors are REGION ids (the phi block), not stmt ids — the
@@ -913,7 +913,7 @@ function promote_arm_cells!(ir::IR)
     end
     # inside-out: deepest region first, so an inner if's post-join store is a
     # direct arm store by the time its enclosing if is processed
-    sort!(ifs; by = s -> region_depth(ir, stmt_region(ir, s)), rev = true)
+    _sort!(ifs; by = s -> region_depth(ir, stmt_region(ir, s)), rev = true)
     total = 0
     for I in ifs
         total += _promote_arm_cells_at!(ir, I)
@@ -943,7 +943,7 @@ function _promote_arm_cells_at!(ir::IR, I::StmtId)
     # store would not fire for them — such arms keep their stores in memory
     # (the post-join store then merely re-stores the same value on the join
     # path)
-    leaky = Set{Int32}()
+    leaky = BitSet()
     for s in each_stmt(ir)
         is_tombstone(ir, s) && continue
         k = stmt_kind(ir, s)
@@ -977,7 +977,7 @@ function _promote_arm_cells_at!(ir::IR, I::StmtId)
     # ---- candidate cells ----------------------------------------------------
     plans = Vector{Tuple{StmtId,                 # cell
                          Vector{StmtId},          # direct arm stores (to delete)
-                         Dict{RegionId,StmtId},   # joining arm -> last direct store (or absent)
+                         IdDict{RegionId,StmtId}, # joining arm -> last direct store (or absent)
                          Vector{Pair{StmtId,StmtId}},  # in-arm get -> reaching store
                          Vector{StmtId},          # in-arm isdefined -> true rewrites
                          Bool}}()                 # needs incoming value
@@ -1016,7 +1016,7 @@ function _promote_arm_cells_at!(ir::IR, I::StmtId)
         # cell_new in declaration position only
         all(nw -> all(st -> before(nw, st), sets), news) || continue
 
-        armlast = Dict{RegionId,StmtId}()
+        armlast = IdDict{RegionId,StmtId}()
         direct = StmtId[]                     # sinkable (non-leaky) arm stores
         allarm = StmtId[]                     # every direct arm store (reach)
         deeper = false
@@ -1089,7 +1089,7 @@ function _promote_arm_cells_at!(ir::IR, I::StmtId)
         end
     end
     # incoming values: one cell_get per needs-incoming cell, just before I
-    incoming = Dict{Int,Operand}()
+    incoming = IdDict{Int,Operand}()
     for (i, (cell, _, _, _, _, needs_in)) in enumerate(plans)
         needs_in || continue
         g = insert_before!(ir, I, K"cell_get", op_stmt(cell); type = Any)
@@ -1179,7 +1179,7 @@ function promote_island_cells!(ir::IR)
         stmt_kind(ir, s) === K"cfg" && push!(cfgs, s)
     end
     isempty(cfgs) && return 0
-    sort!(cfgs; by = s -> region_depth(ir, stmt_region(ir, s)), rev = true)
+    _sort!(cfgs; by = s -> region_depth(ir, stmt_region(ir, s)), rev = true)
     promoted = 0
     for I in cfgs
         is_tombstone(ir, I) && continue
@@ -1192,7 +1192,7 @@ const _EDGE_KINDS = (K"goto", K"br_if", K"switch", K"await")
 
 # containing island block of s: (block index, direct member, crossed-handler?)
 # or nothing when s is not nested inside one of the island's blocks
-function _island_container(ir::IR, bidx::Dict{Int32,Int}, s::StmtId)
+function _island_container(ir::IR, bidx::IdDict{Int32,Int}, s::StmtId)
     cur = s
     hnd = false
     while true
@@ -1208,7 +1208,7 @@ end
 
 # rebuild terminator t, appending `val` to every bundle whose destination
 # region id is in `want` (bundle encoding as in edge_bundles, §5.5)
-function _extend_bundles!(ir::IR, t::StmtId, want::Set{Int32}, val::Operand)
+function _extend_bundles!(ir::IR, t::StmtId, want::BitSet, val::Operand)
     k = stmt_kind(ir, t)
     old = Operand[getop(ir, t, i) for i in 1:nops(ir, t)]
     new = Operand[]
@@ -1253,7 +1253,7 @@ function _promote_island_cells_at!(ir::IR, I::StmtId)
     blocks = live_owned_regions(ir, I)
     n = length(blocks)
     n == 0 && return 0
-    bidx = Dict{Int32,Int}(r.id => i for (i, r) in enumerate(blocks))
+    bidx = IdDict{Int32,Int}(r.id => i for (i, r) in enumerate(blocks))
     # edges: (from, to, bundle-carrying stmt, direct member the edge leaves
     # from — NULL for block terminators, the containing member for sealed
     # exits of nested islands (§5.5) that land on our blocks mid-block).
@@ -1535,15 +1535,15 @@ function _promote_one_island_cell!(ir::IR, I::StmtId, graph, cell::StmtId)
     # after phi placement; these are the raw facts
     thinitok = !isnull(thinit)
     # member positions (region_stmts order; only relative order is used)
-    pos = Dict{Int32,Int}()
+    pos = IdDict{Int32,Int}()
     for r in blocks
         for (p, m) in enumerate(region_stmts(ir, r))
             pos[m.id] = p
         end
     end
     for bi in 1:nb
-        sort!(instores[bi]; by = st -> pos[st.id])
-        sort!(newsin[bi]; by = nw -> pos[nw.id])
+        _sort!(instores[bi]; by = st -> pos[st.id])
+        _sort!(newsin[bi]; by = nw -> pos[nw.id])
     end
     hasst = [!isempty(instores[bi]) for bi in 1:nb]
     firstpos(bi) = isempty(instores[bi]) ? typemax(Int) : pos[instores[bi][1].id]
@@ -1691,7 +1691,10 @@ function _promote_one_island_cell!(ir::IR, I::StmtId, graph, cell::StmtId)
         (thinitok && thcontsok) || return 0    # the staleness sentinel
         threading = true
     end
-    want = Set{Int32}(blocks[bi].id for bi in 1:nb if inphi[bi])
+    want = BitSet()
+    for bi in 1:nb
+        inphi[bi] && push!(want, Int(blocks[bi].id))
+    end
     if !isempty(want)
         # every edge into a phi block must be extendable: edges from
         # unreachable blocks have no reaching value — refuse (verify checks
@@ -1701,7 +1704,7 @@ function _promote_one_island_cell!(ir::IR, I::StmtId, graph, cell::StmtId)
         end
     end
     # ---- rewrite (all refusals are behind us) --------------------------------
-    vin = Ref{Union{Nothing,Operand}}(nothing)
+    vin = Base.RefValue{Union{Nothing,Operand}}(nothing)
     if threading
         # the loop grows a carried arg; its init is the reaching store value
         breg = getregion(ir, thbody)
@@ -1742,7 +1745,7 @@ function _promote_one_island_cell!(ir::IR, I::StmtId, graph, cell::StmtId)
         end
         vin[]::Operand
     end
-    phiarg = Dict{Int,Operand}()
+    phiarg = IdDict{Int,Operand}()
     for bi in 1:nb
         inphi[bi] || continue
         _trace!(:island_phi, blocks[bi], cell)
@@ -1762,7 +1765,7 @@ function _promote_one_island_cell!(ir::IR, I::StmtId, graph, cell::StmtId)
         hasst[bi] && return getop(ir, instores[bi][end], 2)
         return inval(bi)
     end
-    done = Set{Int32}()                       # extend edges into phi blocks
+    done = BitSet()                           # extend edges into phi blocks
     for (f, t, st, mid) in edges
         inphi[t] || continue
         st.id in done && continue
@@ -1937,7 +1940,7 @@ function promote_undef_cells!(ir::IR)
         # stock's maybe-undef slot handling raises
         cellname = :cell
         let names = get(ir.meta, :cell_names, nothing)
-            names isa Dict{Int32,Symbol} &&
+            names isa AbstractDict{Int32,Symbol} &&
                 (cellname = get(names, cell.id, cellname))
         end
         for g in undom
@@ -2015,7 +2018,7 @@ function promote_try_cells!(ir::IR)
         stmt_kind(ir, s) === K"try" || continue
         push!(trys, s)
     end
-    sort!(trys; by = s -> region_depth(ir, stmt_region(ir, s)), rev = true)
+    _sort!(trys; by = s -> region_depth(ir, stmt_region(ir, s)), rev = true)
     total = 0
     for T in trys
         total += _promote_try_cells_at!(ir, T)
@@ -2131,7 +2134,7 @@ function _promote_try_cells_at!(ir::IR, T::StmtId)
         _trace!(:try_join, T, cell)
     end
     # incoming values (storeless joining body): one cell_get just before T
-    incoming = Dict{Int,Operand}()
+    incoming = IdDict{Int,Operand}()
     for (i, (cell, _, _, needs_in)) in enumerate(plans)
         needs_in || continue
         g = insert_before!(ir, T, K"cell_get", op_stmt(cell); type = Any)
@@ -2273,7 +2276,7 @@ function _capture_scratch(ir::IR)
                               e === nothing ? nothing :
                                   EditState(copy(e.next), copy(e.prev), copy(e.okey)),
                               Pair{StmtId,Operand}[], AnalysisCache(),
-                              Dict{Symbol,Any}(:name => get(ir.meta, :name, :capture_judge)))
+                              IdDict{Symbol,Any}(:name => get(ir.meta, :name, :capture_judge)))
 end
 
 """
@@ -2389,7 +2392,7 @@ function promote_capture_cells!(ir::IR; boundary::Symbol = :deferred)
     end
     compact!(work)
     promote_fixpoint!(work; include_undef = false, capture = false)
-    unresolved = Set{Tuple{Int,Int}}()     # probes deleted with dead arms are vacuous
+    unresolved = IdSet{Tuple{Int,Int}}()   # probes deleted with dead arms are vacuous
     for s in each_stmt(work)
         stmt_kind(work, s) === K"call" || continue
         nops(work, s) == 3 || continue
