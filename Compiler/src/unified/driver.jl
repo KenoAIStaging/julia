@@ -998,11 +998,28 @@ function devirtualize_calls!(uir, st::UInferState, interp::Compiler.AbstractInte
         args = Any[stmt_lattice(uir, UnifiedIR.getop(uir, s, i)) for i in 1:nop]
         f = CC.singleton_type(args[1])
         f === nothing && args[1] isa CC.Const && (f = (args[1]::CC.Const).val)
-        f === nothing && continue
-        (f isa Core.Builtin || f isa Core.IntrinsicFunction) && continue
+        local ft
+        if f === nothing
+            # non-singleton concrete callee (closure objects, the do-block
+            # @noinline shape): dispatch is exact on the concrete type —
+            # the same arm `ea_resolve_residual_call` applies; K"closure"
+            # activations stay with their machinery
+            fo2 = UnifiedIR.getop(uir, s, 1)
+            if UnifiedIR.optag(fo2) == UnifiedIR.TAG_STMT &&
+               UnifiedIR.stmt_kind(uir, skip_refines(uir, UnifiedIR.asstmt(fo2))) === K"closure"
+                continue
+            end
+            ft1 = CC.widenconst(args[1])
+            (ft1 isa DataType && isconcretetype(ft1) && !(ft1 <: Type) &&
+             !(ft1 <: Core.Builtin) && !(ft1 <: Core.IntrinsicFunction) &&
+             !(ft1 <: Core.OpaqueClosure)) || continue
+            ft = ft1
+        else
+            (f isa Core.Builtin || f isa Core.IntrinsicFunction) && continue
+            ft = f isa Type ? Type{f} : typeof(f)
+        end
         argts = Any[CC.widenconst(a) for a in args[2:end]]
         Base.any(t -> t === Union{} || !(t isa Type) || CC.has_free_typevars(t), argts) && continue
-        ft = f isa Type ? Type{f} : typeof(f)
         sig = try
             Tuple{ft, argts...}
         catch
