@@ -1014,14 +1014,22 @@ function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
             # guaranteed-defined parameters (stock's throw_undef_if_not
             # machinery for maybe-undef ones is not ported: decline).
             m.is_for_opaque_closure && continue
-            # a site whose RESULT is unused keeps its call: stock carries the
-            # callee's optimized-IR nothrow flags through the splice so the
-            # whole reconstruction chain DCEs; this pipeline re-infers the
-            # spliced body and cannot re-prove nothrow for the resulting
-            # apply_type/new chain (the SparamUnused effects corpus), while
-            # the un-inlined call's interprocedural effects DO prove the
-            # site removable-if-unused — leave that path in charge
-            UnifiedIR.use_counts(ir)[s.id] > 0 || continue
+            # a site whose RESULT is unused keeps its call WHEN the callee's
+            # interprocedural effects prove the site removable-if-unused:
+            # stock carries the callee's optimized-IR nothrow flags through
+            # the splice so the whole reconstruction chain DCEs; this
+            # pipeline re-infers the spliced body and cannot re-prove
+            # nothrow for the resulting apply_type/new chain (the
+            # SparamUnused effects corpus) — for a removable callee the
+            # un-inlined call's effects path is strictly better. A
+            # NON-removable callee (finalizer-registering constructors, the
+            # DoAllocNoEscapeSparam shape) gains nothing from the decline:
+            # the call can never DCE, and only the inlined body lets the
+            # finalizer machinery do its work (wave 11).
+            if UnifiedIR.use_counts(ir)[s.id] == 0
+                fx = opt_callee_effects(state, mi)
+                (fx isa CC.Effects && CC.is_removable_if_unused(fx)) && continue
+            end
             spstates = try
                 CC.sptypes_from_meth_instance(mi)
             catch

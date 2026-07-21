@@ -143,10 +143,16 @@ function sroa_mutables!(ir::UnifiedIR.IR)
         # (promote_cells! §6 policy refuses island cells) — a pure
         # pessimization; leave the allocation in memory form there
         UnifiedIR.inside_island(ir, s) && continue
-        # collect uses; any non-load/store use disqualifies (escape check)
+        # collect uses; any non-load/store use disqualifies (escape check).
+        # One exception: a finalizer call resolve_finalizers! placed this
+        # session (ir.meta[:finalizer_calls]) is a LIFETIME-END use, not an
+        # escape — it runs only once the object is unreachable, so loads
+        # may still forward; the allocation itself must stay (memory mode).
+        fset = get(ir.meta, :finalizer_calls, nothing)
         loads = Tuple{StmtId,Int}[]
         stores = Tuple{StmtId,Int}[]
         ok = true
+        finuse = false
         UnifiedIR.each_ssa_use(ir) do site, used
             (ok && used == s) || return
             site isa UnifiedIR.StmtOperand || (ok = false; return)
@@ -167,6 +173,8 @@ function sroa_mutables!(ir::UnifiedIR.IR)
                        site.opidx == 2 && nopu == 4
                     fld = field_index_of(T, static_operand_value(ir, UnifiedIR.getop(ir, u, 3)))
                     fld === nothing ? (ok = false) : push!(stores, (u, fld))
+                elseif fset isa Set{Int32} && u.id in fset && site.opidx == 2
+                    finuse = true
                 else
                     ok = false
                 end
@@ -175,6 +183,10 @@ function sroa_mutables!(ir::UnifiedIR.IR)
             end
         end
         ok || continue
+        if finuse
+            promoted += forward_mutable_loads_only!(ir, s, loads, stores, nsupplied)
+            continue
+        end
         if nsupplied < nf
             # every load of an uninitialized field must be provably
             # initialized on all paths, or the whole allocation stays
@@ -222,6 +234,57 @@ function sroa_mutables!(ir::UnifiedIR.IR)
         promoted += 1
     end
     return promoted
+end
+
+"""Load forwarding WITHOUT elimination for a mutable `new` whose lifetime
+ends in a placed finalizer call (stock's finalizer-elision load-forwarding
+corpus): the allocation and its stores stay in memory form — the finalizer
+body may read the fields at death — but program-order loads see the last
+program-order store, because the finalizer runs only once the object is
+unreachable (no load can observe it). v1: straight-line only — the `new`,
+every load and every store must share one region; an ordered walk tracks
+the current per-field value and rewrites each covered load to a `refine`
+of it."""
+function forward_mutable_loads_only!(ir::UnifiedIR.IR, s::StmtId,
+                                     loads::Vector{Tuple{StmtId,Int}},
+                                     stores::Vector{Tuple{StmtId,Int}},
+                                     nsupplied::Int)
+    homer = UnifiedIR.stmt_region(ir, s)
+    for (u, _) in loads
+        UnifiedIR.stmt_region(ir, u) == homer || return 0
+    end
+    for (u, _) in stores
+        UnifiedIR.stmt_region(ir, u) == homer || return 0
+    end
+    cur = Dict{Int,UnifiedIR.Operand}()
+    for i in 1:nsupplied
+        cur[i] = UnifiedIR.getop(ir, s, i + 1)
+    end
+    loadmap = Dict{Int32,Int}(u.id => f for (u, f) in loads)
+    storemap = Dict{Int32,Int}(u.id => f for (u, f) in stores)
+    n = 0
+    started = false
+    for st in UnifiedIR.region_stmts(ir, homer)
+        if st == s
+            started = true
+            continue
+        end
+        started || continue
+        f = get(storemap, st.id, nothing)
+        if f !== nothing
+            cur[f] = UnifiedIR.getop(ir, st, 4)
+            continue
+        end
+        f = get(loadmap, st.id, nothing)
+        if f !== nothing
+            v = get(cur, f, nothing)
+            v === nothing && continue
+            UnifiedIR.replace_stmt!(ir, st, K"refine", v;
+                                    type = UnifiedIR.stmt_type(ir, st))
+            n += 1
+        end
+    end
+    return n
 end
 
 # ---------------------------------------------------------------------------
@@ -328,7 +391,11 @@ function resolve_finalizers!(ir::UnifiedIR.IR, st::UInferState)
         UnifiedIR.optag(objo) == UnifiedIR.TAG_STMT || continue
         obj = UnifiedIR.asstmt(objo)
         objT = CC.widenconst(stmt_lattice(ir, objo))
-        (objT isa DataType && ismutabletype(objT)) || continue
+        # sparam-typed allocations (`new{T}` through a materialized
+        # apply_type) carry a UnionAll: mutability is a property of the
+        # wrapped datatype (the DoAllocNoEscapeSparam shape, wave 11)
+        objTd = objT isa UnionAll ? Base.unwrap_unionall(objT) : objT
+        (objTd isa DataType && ismutabletype(objTd)) || continue
         r = try
             fr = Frame(UnifiedIR.Builder().ir, st, Any[])
             infer_call(fr, Any[CC.Const(f), objT])
@@ -369,7 +436,11 @@ function resolve_finalizers!(ir::UnifiedIR.IR, st::UInferState)
         UnifiedIR.stmt_kind(ir, obj) === K"new" || continue
         homer = UnifiedIR.stmt_region(ir, obj)
         UnifiedIR.stmt_region(ir, s) == homer || continue
-        # escape check: every other use is a field load/store
+        # escape check: every other use is a field load/store, or a GC
+        # lifetime marker (`GC.@preserve` roots the object without leaking
+        # it — stock EA's no-escape classification; the paired
+        # `gc_preserve_end`s join the use set below so the placed call
+        # lands after the preserved span)
         ok = true
         uses = StmtId[]
         UnifiedIR.each_ssa_use(ir) do site, used
@@ -380,6 +451,8 @@ function resolve_finalizers!(ir::UnifiedIR.IR, st::UInferState)
             u == s && return
             uk = UnifiedIR.stmt_kind(ir, u)
             if uk === K"extract" && site.opidx == 1
+                push!(uses, u)
+            elseif uk === K"gc_preserve_begin"
                 push!(uses, u)
             elseif uk === K"call"
                 callee2 = static_operand_value(ir, UnifiedIR.getop(ir, u, 1))
@@ -398,6 +471,18 @@ function resolve_finalizers!(ir::UnifiedIR.IR, st::UInferState)
             end
         end
         ok || continue
+        # a preserved object's lifetime extends to the preserve END: add
+        # each begin's paired end(s) so the anchor computation sees them
+        for u in copy(uses)
+            UnifiedIR.stmt_kind(ir, u) === K"gc_preserve_begin" || continue
+            UnifiedIR.each_ssa_use(ir) do site2, used2
+                used2 == u || return
+                site2 isa UnifiedIR.StmtOperand || return
+                e = site2.user
+                UnifiedIR.is_tombstone(ir, e) && return
+                UnifiedIR.stmt_kind(ir, e) === K"gc_preserve_end" && push!(uses, e)
+            end
+        end
         # anchor = the flat-last use's top-level container within the home
         # region (uses inside ifs/loops resolve to the owning op; handler
         # positions refuse — a throw path must keep the GC-time semantics)
@@ -422,7 +507,13 @@ function resolve_finalizers!(ir::UnifiedIR.IR, st::UInferState)
         idx = findfirst(==(anchor), members)
         idx === nothing && continue
         idx < length(members) || continue
-        UnifiedIR.insert_before!(ir, members[idx + 1], K"call", fo, objo; type = Any)
+        placed = UnifiedIR.insert_before!(ir, members[idx + 1], K"call", fo, objo; type = Any)
+        # record the placement for this editable session: mutable SROA
+        # treats it as a lifetime-end use (load forwarding stays legal —
+        # the finalizer only runs once the object is unreachable), not an
+        # escape. The id set is session-transient (dropped at compact!).
+        fset = get!(() -> Set{Int32}(), ir.meta, :finalizer_calls)::Set{Int32}
+        push!(fset, placed.id)
         UnifiedIR.replace_stmt!(ir, s, K"refine", objo;
                                 type = UnifiedIR.stmt_type(ir, s))
         n += 1

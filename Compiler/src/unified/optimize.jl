@@ -1602,6 +1602,7 @@ end
 variable names) across the statement renumbering."
 function compact_carry_names!(ir::UnifiedIR.IR)
     names = get(ir.meta, :cell_names, nothing)
+    fins = get(ir.meta, :finalizer_calls, nothing)
     ir, rs = UnifiedIR.compact!(ir)
     if names isa Dict{Int32,Symbol} && !isempty(names)
         newnames = Dict{Int32,Symbol}()
@@ -1611,6 +1612,16 @@ function compact_carry_names!(ir::UnifiedIR.IR)
             newnames[nid] = nm
         end
         ir.meta[:cell_names] = newnames
+    end
+    if fins isa Set{Int32} && !isempty(fins)
+        # placed-finalizer ids (resolve_finalizers! → mutable-SROA load
+        # forwarding) survive the renumbering the same way
+        newfins = Set{Int32}()
+        for id in fins
+            nid = 1 <= id <= length(rs.stmt) ? rs.stmt[id] : Int32(0)
+            nid == 0 || push!(newfins, nid)
+        end
+        ir.meta[:finalizer_calls] = newfins
     end
     return ir
 end
@@ -1735,6 +1746,7 @@ function _optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
         UnifiedIR.verify_ir(ir; level = 1)
         changed == 0 && break
     end
+    settled_spliced = 0
     if inline && get(ir.meta, :sparam_deferred, false) === true
         # settled-types sparam materialization (stock ir_prepare_inlining!'s
         # spvals_ssa regime): sites whose specialization still carries
@@ -1746,7 +1758,25 @@ function _optimize_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
         delete!(ir.meta, :sparam_deferred)
         infer_ir!(ir, argtypes; state)
         UnifiedIR.editable(ir)
-        lastspliced += inline_calls2!(ir, state; params, materialize_sparams = true)
+        settled_spliced = inline_calls2!(ir, state; params, materialize_sparams = true)
+        lastspliced += settled_spliced
+        ir = compact_carry_names!(ir)
+    end
+    if settled_spliced > 0
+        # a settled-phase splice can EXPOSE work only inlining discharges —
+        # a finalizer registration inside the spliced ctor body: resolve
+        # and place it now, load-forward against the placement, and give
+        # the placed call one inline pass (the DoAllocNoEscapeSparam
+        # shape). Scoped to actual placements so ordinary sparam splices
+        # keep the inline-free cleanup below (an extra global inline round
+        # here regrows settled bodies and flips admission shapes — the
+        # wave-11 merge_fallback lesson).
+        infer_ir!(ir, argtypes; state)
+        UnifiedIR.editable(ir)
+        if resolve_finalizers!(ir, state) > 0
+            sroa_mutables!(ir)
+            inline_calls2!(ir, state; params, materialize_sparams = true)
+        end
         ir = compact_carry_names!(ir)
     end
     if lastspliced > 0

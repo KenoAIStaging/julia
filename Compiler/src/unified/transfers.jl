@@ -1096,6 +1096,32 @@ end
 
 const NEW_EXCT = Union{ErrorException,TypeError}
 
+"""Every VALUE of the type lattice `tl` is a fully-applied instantiation of
+a (non-Tuple, non-abstract) struct wrapper — i.e. a concrete type — even
+though no single concrete type is statically known. The `Type{C{_A}} where
+_A` shape a materialized apply_type over reconstructed sparams produces:
+its Type parameter is a DataType (fully applied by construction — a
+partial application would be a UnionAll) with free typevars bound by the
+enclosing `where`s."""
+function concrete_shaped_type_lattice(@nospecialize tl)
+    tw = tl
+    while tw isa UnionAll
+        tw = tw.body
+    end
+    # `Type{C{_A}}` here is a TypeEq (exact-type lattice), not a DataType —
+    # `isType`/`type_parameter` cover both encodings
+    CC.isType(tw) || return false
+    p = try
+        CC.type_parameter(tw)
+    catch
+        return false
+    end
+    p isa DataType || return false
+    (isabstracttype(p) || p.name === Tuple.name) && return false
+    w = Base.unwrap_unionall(p.name.wrapper)
+    return length(p.parameters) == length((w::DataType).parameters)
+end
+
 function transfer_new(fr::Frame, s::StmtId)
     ir = fr.ir
     lat = CC.fallback_lattice
@@ -1118,12 +1144,31 @@ function transfer_new(fr::Frame, s::StmtId)
         (fcount === nothing || nargs > fcount) &&
             return (rt, CC.Effects(CC.EFFECTS_UNKNOWN; consistent), NEW_EXCT)
         nothrow = CC.isconcretedispatch(rt)
+        tvfields = false
+        if !nothrow && concrete_shaped_type_lattice(tl)
+            # the type operand's lattice is `Type{C{_A}} where _A` for a
+            # FULLY-APPLIED struct wrapper (a materialized `new{T}` through
+            # apply_type, the DoAllocNoEscapeSparam shape): every VALUE of
+            # that lattice is a full instantiation — a concrete type — so
+            # the allocation itself cannot throw even though `instanceof`
+            # is inexact (stock loses this precision, its @test_broken).
+            # Field-assignment nothrow is only checkable against declared
+            # field types carrying NO free typevars (`fieldtype` on the
+            # UnionAll joins those loosely: an `x::T` field would accept
+            # anything statically while throwing at runtime).
+            nothrow = true
+            tvfields = true
+        end
         ats = Vector{Any}(undef, nargs)
         anyrefine = false
         allconst = CC.isconcretedispatch(rt)
         for i in 1:nargs
             at = widenucond(opl(fr, UnifiedIR.getop(ir, s, i + 1)))
             ft = fieldtype(rt, i)
+            if nothrow && tvfields
+                fti = fieldtype(ut, i)
+                nothrow = !(fti isa TypeVar) && fti isa Type && !CC.has_free_typevars(fti)
+            end
             nothrow && (nothrow = CC.:⊑(lat, at, ft))
             at = CC.tmeet(lat, at, ft)
             at === Union{} && return (Union{}, CC.EFFECTS_THROWS, TypeError)   # guaranteed TypeError
