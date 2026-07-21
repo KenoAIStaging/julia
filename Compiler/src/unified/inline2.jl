@@ -50,6 +50,22 @@ const INLINE_COST_MAX_ACTIVE = 4
 const INLINE_COST_MAX_SRC_STMTS = 1000
 const CI_COST_ENABLED = Base.RefValue(true)
 
+# CI-less pricing grade (wave 11): how a candidate WITHOUT a cached
+# CodeInstance verdict is priced.
+#   :optimize — full pipeline over the callee body, recursively (each level
+#               prices ITS candidates the same way: the cold-landing cost
+#               towers of scratchpad/wave10h — 3+ levels of
+#               inline2_cost_uncached → optimize_ir! → inline_calls2!);
+#   :depth1   — full pipeline only OUTSIDE a tower (TOWER_FRAME_CAP unset);
+#               nested pricing (inside any cost/fx/ea tower walk) uses the
+#               statement-cost walk, so towers terminate at depth 1;
+#   :stmtwalk — statement-cost walk always (stock's own shape: the model
+#               prices the callee's inferred body without optimizing it).
+# Grades memoize separately (INLINE_COST_SW_MEMO): a nested stmt-walk
+# verdict never masks the full-grade verdict a depth-0 query computes.
+const COST_PRICING = Base.RefValue{Symbol}(:depth1)
+const INLINE_COST_SW_MEMO = IdDict{Core.MethodInstance,Any}()  # -> Int | nothing
+
 """
     inline2_cost(st, mi, src) -> Union{Int,Nothing}
 
@@ -91,35 +107,51 @@ function inline2_cost(st::UInferState, mi::Core.MethodInstance, src::Core.CodeIn
     world = st.cfg.world
     # same-task reentry succeeds (ReentrantLock); a cross-thread race skips
     # the memo and yields no verdict rather than blocking a compile path
+    # pricing grade for THIS query: nested tower walks (any cost/fx/ea
+    # helper's bounded optimization sets TOWER_FRAME_CAP around itself)
+    # demote to the statement-cost walk under :depth1
+    mode = COST_PRICING[]
+    sw = mode === :stmtwalk || (mode === :depth1 && TOWER_FRAME_CAP[] != 0)
     trylock(INLINE_COST_LOCK) || return nothing
     try
         if INLINE_COST_WORLD[] != world
             empty!(INLINE_COST_MEMO)
+            empty!(INLINE_COST_SW_MEMO)
             INLINE_COST_WORLD[] = world
         end
+        # a full-grade verdict serves every query; the stmt-walk memo only
+        # serves stmt-walk-grade queries (depth-0 queries recompute at full
+        # grade and store alongside)
         haskey(INLINE_COST_MEMO, mi) && return INLINE_COST_MEMO[mi]
+        sw && haskey(INLINE_COST_SW_MEMO, mi) && return INLINE_COST_SW_MEMO[mi]
         (mi in INLINE_COST_ACTIVE || length(INLINE_COST_ACTIVE) >= INLINE_COST_MAX_ACTIVE) &&
             return nothing
-        opt_work_take!() || return nothing
+        # the statement-walk grade is one bounded infer per mi (memoized) —
+        # it does not draw down the per-body callee-optimization budget, or
+        # the (much more numerous) cheap verdicts would starve the tail
+        # refinements' EA summaries of their units (the f_EA_refine shape)
+        sw || opt_work_take!() || return nothing
         push!(INLINE_COST_ACTIVE, mi)
         t0 = time_ns()
         r = try
-            inline2_cost_uncached(st, mi, src)
+            sw ? inline2_cost_stmtwalk(st, mi, src) :
+                 inline2_cost_uncached(st, mi, src)
         catch
             nothing
         finally
             delete!(INLINE_COST_ACTIVE, mi)
             DRIVER_PHASES.cost_tower += Int(time_ns() - t0)
         end
-        INLINE_COST_MEMO[mi] = r
+        (sw ? INLINE_COST_SW_MEMO : INLINE_COST_MEMO)[mi] = r
         return r
     finally
         unlock(INLINE_COST_LOCK)
     end
 end
 
-function inline2_cost_uncached(st::UInferState, mi::Core.MethodInstance,
-                               src::Core.CodeInfo)
+# Shared pricing prologue: specTypes → per-parameter argtypes (packed va
+# tail) + the entry-converted callee body, or nothing (unpriceable shape).
+function cost_entry_convert(mi::Core.MethodInstance, src::Core.CodeInfo)
     m = mi.def
     m isa Method || return nothing
     length(src.code) <= INLINE_COST_MAX_SRC_STMTS || return nothing
@@ -144,6 +176,14 @@ function inline2_cost_uncached(st::UInferState, mi::Core.MethodInstance,
     ir.meta[:slotnames] = src.slotnames
     ir.sptypes = Any[t for t in mi.sparam_vals]
     ir.meta[:sptypes_lat] = sptypes_lattice(mi)
+    return (ir, ps)
+end
+
+function inline2_cost_uncached(st::UInferState, mi::Core.MethodInstance,
+                               src::Core.CodeInfo)
+    conv = cost_entry_convert(mi, src)
+    conv === nothing && return nothing
+    ir, ps = conv
     # tower frame cap: price with a BOUNDED walk, refuse when it fires
     # (see TOWER_FRAME_CAP) — the statement-count fallback then applies,
     # which declines the same budget-busting bodies the capped walk would
@@ -177,6 +217,250 @@ function inline2_cost_uncached(st::UInferState, mi::Core.MethodInstance,
     # callsite @inline = 20x); beyond it the model returns MAX_INLINE_COST
     cap = 20 * params.inline_cost_threshold
     return Int(Compiler.inline_cost_model(ircode, params, Int(cap)))
+end
+
+# ---------------------------------------------------------------------------
+# Statement-cost pricing over the inferred, UNOPTIMIZED body (wave 11)
+# ---------------------------------------------------------------------------
+#
+# Stock's `statement_cost` vocabulary transplanted onto the typed region IR
+# straight out of entry conversion + one `infer_ir!` pass — no optimizer, so
+# pricing never recurses into `inline_calls2!` (the cold-landing cost
+# towers). Divergence from the pipeline-optimized grade: wrapper chains that
+# would fold away are priced at their pre-fold statement costs, and
+# statically-resolvable residual calls are priced as the `:invoke` they
+# would become (`UNKNOWN_CALL_COST`, the same rule `inline2_cost_uncached`
+# applies by rewriting them before running stock's model) rather than at
+# their post-inline expansion.
+
+"""
+    inline2_cost_stmtwalk(st, mi, src) -> Union{Int,Nothing}
+
+The stock statement-cost model over `mi`'s inferred (pre-optimize) body.
+`nothing` = no verdict (unpriceable shape, or the bounded inference walk
+hit a cutoff).
+"""
+function inline2_cost_stmtwalk(st::UInferState, mi::Core.MethodInstance,
+                               src::Core.CodeInfo)
+    conv = cost_entry_convert(mi, src)
+    conv === nothing && return nothing
+    ir, ps = conv
+    lim0 = st.limited
+    prevcap = TOWER_FRAME_CAP[]
+    try
+        TOWER_FRAME_CAP[] = TOWER_FRAME_BUDGET[]
+        infer_ir!(ir, ps; state = st)
+    finally
+        TOWER_FRAME_CAP[] = prevcap
+    end
+    st.limited > lim0 && return nothing
+    params = Compiler.OptimizationParams(st.cfg.interp)
+    cap = 20 * params.inline_cost_threshold
+    return region_inline_cost(ir, st, params, Int(cap))
+end
+
+"""Blocks of the body's cfg islands unreachable once Const branch
+conditions are honored (the walk prices an UNOPTIMIZED body — without
+this, a wrapper's statically-dead generic arm charges its nonleaf penalty
+while the optimized body the verdict stands in for would have folded it:
+the `setproperty!` convert-arm shape). Returns a `BitSet` of DEAD region
+ids (empty = everything live)."""
+function sw_dead_blocks(ir::UnifiedIR.IR)
+    dead = BitSet()
+    branchkind(k::UnifiedIR.Kind) =
+        k === K"goto" || k === K"br_if" || k === K"switch" || k === K"await"
+    for s in UnifiedIR.each_stmt(ir)
+        UnifiedIR.is_tombstone(ir, s) && continue
+        UnifiedIR.stmt_kind(ir, s) === K"cfg" || continue
+        rs = UnifiedIR.live_owned_regions(ir, s)
+        isempty(rs) && continue
+        blocks = BitSet(Int(r.id) for r in rs)
+        # island block containing a statement's region (parent-chain walk)
+        function owning_block(t::StmtId)
+            r = Int(UnifiedIR.stmt_region(ir, t).id)
+            steps = 0
+            while !(r in blocks)
+                (steps += 1) <= UnifiedIR.nregions(ir) || return 0
+                p = Int(UnifiedIR.getregion(ir, UnifiedIR.RegionId(Int32(r))).parent.id)
+                p == 0 && return 0
+                r = p
+            end
+            return r
+        end
+        succs = Dict{Int,Vector{Int}}()
+        seeds = BitSet([Int(rs[1].id)])
+        for t in UnifiedIR.each_stmt(ir)
+            UnifiedIR.is_tombstone(ir, t) && continue
+            k = UnifiedIR.stmt_kind(ir, t)
+            branchkind(k) || continue
+            dests = Int[]
+            if k === K"br_if"
+                condl = stmt_lattice(ir, UnifiedIR.getop(ir, t, 1))
+                bs = UnifiedIR.edge_bundles(ir, t)
+                if condl isa CC.Const && condl.val isa Bool && length(bs) >= 2
+                    push!(dests, Int(bs[condl.val ? 1 : 2][1].id))
+                else
+                    for (d, _) in bs
+                        push!(dests, Int(d.id))
+                    end
+                end
+            else
+                for (d, _) in UnifiedIR.edge_bundles(ir, t)
+                    push!(dests, Int(d.id))
+                end
+            end
+            bl = owning_block(t)
+            if bl in blocks
+                append!(get!(() -> Int[], succs, bl), dests)
+            else
+                # branch from outside this island: its in-island targets are
+                # entries (conservatively live)
+                for d in dests
+                    d in blocks && push!(seeds, d)
+                end
+            end
+        end
+        reach = BitSet()
+        wl = collect(seeds)
+        while !isempty(wl)
+            b = pop!(wl)
+            (b in reach || !(b in blocks)) && continue
+            push!(reach, b)
+            for d in get(succs, b, Int[])
+                d in reach || push!(wl, d)
+            end
+        end
+        for b in blocks
+            b in reach || push!(dead, b)
+        end
+    end
+    return dead
+end
+
+"true when `s` sits (transitively) inside a dead island block"
+function sw_in_dead_block(ir::UnifiedIR.IR, s::StmtId, dead::BitSet)
+    r = Int(UnifiedIR.stmt_region(ir, s).id)
+    steps = 0
+    while r != 0
+        r in dead && return true
+        (steps += 1) <= UnifiedIR.nregions(ir) || return false
+        r = Int(UnifiedIR.getregion(ir, UnifiedIR.RegionId(Int32(r))).parent.id)
+    end
+    return false
+end
+
+function region_inline_cost(ir::UnifiedIR.IR, st::UInferState,
+                            params::Compiler.OptimizationParams, cap::Int)
+    dead = sw_dead_blocks(ir)
+    bodycost = 0
+    for s in UnifiedIR.each_stmt(ir)
+        UnifiedIR.is_tombstone(ir, s) && continue
+        isempty(dead) || !sw_in_dead_block(ir, s, dead) || continue
+        c = region_stmt_cost(ir, st, s, params)
+        bodycost = Compiler.plus_saturate(bodycost, c)
+        bodycost > cap && return Int(Compiler.MAX_INLINE_COST)
+    end
+    return Int(Compiler.inline_cost_clamp(bodycost))
+end
+
+# stock `statement_or_branch_cost` on region-IR vocabulary
+function region_stmt_cost(ir::UnifiedIR.IR, st::UInferState, s::StmtId,
+                          params::Compiler.OptimizationParams)
+    k = UnifiedIR.stmt_kind(ir, s)
+    if k === K"call"
+        return region_call_cost(ir, st, s, params)
+    elseif k === K"intrinsic"
+        f = static_operand_value(ir, UnifiedIR.getop(ir, s, 1))
+        return f isa Core.IntrinsicFunction ? region_intrinsic_cost(ir, s, f) : 20
+    elseif k === K"invoke"
+        # non-returning invokes are error paths: free (stock's rule)
+        t = UnifiedIR.stmt_type(ir, s)
+        return (t isa Type && t === Union{}) ? 0 : 20
+    elseif k === K"foreigncall"
+        return 20
+    elseif k === K"copyast"
+        return 100
+    elseif k === K"try"
+        return typemax(Int)          # stock EnterNode: never inline
+    elseif k === K"continue"
+        return 40                    # loop backedge (stock backward goto)
+    elseif k === K"goto" || k === K"br_if" || k === K"switch" || k === K"await"
+        # cfg-island branch: backward target = a loop (dense spans: the
+        # target block's first statement precedes the branch)
+        for i in 1:UnifiedIR.nops(ir, s)
+            o = UnifiedIR.getop(ir, s, i)
+            UnifiedIR.optag(o) == UnifiedIR.TAG_BLOCK || continue
+            tr = UnifiedIR.getregion(ir, UnifiedIR.asregion(o))
+            tf = tr.first
+            (tf.id != 0 && tf.id <= s.id) && return 40
+        end
+        return 0
+    end
+    return 0
+end
+
+# stock `statement_cost`'s `:call` arm on region-IR operands
+function region_call_cost(ir::UnifiedIR.IR, st::UInferState, s::StmtId,
+                          params::Compiler.OptimizationParams)
+    #=const=# UNKNOWN_CALL_COST = 20
+    flat = stmt_lattice(ir, UnifiedIR.getop(ir, s, 1))
+    f = CC.singleton_type(flat)
+    if f isa Core.IntrinsicFunction
+        return region_intrinsic_cost(ir, s, f)
+    end
+    if f isa Core.Builtin && f !== Core.invoke
+        nop = UnifiedIR.nops(ir, s)
+        if f === Core.getfield || f === Core.tuple || f === Core.getglobal
+            return 0
+        elseif (f === Core.memoryrefget || f === Core.memoryref_isassigned) && nop >= 3
+            atyp = stmt_lattice(ir, UnifiedIR.getop(ir, s, 2))
+            return Compiler.isknowntype(atyp) ? 1 : params.inline_nonleaf_penalty
+        elseif (f === Core.memoryrefset! || f === Core.memoryrefunset!) && nop >= 3
+            atyp = stmt_lattice(ir, UnifiedIR.getop(ir, s, 2))
+            return Compiler.isknowntype(atyp) ? 5 : params.inline_nonleaf_penalty
+        elseif f === Core.typeassert && nop >= 3 &&
+               CC.isconstType(CC.widenconst(stmt_lattice(ir, UnifiedIR.getop(ir, s, 3))))
+            return 1
+        end
+        fidx = CC.find_tfunc(f)
+        fidx === nothing && return UNKNOWN_CALL_COST
+        return CC.T_FFUNC_COST[fidx]
+    end
+    t = UnifiedIR.stmt_type(ir, s)
+    (t isa Type && t === Union{}) && return 0          # error path: free
+    # a statically-resolvable residual call measures as the `:invoke` it
+    # becomes (stock's inliner rewrites declined candidates before its
+    # model sees them — the same rule the optimized-grade pricing applies)
+    ea_resolve_residual_call(ir, st, s) isa Core.MethodInstance &&
+        return UNKNOWN_CALL_COST
+    return params.inline_nonleaf_penalty
+end
+
+# stock's IntrinsicFunction arm (const-arg halving heuristic included);
+# operand 1 is the callee/which slot for both K"call" and K"intrinsic",
+# so arities line up with stock's `length(ex.args)`
+function region_intrinsic_cost(ir::UnifiedIR.IR, s::StmtId, f::Core.IntrinsicFunction)
+    iidx = Int(reinterpret(Int32, f)) + 1
+    nargs = UnifiedIR.nops(ir, s)
+    isassigned(CC.T_IFUNC, iidx) || return 20
+    minarg, maxarg, = CC.T_IFUNC[iidx]
+    (minarg + 1 <= nargs <= maxarg + 1) || return 20
+    cost = CC.T_IFUNC_COST[iidx]
+    if cost == 0 || nargs < 3 || f === Core.Intrinsics.llvmcall
+        return cost
+    end
+    aty2 = CC.widenconditional(stmt_lattice(ir, UnifiedIR.getop(ir, s, 2)))
+    nconst = Int(aty2 isa CC.Const)
+    for i in 3:nargs
+        aty = CC.widenconditional(stmt_lattice(ir, UnifiedIR.getop(ir, s, i)))
+        if CC.widenconst(aty) != CC.widenconst(aty2)
+            nconst = 0
+            break
+        end
+        nconst += aty isa CC.Const
+    end
+    nconst + 2 >= nargs && (cost = (cost - 1) ÷ 2)
+    return cost
 end
 
 # A "single match" is only the dispatch outcome when it also FULLY COVERS

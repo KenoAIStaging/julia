@@ -1,29 +1,25 @@
-# Cold whole-workload walk benchmark (wave 9, B1): the unified driver over
-# the Test-loading workload's compile set, in a cold-cache process.
+# Cold ANSI-write walk benchmark (wave 11): the unified driver over the
+# StyledStrings styled-print compile set, in a cold-cache process — the
+# `_ansi_writer` first-compile chain whose CI-less callee graph drives the
+# recursive inline-cost towers (scratchpad/wave10h/img_workload.log).
 #
 #   ./usr/bin/julia --startup-file=no --compiled-modules=no \
-#       Compiler/bench/unified_coldwalk.jl
+#       Compiler/bench/unified_ansiwalk.jl
 #
-# `--compiled-modules=no` loads Test (and deps) from SOURCE, so the stdlib
-# methods below have no cached CodeInstances — the sys-unified image
-# scenario, where Base bodies are baked but every stdlib body compiles
-# through the pipeline on first load. The target list is the stock
-# compiler's own account of the workload, harvested once via
+# Same harness shape as unified_coldwalk.jl (see its header for the
+# methodology); the target list comes from
 #
 #   ./usr/bin/julia --startup-file=no --pkgimages=no \
-#       --trace-compile=trace.jl -e 'using Test; @testset "x" begin @test 1+1==2 end'
+#       --trace-compile=trace.jl -e 'using StyledStrings;
+#           io = IOContext(IOBuffer(), :color => true);
+#           print(io, styled"{red:hello} {(foreground=blue):world $(1+2)}");
+#           printstyled(io, "x"; color = :green, bold = true);
+#           print(io, styled"{bold:{yellow:nested} tail}")'
 #
-# filtered to signatures resolvable after `using Test` (Test/Base/Core
-# rows). Each target gets one driver pass through the hook-shaped entry
-# (`_unified_typeinf` under the task-state discipline `unified_typeinf`
-# applies; the stock `add_codeinsts_to_jit!` closure is skipped so the
-# numbers isolate PIPELINE compute from LLVM codegen). Driver-published
-# CodeInstances stay in the cache across targets, exactly like the image
-# walk. A wall-clock budget (COLDWALK_BUDGET seconds, default 240) stops
-# the walk early and reports the partial table — cumulative time through
-# target #k is comparable across runs either way.
+# Knobs: ANSIWALK_BUDGET (seconds, default 480), COLDWALK_CI_SERVE=0,
+# COLDWALK_COST_PRICING=optimize|depth1|stmtwalk (as in unified_coldwalk.jl).
 
-using Test  # the workload subject: must be loaded (cold) before resolving sigs
+using StyledStrings  # the workload subject: loaded (cold) before resolving sigs
 
 pushfirst!(LOAD_PATH, joinpath(Sys.BINDIR, Base.DATAROOTDIR, "julia"))
 # UNIFIED_LOAD_OVERLAY: a directory whose package entries (UnifiedIR, ...)
@@ -33,7 +29,7 @@ import Compiler
 const U = Compiler.load_unified!()
 const CC = Compiler
 
-include(joinpath(@__DIR__, "coldwalk_sigs.jl"))  # WORKLOAD_SIGS
+include(joinpath(@__DIR__, "ansiwalk_sigs.jl"))  # ANSI_SIGS
 
 function resolve_mi(sigstr::String)
     tt = try
@@ -56,7 +52,7 @@ function resolve_mi(sigstr::String)
     end
 end
 
-# the hook-shaped driver entry, minus the JIT closure (see header)
+# the hook-shaped driver entry, minus the JIT closure
 function drive(mi::Core.MethodInstance)
     interp = CC.NativeInterpreter(Base.get_world_counter())
     dts = U.driver_task_state()
@@ -81,14 +77,11 @@ let
     println("warmup ", round(t; digits = 1), "s")
 end
 
-const BUDGET = parse(Float64, get(ENV, "COLDWALK_BUDGET", "240"))
-# A/B switches: COLDWALK_CI_SERVE=0 turns the CodeInstance-cache serving
-# (inference + cost/effects fast paths) off — the pre-wave-9 behavior
+const BUDGET = parse(Float64, get(ENV, "ANSIWALK_BUDGET", "480"))
 if get(ENV, "COLDWALK_CI_SERVE", "1") == "0"
     U.CI_SERVE_ENABLED[] = false
     U.CI_COST_ENABLED[] = false
 end
-# COLDWALK_COST_PRICING=optimize|depth1|stmtwalk — CI-less pricing grade A/B
 if haskey(ENV, "COLDWALK_COST_PRICING")
     U.COST_PRICING[] = Symbol(ENV["COLDWALK_COST_PRICING"])
 end
@@ -99,7 +92,7 @@ U.reset_driver_phases!()
 
 resolved = Tuple{String,Core.MethodInstance}[]
 skipped = 0
-for s in WORKLOAD_SIGS
+for s in ANSI_SIGS
     m = resolve_mi(s)
     m === nothing ? (global skipped += 1) : push!(resolved, (s, m))
 end
@@ -122,7 +115,7 @@ for (i, (s, m)) in enumerate(resolved)
 end
 
 println()
-println("== coldwalk: ", completed, "/", length(resolved), " targets in ",
+println("== ansiwalk: ", completed, "/", length(resolved), " targets in ",
         round(total; digits = 2), "s ==")
 U.print_pipeline_stats()
 U.print_driver_phases()
