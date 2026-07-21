@@ -353,7 +353,7 @@ typedef struct _jl_task_t {
     // A `Base.WaitEntry` cached for reuse across parks (or `nothing`), so the
     // common single-registration park does not allocate. Owned by this task.
     jl_value_t *cached_wait_entry;
-    // Cancellation request - can be an arbitary julia value, but the runtime recognizes
+    // Cancellation request - can be an arbitrary julia value, but the runtime recognizes
     // CANCEL_REQUEST_ enum values.
     _Atomic(jl_value_t *) cancellation_request;
 
