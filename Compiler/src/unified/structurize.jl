@@ -391,7 +391,11 @@ function _collapse_one_loop!(ir::UnifiedIR.IR, cfgop::StmtId)
 end
 
 function _collapse_natural_loop!(ir::UnifiedIR.IR, cfgop::StmtId,
-                                 dom::Dict{RegionId,Set{RegionId}},
+                                 # dom: UnifiedIR.island_dominators result
+                                 # (IdDict{RegionId,IdSet{RegionId}} — left
+                                 # unannotated across the C2 bootstrap-dialect
+                                 # transition)
+                                 dom,
                                  own::Set{Int32}, H::RegionId, srcs::Vector{RegionId})
     isempty(UnifiedIR.getregion(ir, H).args) || return false
     # predecessor map over the island's block graph
