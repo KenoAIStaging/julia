@@ -85,15 +85,18 @@ end
 _unified_ledger_line("post-warmup")
 _U.reset_pipeline_stats!()
 
-Core.println("UNIFIED: pipeline ON (Compiler.UNIFIED_HOOKS -> unified_typeinf; ",
+Core.println("UNIFIED: pipeline ON (Compiler.UNIFIED_HOOKS global mode -> unified_typeinf; ",
              "jl_typeinf_func stays Compiler.typeinf_ext_toplevel, world refreshed)")
-# second jl_typeinf_world refresh (see the post-bake one above): pick up
-# everything the warmup defined. staticdata serializes jl_typeinf_world, so
-# the refreshed world persists into the dumped image. This is exactly what
-# package-mode activate! gets from activate_codegen!.
-ccall(:jl_set_typeinf_func, Cvoid, (Any,), Base.Compiler.typeinf_ext_toplevel)
 _U.SHADOW_ENABLED[] = false
-_U.enable_pipeline!()
+# global_mode is a FIELD of the UnifiedHooks object (the wave-12
+# reflection/global mode split): without it typeinf_ext_toplevel never
+# consults the hooks for C-driven inference and the whole stage — and the
+# booted image — silently runs stock. enable_pipeline!(global_mode=true)
+# also re-registers jl_typeinf_func AFTER installing the hooks, refreshing
+# the pinned jl_typeinf_world to one that includes everything the warmup
+# defined (staticdata serializes that world, so it persists into the
+# dumped image — exactly what package-mode activate! does).
+_U.enable_pipeline!(global_mode = true)
 _U.GLOBAL_MODE[] = true
 
 const _t_workload = time_ns()
