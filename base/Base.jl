@@ -333,10 +333,13 @@ a_method_to_overwrite_in_test() = inferencebarrier(1)
 
 # Compiler frontend
 # UnifiedIR is the shared substrate under JuliaSyntax's SyntaxGraph (storage
-# core, tree porcelain, kind registry) and under the compiler IR; it must be
-# available before JuliaSyntax is bootstrapped.
-Core.println("UnifiedIR/src/UnifiedIR.jl")
-include(@__MODULE__, string(DATAROOT, "julia/UnifiedIR/src/UnifiedIR.jl"))
+# core, tree porcelain, kind registry) and under the compiler IR. Its
+# compiler-needed core already loaded at the basecompiler stage (bootstrap
+# dialect; Base_compiler.jl); now that the full Base vocabulary exists,
+# finish the module — tree porcelain, textual format, test-dialect
+# interpreter — before JuliaSyntax bootstraps on the substrate.
+Core.println("UnifiedIR/src/UnifiedIR.jl (syntax layer)")
+UnifiedIR.load_syntax!()
 Core.println("JuliaSyntax/src/JuliaSyntax.jl")
 include(@__MODULE__, string(DATAROOT, "julia/JuliaSyntax/src/JuliaSyntax.jl"))
 # May be replaced in incremental sysimage build after-the-fact

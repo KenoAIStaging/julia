@@ -83,6 +83,15 @@ COMPILER_SRCS := $(addprefix $(JULIAHOME)/, \
 		base/traits.jl \
 		base/tuple.jl)
 COMPILER_SRCS += $(shell find $(JULIAHOME)/Compiler/src -name \*.jl -and -not -name verifytrim.jl -and -not -name show.jl)
+# UnifiedIR's compiler-needed core loads at the basecompiler stage (bootstrap
+# dialect; included from Base_compiler.jl). The debug/syntax layer
+# (tree/print/parse/interp/testdialect) is finished by Base.jl via
+# UnifiedIR.load_syntax!().
+COMPILER_SRCS += $(addprefix $(JULIAHOME)/UnifiedIR/src/, \
+		UnifiedIR.jl compat.jl kinds.jl operands.jl columns.jl \
+		attrgraph.jl core.jl refs.jl builder.jl stmts.jl verify.jl \
+		dense.jl editable.jl surgery.jl compact.jl floating.jl \
+		analysis.jl passes.jl promote.jl)
 # Julia-based compiler frontend is bootstrapped into Base for now
 # (UnifiedIR is the substrate JuliaSyntax runs on, bootstrapped just before it)
 COMPILER_FRONTEND_SRCS = $(shell find $(JULIAHOME)/UnifiedIR/src $(JULIAHOME)/JuliaSyntax/src -name \*.jl)

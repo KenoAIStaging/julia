@@ -392,6 +392,23 @@ process_sysimg_args!()
 
 function isready end
 
+# UnifiedIR's compiler-needed core (bootstrap dialect). Loading it here —
+# before the compiler — makes bootstrap-cleanliness of the unified IR
+# substrate a permanent build invariant (COMPILER-PORT-PLAN C2 increment 2).
+# Inert at this stage: nothing consults it until the unified driver is
+# activated; the debug/syntax layer is finished at the end of Base.jl via
+# `UnifiedIR.load_syntax!()`.
+try
+    include(strcat(DATAROOT, "julia/UnifiedIR/src/UnifiedIR.jl"))
+catch
+    Core.println("ERROR: UnifiedIR's core failed to load at the basecompiler stage.")
+    Core.println("Its compiler-needed files (everything UnifiedIR.jl includes before")
+    Core.println("load_syntax!) must stay in the bootstrap dialect: partial-Base")
+    Core.println("vocabulary only — see UnifiedIR/src/compat.jl and")
+    Core.println("BOOTSTRAP-SUBSET-NOTES.md (COMPILER-PORT-PLAN C2).")
+    rethrow()
+end
+
 include(strcat(DATAROOT, "julia/Compiler/src/Compiler.jl"))
 using .Compiler.ReinferUtils: ReinferUtils, invalidate_code_for_globalref!
 
