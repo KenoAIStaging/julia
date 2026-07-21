@@ -313,9 +313,6 @@ token; use it to hoist the token lookup out of a tight loop.
 """
 macro cancel_check()
     quote
-        # also a GC safepoint, so that a tight polling loop cannot starve a
-        # concurrent stop-the-world
-        ccall(:jl_gc_safepoint, Cvoid, ())
         # the scoped cancellation token ...
         checkcancel(default_cancel_source())
         # ... and per-task requests (delivered through
@@ -332,7 +329,6 @@ end
 macro cancel_check(tok)
     quote
         local t = $(esc(tok))
-        ccall(:jl_gc_safepoint, Cvoid, ())
         checkcancel(t === nothing ? nothing : (t::CancellationToken).source)
         # see above: the reset-point-establishing builtin must come last
         local req = Core.cancellation_point!()
