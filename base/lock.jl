@@ -248,6 +248,16 @@ end
 function wait_no_relock(c::GenericCondition)
     ct = current_task()
     w = _wait2(c, ct)
+    cr = pre_sleep_cancellation_request()
+    if cr !== nothing
+        # A cancellation request is already pending (e.g. it arrived while we
+        # were still spinning and thus not interruptibly waiting): don't park.
+        @atomicreplace ct.waiting_on w => nothing
+        list_deletefirst!(waitqueue(c), w)
+        unlock(c.lock)
+        acknowledge_cancellation!(ct, cr)
+        throw(cr)
+    end
     token = unlockall(c.lock)
     try
         return wait()

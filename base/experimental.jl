@@ -666,6 +666,14 @@ function wait_with_timeout(c::GenericCondition; first::Bool=false, timeout::Real
     # single-use-ness guarantees that the timeout task's expected-entry CAS
     # cannot claim a later, unrelated wait of `ct`.
     w = Base._wait2(c, ct, first; entry=Base.WaitEntry(ct))
+    cr = Base.pre_sleep_cancellation_request()
+    if cr !== nothing
+        # A cancellation request is already pending: don't park.
+        @atomicreplace ct.waiting_on w => nothing
+        Base.list_deletefirst!(Base.waitqueue(c), w)
+        Base.acknowledge_cancellation!(ct, cr)
+        throw(cr)
+    end
     token = Base.unlockall(c.lock)
 
     timer::Union{Timer, Nothing} = nothing
