@@ -13,6 +13,9 @@
 # Every outcome must match; exits nonzero on any mismatch.
 
 pushfirst!(LOAD_PATH, joinpath(Sys.BINDIR, Base.DATAROOTDIR, "julia"))
+# UNIFIED_LOAD_OVERLAY: a directory whose package entries (UnifiedIR, ...)
+# take priority — pins a source snapshot when the working tree is in flux
+haskey(ENV, "UNIFIED_LOAD_OVERLAY") && pushfirst!(LOAD_PATH, ENV["UNIFIED_LOAD_OVERLAY"])
 import Compiler
 const U = Compiler.load_unified!()
 
