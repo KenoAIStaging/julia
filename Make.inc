@@ -14,6 +14,14 @@
 # Set to zero to turn off extra precompile (e.g. for the REPL)
 JULIA_PRECOMPILE ?= 1
 
+# Build sys.so as the unified image: the UnifiedIR compiler port is baked
+# into the sysimage and installed as the runtime's default inference path,
+# and the stdlib pkgimages are compiled through it (see sysimage.mk).
+# Set to zero for the stock (pre-UnifiedIR) sysimage build.  Note that the
+# unified sys stage is substantially slower than the stock one (~8x at the
+# time of the flip); UNIFIED_SYSIMAGE=0 is the escape hatch.
+UNIFIED_SYSIMAGE ?= 1
+
 # Set FORCE_ASSERTIONS to 1 to enable assertions in the C and C++ portions
 # of the Julia code base. You may also want to set LLVM_ASSERTIONS to 1,
 # which will enable assertions in LLVM.

@@ -175,10 +175,12 @@ JULIALOWERING_SRCS := $(shell find $(build_datarootdir)/julia/JuliaLowering/src 
 # generate_precompile workload runs (Compiler/src/unified/bootstrap_driver.jl).
 UNIFIED_BOOT_SRCS := $(shell find $(JULIAHOME)/Compiler/src/unified $(JULIAHOME)/UnifiedIR/src $(JULIAHOME)/UnifiedCompiler/src -name \*.jl)
 
-# UNIFIED_SYSIMAGE=1 makes the unified driver the DEFAULT `sys` stage script:
-# sys.so itself is then built with the UnifiedIR compiler port baked in and
-# installed as the runtime inference entry before (and after — the flip
-# persists into the image) the precompile workload.
+# UNIFIED_SYSIMAGE=1 (the default, set in Make.inc) makes the unified driver
+# the `sys` stage script: sys.so itself is built with the UnifiedIR compiler
+# port baked in and installed as the runtime inference entry before (and
+# after — the flip persists into the image) the precompile workload, and the
+# stdlib pkgimages are then compiled through it by the stock pkgimage.mk
+# flow.  UNIFIED_SYSIMAGE=0 restores the stock (pre-UnifiedIR) sys stage.
 ifeq ($(UNIFIED_SYSIMAGE),1)
 SYS_STAGE_SCRIPT := $(JULIAHOME)/Compiler/src/unified/bootstrap_driver.jl
 # the driver bakes the unified/ port sources into the image and then runs
