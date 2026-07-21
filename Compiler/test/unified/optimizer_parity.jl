@@ -428,4 +428,58 @@ _op_nonbuiltin_call(src) = (@nospecialize(x),) -> Meta.isexpr(x, :call) &&
     end
 end
 
+# wave 10: comparison lifting must not confuse the two K"extract" flavors —
+# `extract(if, i)` over an if whose arms produce ONE result operand projects
+# INTO that runtime value (tuple element i), it does not select a result
+# operand. Confusing them compared the destructured iterate-result TUPLE
+# (instead of its first element) against `nothing`/the guard type, folding
+# both guards to Const(false) and leaving the union-split residual
+# `throw_methoderror` arm as the unconditionally-taken path (the
+# StyledStrings `termcolor(::IOBuffer, ::SimpleColor, ::Char)` manual
+# MethodError during incremental precompile).
+struct OPSCol
+    v::Symbol
+end
+struct OPFaceUL
+    ul::Union{Nothing, Bool, OPSCol, Tuple{Union{Nothing, OPSCol}, Symbol}}
+end
+@noinline op_termc(io::IO, c::OPSCol, cat::Char) = (write(io, 'S'); nothing)
+@noinline op_termc(io::IO, ::Nothing, cat::Char) = (write(io, 'N'); nothing)
+function op_destructure_guard(io::IO, f::OPFaceUL)
+    if f.ul isa Tuple
+        c, s = f.ul     # re-read: the destructure iterates the wide union
+        isnothing(c) || op_termc(io, c, '5')
+    end
+    nothing
+end
+
+@testset "optimizer parity: wave-10 extract-flavor comparison lifting" begin
+    saved = Base.REFLECTION_COMPILER[]
+    try
+        Base.REFLECTION_COMPILER[] = Compiler
+        OPUnified.enable_pipeline!()
+
+        @testset "destructured union element keeps its guards" begin
+            src = _code_typed1(op_destructure_guard, (IOBuffer, OPFaceUL))
+            # the guarded op_termc dispatch must survive (inlined write or
+            # call/invoke); pre-fix every path in the tuple branch collapsed
+            # into the residual throw_methoderror arm
+            @test any(src.code) do x
+                _isinvoke(:op_termc, x) || _iscall(src, op_termc, x) ||
+                    _isinvoke(:write, x)
+            end
+            # and the isa-OPSCol dispatch guard must not fold away (pre-fix
+            # it folded to Const(false), erasing the guarded arm)
+            @test any(src.code) do x
+                Meta.isexpr(x, :call) && length(x.args) == 3 &&
+                    OPCC.singleton_type(OPCC.argextype(x.args[1], src, OPCC.VarState[])) === isa &&
+                    OPCC.singleton_type(OPCC.argextype(x.args[3], src, OPCC.VarState[])) === OPSCol
+            end
+        end
+    finally
+        OPUnified.disable_pipeline!()
+        Base.REFLECTION_COMPILER[] = saved
+    end
+end
+
 end # module UnifiedOptimizerParityTests

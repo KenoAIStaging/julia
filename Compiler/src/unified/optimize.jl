@@ -424,11 +424,16 @@ function forward_extracts!(ir::UnifiedIR.IR)
         if dk === K"if"
             arms = result_arms(ir, def)
             (arms === nothing || isempty(arms)) && continue
-            # uniform-constant position: fold outright
+            # uniform-constant position: fold outright. POSITIONAL reads are
+            # only meaningful for multi-operand (de-tupled) results — a
+            # single-operand result IS the if's value, and an extract over
+            # it projects INTO that value (the armpairs path below projects
+            # correctly, incl. constant leaves via const_struct_field_op)
             v0 = nothing
             uniform = true
             for (_, t) in arms
-                idx <= UnifiedIR.nops(ir, t) || (uniform = false; break)
+                (2 <= UnifiedIR.nops(ir, t) && idx <= UnifiedIR.nops(ir, t)) ||
+                    (uniform = false; break)
                 v = static_operand_value(ir, UnifiedIR.getop(ir, t, idx))
                 v === nothing && (uniform = false; break)
                 ismutable(v) && !(v isa Union{Type,Function,Module,Symbol,String}) &&
@@ -468,7 +473,11 @@ function forward_extracts!(ir::UnifiedIR.IR)
             armpairs = Tuple{StmtId,UnifiedIR.Operand}[]
             armok = true
             for (_, t) in arms
-                k <= UnifiedIR.nops(ir, t) || (armok = false; break)
+                # positional base extract: de-tupled multi-operand results
+                # only (a single-operand result would make the base a
+                # projection INTO the value, not a result selection)
+                (2 <= UnifiedIR.nops(ir, t) && k <= UnifiedIR.nops(ir, t)) ||
+                    (armok = false; break)
                 push!(armpairs, (t, UnifiedIR.getop(ir, t, k)))
             end
             armok || continue
@@ -594,7 +603,11 @@ function lift_keyvalue_gets!(ir::UnifiedIR.IR)
                 (arms === nothing || isempty(arms)) && return nothing
                 v0 = nothing
                 for (_, t) in arms
-                    kidx <= UnifiedIR.nops(ir, t) || return nothing
+                    # positional walk: de-tupled multi-operand results only
+                    # (a single-operand result is the if's VALUE; the extract
+                    # projects into it — not a result-position selection)
+                    (2 <= UnifiedIR.nops(ir, t) && kidx <= UnifiedIR.nops(ir, t)) ||
+                        return nothing
                     v = kv_walk(UnifiedIR.getop(ir, t, kidx), depth + 1)
                     v === nothing && return nothing
                     v0 === nothing ? (v0 = v) : (v == v0 || return nothing)
@@ -846,17 +859,29 @@ function fold_pure_queries!(ir::UnifiedIR.IR)
             UnifiedIR.optag(o) == UnifiedIR.TAG_STMT || continue
             d = skip_refines(ir, UnifiedIR.asstmt(o))
             dk = UnifiedIR.stmt_kind(ir, d)
-            pos = 0
+            # `elem == 0`: the subject is the if's VALUE itself; `elem >= 1`:
+            # the subject is `extract(if, elem)`. An if whose arm results
+            # carry ONE operand has that operand as its value (an extract
+            # over it projects INTO the runtime value — tuple element
+            # `elem`); only a MULTI-operand result if de-tuples positionally
+            # (its value is the synthetic escape tuple). Confusing the two
+            # flavors compared the whole tuple where an element was asked —
+            # `isa(c, T)`/`c === nothing` over a destructured union-split
+            # iterate result folded to Const(false)/Const(false), turning
+            # the residual throw_methoderror arm into the taken path (the
+            # StyledStrings termcolor manual-MethodError class).
+            elem = -1
             if dk === K"extract" && begin
                    bo = UnifiedIR.getop(ir, d, 1)
                    UnifiedIR.optag(bo) == UnifiedIR.TAG_STMT &&
                        UnifiedIR.stmt_kind(ir, UnifiedIR.asstmt(bo)) === K"if"
                end
-                pos = Int(UnifiedIR.imm_value(UnifiedIR.getop(ir, d, 2))::Int64)
+                elem = Int(UnifiedIR.imm_value(UnifiedIR.getop(ir, d, 2))::Int64)
+                elem >= 1 || continue
                 d = UnifiedIR.asstmt(UnifiedIR.getop(ir, d, 1))
                 dk = K"if"
             elseif dk === K"if"
-                pos = 1
+                elem = 0
             end
             if dk === K"select" ||
                (dk === K"call" && UnifiedIR.nops(ir, d) == 4 &&
@@ -867,13 +892,32 @@ function fold_pure_queries!(ir::UnifiedIR.IR)
                 push!(armlats, stmt_lattice(ir, UnifiedIR.getop(ir, d, 3 + ofs)))
                 subj = i
                 break
-            elseif dk === K"if" && pos >= 1
+            elseif dk === K"if" && elem >= 0
                 arms = result_arms(ir, d)
                 (arms === nothing || isempty(arms)) && continue
                 bad = false
                 for (_, t) in arms
-                    pos <= UnifiedIR.nops(ir, t) || (bad = true; break)
-                    push!(armlats, stmt_lattice(ir, UnifiedIR.getop(ir, t, pos)))
+                    nres = UnifiedIR.nops(ir, t)
+                    local al
+                    if nres == 1
+                        al = stmt_lattice(ir, UnifiedIR.getop(ir, t, 1))
+                        if elem >= 1
+                            # element projection into the arm's value
+                            al = try
+                                CC.getfield_tfunc(L, al, CC.Const(elem))
+                            catch
+                                nothing
+                            end
+                        end
+                    elseif elem >= 1 && elem <= nres
+                        al = stmt_lattice(ir, UnifiedIR.getop(ir, t, elem))
+                    else
+                        # elem == 0 over a multi-result if (its value is the
+                        # synthetic escape tuple), or out-of-range: decline
+                        al = nothing
+                    end
+                    (al === nothing || al === Union{}) && (bad = true; break)
+                    push!(armlats, al)
                 end
                 bad && (empty!(armlats); continue)
                 co = UnifiedIR.getop(ir, d, 1)
