@@ -294,9 +294,21 @@ struct _jl_cancel_source_t {
     // Weak (spliced by the GC): most recently attached live child;
     // `jl_nothing`-terminated. Union{Nothing, CancellationTokenSource}.
     _Atomic(jl_value_t*) child_head;
+    // Parked waiters: an intrusive doubly-linked list of `Base.WaitEntry`
+    // registrations (their `tnext`/`tprev` halves), where the cancellation
+    // walk finds tasks blocked under this source. Strong references (the
+    // GC's special-cased marking traces them), guarded by `_lock`.
+    jl_value_t *waiters_head;   // Union{Nothing, Base.WaitEntry}
+    jl_value_t *waiters_tail;
     // 0x00 = live; (0x80 | sev) = cancelled at severity sev (0x0 SAFE,
     // 0x3 ABANDON_EXTERNAL, 0x4 ABANDON_ALL). Monotonic (CAS-max).
     _Atomic(uint8_t) state;
+    // Bitmask (1 << sev) of severities whose delivery some task observed;
+    // feeds the ^C episode state machine (async-signal-safe C reads).
+    _Atomic(uint8_t) delivered;
+    // Spinlock guarding the waiter list only; attachment and state stay
+    // lock-free (see the concurrency notes above).
+    _Atomic(uint8_t) _lock;
     // Number of parent links following the fixed fields. Const.
     uint16_t nparents;
     // jl_cancel_parent_link_t links[nparents];  (see jl_cancel_source_links)
@@ -337,7 +349,11 @@ typedef struct _jl_task_t {
     uint8_t sticky; // record whether this Task can be migrated to a new thread
     uint16_t priority;
     _Atomic(uint8_t) _isexception; // set if `result` is an exception to throw or that we exited with
-    uint8_t pad0[3];
+    // Set to request that this task yields at its next cancellation point
+    // (so that e.g. a canceller sharing the thread can run); cleared by the
+    // task itself when it honors the request.
+    _Atomic(uint8_t) preempt_request;
+    uint8_t pad0[2];
     // === 64 bytes (cache line)
     uint64_t rngState[JL_RNG_SIZE];
     // flag indicating whether or not to record timing metrics for this task
@@ -365,6 +381,13 @@ typedef struct _jl_task_t {
     // CANCEL_REQUEST_ enum values.
     _Atomic(jl_value_t *) cancellation_request;
 
+    // The cancellation token source last published by a cancellation point on
+    // this task ("the token governing the compute currently running here").
+    // `nothing`, or a `Core.CancellationTokenSource`. Read by cancellers
+    // scanning for running computations governed by a cancelled subtree; may
+    // be stale between cancellation points (benign: level-triggered recovery
+    // at the next check).
+    _Atomic(jl_value_t *) bound_cancel_token;
 // hidden state:
 
     // id of owning thread - does not need to be defined until the task runs

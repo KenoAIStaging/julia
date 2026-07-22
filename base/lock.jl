@@ -191,9 +191,12 @@ wait for it to become available.
 
 Each `lock` must be matched by an [`unlock`](@ref).
 """
-@inline function lock(rl::ReentrantLock)
-    trylock(rl) || (@noinline function slowlock(rl::ReentrantLock)
+@inline function lock(rl::ReentrantLock; cancel::CancelTokenArg=DEFAULT_CANCEL)
+    trylock(rl) || (@noinline function slowlock(rl::ReentrantLock, cancel::CancelTokenArg)
         Threads.lock_profiling() && Threads.inc_lock_conflict_count()
+        # resolve the scoped default once; a cancelled acquisition throws the
+        # CancellationRequest without the lock held
+        tok = resolve_cancel_token(cancel)
         c = rl.cond_wait
         ct = current_task()
         iteration = 1
@@ -236,31 +239,34 @@ Each `lock` must be matched by an [`unlock`](@ref).
             end
 
             # It was locked, so now wait for the unlock to notify us
-            wait_no_relock(c)
+            wait_no_relock(c, tok)
 
             # Loop back and try locking again
             iteration = 1
         end
-    end)(rl)
+    end)(rl, cancel)
     return
 end
 
-function wait_no_relock(c::GenericCondition)
+function wait_no_relock(c::GenericCondition, tok::MaybeToken=default_cancel_token())
     ct = current_task()
+    src = tok === nothing ? nothing : tok.source
     w = _wait2(c, ct)
-    cr = pre_sleep_cancellation_request()
-    if cr !== nothing
-        # A cancellation request is already pending (e.g. it arrived while we
-        # were still spinning and thus not interruptibly waiting): don't park.
+    if src !== nothing && !register_cancellation!(src, w)
+        # The governing token is already cancelled (e.g. it was cancelled
+        # while we were still spinning and thus not interruptibly waiting):
+        # don't park.
         @atomicreplace ct.waiting_on w => nothing
         list_deletefirst!(waitqueue(c), w)
         unlock(c.lock)
-        acknowledge_cancellation!(ct, cr)
-        throw(cr)
+        checkcancel(src)
+        error("cancellation registration refused, but the source is not cancelled")
     end
     token = unlockall(c.lock)
     try
-        return wait()
+        ret = wait()
+        src === nothing || unregister_cancellation!(src, w)
+        return ret
     catch
         # We were resumed without a wake having been delivered through our
         # registration (an interrupter claimed it, or a raw `throwto`).
@@ -270,6 +276,7 @@ function wait_no_relock(c::GenericCondition)
         lock(c.lock)
         list_deletefirst!(waitqueue(c), w)
         unlock(c.lock)
+        src === nothing || unregister_cancellation!(src, w)
         rethrow()
     end
 end
@@ -348,6 +355,15 @@ See also [`@lock`](@ref).
 """
 function lock(f, l::AbstractLock)
     lock(l)
+    try
+        return f()
+    finally
+        unlock(l)
+    end
+end
+
+function lock(f, l::ReentrantLock; cancel::CancelTokenArg=DEFAULT_CANCEL)
+    lock(l; cancel)
     try
         return f()
     finally
@@ -532,11 +548,15 @@ end
 Wait for one of the `sem_size` permits to be available,
 blocking until one can be acquired.
 """
-function acquire(s::Semaphore)
+function acquire(s::Semaphore; cancel::CancelTokenArg=DEFAULT_CANCEL)
     lock(s.cond_wait)
     try
-        while s.curr_cnt >= s.sem_size
-            wait(s.cond_wait)
+        if s.curr_cnt >= s.sem_size
+            tok = resolve_cancel_token(cancel)
+            while s.curr_cnt >= s.sem_size
+                # a cancelled wait throws before the permit is taken
+                wait(s.cond_wait, tok)
+            end
         end
         s.curr_cnt = s.curr_cnt + 1
     finally
@@ -569,8 +589,8 @@ end
     This method requires at least Julia 1.8.
 
 """
-function acquire(f, s::Semaphore)
-    acquire(s)
+function acquire(f, s::Semaphore; cancel::CancelTokenArg=DEFAULT_CANCEL)
+    acquire(s; cancel)
     try
         return f()
     finally
@@ -654,7 +674,7 @@ mutable struct Event
     Event(autoreset::Bool=false) = new(Threads.Condition(), autoreset, false)
 end
 
-function wait(e::Event)
+function wait(e::Event; cancel::CancelTokenArg=DEFAULT_CANCEL)
     if e.autoreset
         (@atomicswap :acquire_release e.set = false) && return
     else
@@ -667,7 +687,7 @@ function wait(e::Event)
         else
             e.set && return
         end
-        wait(e.notify)
+        wait(e.notify, resolve_cancel_token(cancel))
     finally
         unlock(e.notify) # release barrier
     end

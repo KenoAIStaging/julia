@@ -19,6 +19,12 @@ end
 let lk = ReentrantLock()
     c1 = Event()
     c2 = Event()
+    # whether `t` is parked on `waitee` (its wait registration is enqueued
+    # there; plain condition waits record the waitq list as their identity)
+    parked_on(t::Task, @nospecialize(waitee)) =
+        (w = @atomic :acquire t.waiting_on;
+         w isa Base.WaitEntry &&
+             w.queue === (waitee isa Base.GenericCondition ? waitee.waitq : waitee))
     @test trylock(lk)
     @test trylock(lk)
     t1 = @async (notify(c1); lock(lk); unlock(lk); trylock(lk))

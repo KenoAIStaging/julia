@@ -2519,6 +2519,10 @@ FORCE_INLINE void gc_mark_outrefs(jl_ptls_t ptls, jl_gc_markqueue_t *mq, void *_
                 size_t dtsz = sizeof(jl_cancel_source_t) + np * sizeof(jl_cancel_parent_link_t);
                 if (update_meta)
                     gc_setmark(ptls, o, bits, dtsz);
+                // the waiter-list head/tail are strong (adjacent) slots
+                gc_mark_objarray(ptls, new_obj, &cs->waiters_head,
+                                 &cs->waiters_head + 2, 1,
+                                 (2 << 2) | (bits & GC_OLD));
                 if (np > 0) {
                     jl_value_t **objary_begin = (jl_value_t**)jl_cancel_source_links(cs);
                     // stride over the link entries, visiting only the

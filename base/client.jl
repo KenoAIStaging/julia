@@ -592,7 +592,12 @@ function _start()
     # `--project` has been processed at this point - latch the active project's syntax
     # version and use it for `-L`, `argfile`, etc. If launched, the REPL will re-evaluate
     # at each prompt.
-    @Base.ScopedValues.with MainInclude.main_parser=>parser_for_active_project() try
+    # The whole foreground execution runs as a ^C episode: a SIGINT (with
+    # exit-on-sigint disabled) cancels the episode token's scope. An
+    # interactive session installs its own per-evaluation episodes later
+    # (see REPL.repl_backend_loop), superseding this one.
+    sigint_tok = sigint_new_episode!()
+    @Base.ScopedValues.with MainInclude.main_parser=>parser_for_active_project() CANCEL_TOKEN=>sigint_tok try
         repl_was_requested = exec_options(JLOptions())
         if invokelatest(should_use_main_entrypoint) && !is_interactive
             main = invokelatest(getglobal, Main, :main)
@@ -615,7 +620,16 @@ function _start()
         end
     catch
         ret = Cint(1)
-        invokelatest(display_error, scrub_repl_backtrace(current_exceptions()))
+        # report the error in a fresh ^C epoch (the script's epoch may be
+        # the very cancellation being reported; level-triggered checks in
+        # the printing path would re-throw it mid-report)
+        local errs = scrub_repl_backtrace(current_exceptions())
+        try
+            ScopedValues.@with(CANCEL_TOKEN => sigint_new_episode!(),
+                               invokelatest(display_error, errs))
+        finally
+            sigint_close_episode!()
+        end
     end
     if is_interactive && get(stdout, :color, false)
         print(color_normal)
