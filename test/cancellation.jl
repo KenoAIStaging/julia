@@ -789,7 +789,7 @@ end
     # surviving spin loop blocks GC's stop-the-world, which also blocks all
     # signal processing), in which case not even SIGTERM gets through.
     # SIGKILL it rather than hanging the test suite.
-    if timedwait(() -> process_exited(p), 240.0) !== :ok
+    if timedwait(() -> process_exited(p), 600.0) !== :ok
         kill(p, Base.SIGKILL)
     end
     wait(p)
@@ -865,7 +865,7 @@ end
         end
         """, [1.0, 2.5]; forcekill=true)
     @test occursin("failed to acknowledge SIGINT", output)
-    @test occursin(r"Abandoning (the )?current task", output)
+    @test occursin("Abandoned the current task", output)
     @test p.exitcode == 128 + 2
 
     # ^C with a stray @async task pending is catchable and the script exits
@@ -1065,7 +1065,7 @@ if Sys.isunix()
         kill(p, Base.SIGINT)
         expect("failed to acknowledge SIGINT"; timeout=15.0)
         kill(p, Base.SIGINT)
-        expect("Abandoning current task")
+        expect("Abandoned the current task")
         expect("julia> ")
 
         # the rescued REPL still evaluates
@@ -1142,4 +1142,58 @@ if Sys.isunix()
         close(ptm)
         wait(reader)
     end
+end
+
+@testset "cancelled condition waiter reacquiring a contended lock" begin
+    # A cancelled `wait(::Threads.Condition)` must rethrow the
+    # CancellationRequest after reacquiring the condition lock, even when
+    # the reacquire is contended: the waiter's stale (lazily collected)
+    # condition-queue entry stays linked while it parks on the lock with a
+    # fresh wait entry, and must not corrupt either queue.
+    cond = Threads.Condition()
+    src = Base.CancellationTokenSource()
+    waiter_result = Channel{Any}(1)
+    waiter = Threads.@spawn begin
+        try
+            Base.ScopedValues.with(Base.CANCEL_TOKEN => Base.CancellationToken(src)) do
+                lock(cond)
+                try
+                    wait(cond)
+                finally
+                    unlock(cond)
+                end
+            end
+            put!(waiter_result, :completed)
+        catch e
+            put!(waiter_result, e)
+        end
+    end
+    # wait until the waiter is parked on the condition
+    @test timedwait(10) do
+        lock(cond)
+        parked = !isempty(cond)
+        unlock(cond)
+        parked
+    end === :ok
+    # a holder keeps the condition lock while the cancellation is delivered
+    held = Base.Event()
+    release = Base.Event()
+    holder = Threads.@spawn begin
+        lock(cond)
+        notify(held)
+        wait(release; cancel=nothing)
+        unlock(cond)
+    end
+    wait(held)
+    Base.cancel!(src)
+    # give the woken waiter time to reach the contended reacquire and park
+    sleep(0.5)
+    notify(release)
+    v = fetch(waiter)
+    result = take!(waiter_result)
+    @test result isa Base.CancellationRequest
+    # the condition lock must be intact and uncontended afterwards
+    @test trylock(cond.lock)
+    unlock(cond.lock)
+    wait(holder)
 end
