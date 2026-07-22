@@ -173,8 +173,12 @@ function eval_user_input(errio, @nospecialize(ast), show_value::Bool)
                 # error display (user-extensible show methods) runs in a
                 # fresh ^C epoch: the failed evaluation's cancelled epoch
                 # must not poison it, and a stuck printout is cancellable
-                with_cancel_token(() -> invokelatest(display_error, errio, lasterr),
-                                  sigint_new_episode!())
+                try
+                    with_cancel_token(() -> invokelatest(display_error, errio, lasterr),
+                                      sigint_new_episode!())
+                finally
+                    sigint_close_episode!()
+                end
                 errcount = 0
                 lasterr = nothing
             else
@@ -510,8 +514,12 @@ function run_fallback_repl(interactive::Bool)
                         end
                     end
                     # each interactive input is a fresh ^C epoch
-                    with_cancel_token(() -> eval_user_input(stderr, ex, true),
-                                      sigint_new_episode!())
+                    try
+                        with_cancel_token(() -> eval_user_input(stderr, ex, true),
+                                          sigint_new_episode!())
+                    finally
+                        sigint_close_episode!()
+                    end
                 catch err
                     isa(err, InterruptException) ? print("\n\n") : rethrow()
                 end
