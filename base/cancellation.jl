@@ -553,23 +553,34 @@ function cancel!(src::CancellationTokenSource,
     return true
 end
 
-function _cancel_walk!(src::CancellationTokenSource, sev::UInt8)
+# The first walk of a fresh cancellation deduplicates by state advance
+# (`visited === nothing`); a redelivery walks an already-raised subtree, so
+# it deduplicates by an explicit visited set instead.
+function _cancel_walk!(src::CancellationTokenSource, sev::UInt8,
+                       visited::Union{Nothing, IdSet{CancellationTokenSource}}=nothing)
     # Iterative worklist (no recursion): a deep source chain must not
     # overflow the canceller's stack, and a reconverging ("linked") graph
     # must visit each node once, not once per path.
     pending = CancellationTokenSource[src]
+    visited === nothing || push!(visited, src)
     while !isempty(pending)
-        _cancel_walk_node!(pop!(pending), sev, pending)
+        _cancel_walk_node!(pop!(pending), sev, pending, visited)
     end
     return nothing
 end
 
 function _cancel_walk_node!(node::CancellationTokenSource, sev::UInt8,
-                            pending::Vector{CancellationTokenSource})
-    # Advance at least to the node's current severity: a concurrent higher-
+                            pending::Vector{CancellationTokenSource},
+                            visited::Union{Nothing, IdSet{CancellationTokenSource}})
+    towake = nothing
+    tonotify = nothing
+    _lock_source(node)
+    # Deliver at least the node's current severity: a concurrent higher-
     # severity cancel! may have raised the state after this walk's own
-    # transition; its walk skips children this one already advanced, so this
-    # walk must carry the escalated severity onward.
+    # transition, and its walk can find the waiters already unlinked by
+    # this one - the claim below must then honor the escalated request.
+    # (Read under the node's lock so the claim section below cannot act on
+    # a stale, lower severity.)
     st = @atomic :acquire node.state
     stsev = st & SEVERITY_MASK
     sev < stsev && (sev = stsev)
@@ -578,9 +589,6 @@ function _cancel_walk_node!(node::CancellationTokenSource, sev::UInt8,
     # the lock is released: waking may take other locks (a frozen task's
     # donenotify), and waiters take their waitee's lock *before* this node's
     # lock, so waking under it could deadlock.
-    towake = nothing
-    tonotify = nothing
-    _lock_source(node)
     w = node.waiters_head
     while w isa WaitEntry
         wnext = w.tnext
@@ -642,17 +650,20 @@ function _cancel_walk_node!(node::CancellationTokenSource, sev::UInt8,
     # whose state this walk advanced; a child whose state was already at (or
     # above) this severity has been walked - or is being walked - by whoever
     # advanced it, so revisiting it would make a reconverging graph
-    # exponential. The seq_cst `child_head` read below (paired with the
-    # seq_cst state write that queued `node`) closes the race against a
-    # concurrent attach: a child that this read misses was published after
-    # our state write, so its constructor observes that write and the child
-    # is born at (at least) this severity. Children attached concurrently
-    # *during* the walk are prepended before the list positions already
-    # traversed and are likewise born cancelled.
+    # exponential. A redelivery walk advances no states, so it queues by the
+    # explicit visited set instead. The seq_cst `child_head` read below
+    # (paired with the seq_cst state write that queued `node`) closes the
+    # race against a concurrent attach: a child that this read misses was
+    # published after our state write, so its constructor observes that
+    # write and the child is born at (at least) this severity. Children
+    # attached concurrently *during* the walk are prepended before the list
+    # positions already traversed and are likewise born cancelled.
     c = @atomic node.child_head
     while c !== nothing
         c = c::CancellationTokenSource
-        if _raise_state!(c, sev)
+        advanced = _raise_state!(c, sev)
+        if visited === nothing ? advanced : !(c in visited)
+            visited === nothing || push!(visited, c)
             push!(pending, c)
         end
         c = _cancel_next_child(node, c)
@@ -672,7 +683,7 @@ function redeliver!(src::CancellationTokenSource)
     st == 0x00 && return false
     sev = st & SEVERITY_MASK
     Threads.atomic_fence_heavy()
-    _cancel_walk!(src, sev)
+    _cancel_walk!(src, sev, IdSet{CancellationTokenSource}())
     _cancel_running!(src, sev)
     return true
 end
