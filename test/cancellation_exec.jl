@@ -111,24 +111,86 @@ end
     @test_throws TaskFailedException fetch(watcher)
 end
 
-@testset "ABANDON_ALL freezes a running task" begin
-    started = Base.Event()
-    # The victim has no cancellation points in its loop: only freezing can
-    # stop it promptly. The task-start check published its binding to the
-    # scope's token, which is how the cancellation walk finds it.
-    victim, src = cancellable_spawn() do
-        notify(started)
-        x = Ref(1.0)
-        while x[] > 0
-            x[] = x[] * 1.0000001 + 0.1
+
+@testset "unsafe_abandon! validates at delivery and can refuse" begin
+    # A victim cycling a ReentrantLock (which inhibits finalizers while
+    # held) must never be abandoned mid-hold: the delivery-point validation
+    # refuses instead of corrupting runtime bookkeeping. Abandon spam either
+    # gets a clean refusal or commits during an unlocked window.
+    lk = ReentrantLock()
+    stop = Threads.Atomic{Bool}(false)
+    victim = Threads.@spawn begin
+        while !stop[]
+            lock(lk)
+            try
+                x = 0
+                for i in 1:2000
+                    x += i
+                end
+            finally
+                unlock(lk)
+            end
         end
     end
+    committed = false
+    deadline = time() + 20.0
+    while !committed && time() < deadline
+        istaskdone(victim) && break
+        rescue = Task(() -> (while true; wait(); end))
+        rescue.sticky = false
+        committed = Base.unsafe_abandon!(victim, rescue)
+        if !committed
+            # refusal must leave the victim untouched and running
+            @test !istaskdone(victim)
+        end
+        sleep(0.001)
+    end
+    @test committed
+    if committed
+        @test victim.state === :abandoned
+    else
+        # Don't leave the victim spinning (it would wedge the process): stop
+        # it and surface the failure through the @test above.
+        stop[] = true
+        @test timedwait(() -> istaskdone(victim), 10.0) === :ok
+    end
+    # runtime must be healthy afterwards (finalizers not leaked-inhibited)
+    GC.gc(false)
+end
+
+# Linux-only: blocks the abandon signal by number (SIGUSR2 == 12) and uses
+# Linux's SIG_BLOCK/SIG_UNBLOCK values.
+Sys.islinux() && @testset "unsafe_abandon! withdraws cleanly on delivery timeout" begin
+    # Block the abandon signal in the victim so delivery cannot happen: the
+    # requester must time out, withdraw every published effect, and return
+    # false with the victim still running and not marked done.
+    started = Base.Event()
+    release = Threads.Atomic{Bool}(false)
+    victim = Threads.@spawn begin
+        # block SIGUSR2 on this thread
+        sset = zeros(UInt8, 128)
+        ccall(:sigemptyset, Cint, (Ptr{UInt8},), sset)
+        ccall(:sigaddset, Cint, (Ptr{UInt8}, Cint), sset, 12) # SIGUSR2
+        ccall(:pthread_sigmask, Cint, (Cint, Ptr{UInt8}, Ptr{Cvoid}), 0 #= SIG_BLOCK =#, sset, C_NULL)
+        notify(started)
+        # spin in compute so the task stays current on its thread
+        while !release[]
+            ccall(:jl_cpu_pause, Cvoid, ())
+        end
+        ccall(:pthread_sigmask, Cint, (Cint, Ptr{UInt8}, Ptr{Cvoid}), 1 #= SIG_UNBLOCK =#, sset, C_NULL)
+        :survived
+    end
     wait(started)
-    sleep(0.5) # make sure it is spinning on its thread
-    @test cancel!(src, Base.CANCEL_REQUEST_ABANDON_ALL)
-    @test timedwait(() -> istaskdone(victim), 10.0) == :ok
-    @test victim.state === :abandoned
-    @test istaskfailed(victim)
+    rescue = Task(() -> (while true; wait(); end))
+    rescue.sticky = false
+    t0 = time()
+    ok = Base.unsafe_abandon!(victim, rescue)
+    dt = time() - t0
+    @test !ok
+    @test !istaskdone(victim)         # not falsely marked :abandoned
+    @test dt < 10.0                   # bounded timeout, no hang
+    release[] = true                  # victim completes normally afterwards
+    @test fetch(victim) === :survived
 end
 
 @testset "foreign-call cancellation handlers" begin
@@ -441,4 +503,29 @@ end
     unlock(held)
     @test failures == 0
     @test rounds > 0
+end
+
+# NOTE (port): the ABANDON_ALL freeze testset runs LAST: a freeze is a
+# hail-mary that may leave the process inconsistent by design (e.g. the
+# victim frozen inside an allocator or JIT-internal lock that the abandon
+# refusal checks cannot see), so no later testset may depend on
+# post-freeze process health.
+@testset "ABANDON_ALL freezes a running task" begin
+    started = Base.Event()
+    # The victim has no cancellation points in its loop: only freezing can
+    # stop it promptly. The task-start check published its binding to the
+    # scope's token, which is how the cancellation walk finds it.
+    victim, src = cancellable_spawn() do
+        notify(started)
+        x = Ref(1.0)
+        while x[] > 0
+            x[] = x[] * 1.0000001 + 0.1
+        end
+    end
+    wait(started)
+    sleep(0.5) # make sure it is spinning on its thread
+    @test cancel!(src, Base.CANCEL_REQUEST_ABANDON_ALL)
+    @test timedwait(() -> istaskdone(victim), 10.0) == :ok
+    @test victim.state === :abandoned
+    @test istaskfailed(victim)
 end
