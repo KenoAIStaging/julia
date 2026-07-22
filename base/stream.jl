@@ -441,12 +441,11 @@ function closewrite(s::LibuvStream; cancel::CancelTokenArg=DEFAULT_CANCEL)
     ct = current_task()
     tok = cancel === DEFAULT_CANCEL ? resolve_cancel_token(cancel) : check_cancel_arg(cancel)
     src = tok === nothing ? nothing : tok.source
-    if cancel_pending(src, ct)
+    if src !== nothing && iscancelled(src)
         # The governing token is already cancelled: throw before issuing the
         # shutdown request.
         iolock_end()
         checkcancel(src)
-        iolock_begin() # the pending cancellation was covered concurrently
     end
     req = Libc.malloc(_sizeof_uv_shutdown)
     uv_req_set_data(req, C_NULL) # in case we get interrupted before arriving at the wait call
@@ -1143,12 +1142,11 @@ function uv_write_noncancel(s::LibuvStream, p::Ptr{UInt8}, n::UInt,
                             tok::MaybeToken=default_cancel_token())
     ct = current_task()
     src = tok === nothing ? nothing : tok.source
-    if cancel_pending(src, ct)
+    if src !== nothing && iscancelled(src)
         # The governing token is already cancelled: throw before handing
         # anything to libuv.
         iolock_end()
         checkcancel(src)
-        iolock_begin() # the pending cancellation was covered concurrently
     end
     if abandoning_external_waits(ct)
         # Unwinding from an ABANDON_EXTERNAL (or stronger) cancellation:
