@@ -1126,8 +1126,8 @@ JL_DLLEXPORT jl_task_t *jl_new_task(jl_value_t *start, jl_value_t *completion_fu
     jl_timing_task_init(t);
     jl_atomic_store_relaxed(&t->bound_cancel_token, jl_nothing);
     jl_atomic_store_relaxed(&t->preempt_request, 0);
-    t->reset_ctx = NULL;
-    t->cancel_handler_ctx = NULL;
+    jl_atomic_store_relaxed(&t->reset_ctx, NULL);
+    jl_atomic_store_relaxed(&t->cancel_handler_ctx, NULL);
 
     if (t->ctx.copy_stack)
         t->ctx.copy_ctx = NULL;
@@ -1602,8 +1602,8 @@ jl_task_t *jl_init_root_task(jl_ptls_t ptls, void *stack_lo, void *stack_hi)
     }
     jl_atomic_store_relaxed(&ct->bound_cancel_token, jl_nothing);
     jl_atomic_store_relaxed(&ct->preempt_request, 0);
-    ct->reset_ctx = NULL;
-    ct->cancel_handler_ctx = NULL;
+    jl_atomic_store_relaxed(&ct->reset_ctx, NULL);
+    jl_atomic_store_relaxed(&ct->cancel_handler_ctx, NULL);
     ptls->abandon_to = NULL;
     ptls->root_task = ct;
     jl_atomic_store_relaxed(&ptls->current_task, ct);
@@ -1672,7 +1672,7 @@ JL_DLLEXPORT int8_t jl_get_task_threadpoolid(jl_task_t *t)
 // interruption signal whose delivery re-checks the task's own bound source,
 // so over-approximating is harmless, while a miss would strand a running
 // computation whose code has no later cancellation point.
-static int cancel_source_subtree_member(jl_value_t *node, jl_value_t *src) JL_NOTSAFEPOINT
+int jl_cancel_source_subtree_member(jl_value_t *node, jl_value_t *src) JL_NOTSAFEPOINT
 {
     jl_value_t *stack[32];
     size_t top = 0;
@@ -1723,7 +1723,7 @@ JL_DLLEXPORT jl_value_t *jl_cancel_collect_bound(jl_value_t *src)
             continue;
         jl_value_t *bound = jl_atomic_load_acquire(&t->bound_cancel_token);
         if (bound != NULL && bound != jl_nothing &&
-            cancel_source_subtree_member(bound, src)) {
+            jl_cancel_source_subtree_member(bound, src)) {
             jl_array_ptr_1d_push(out, (jl_value_t*)t);
         }
     }
