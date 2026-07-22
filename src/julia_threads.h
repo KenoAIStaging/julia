@@ -291,6 +291,15 @@ struct _jl_cancel_source_t {
     // GC's special-cased marking traces them), guarded by `_lock`.
     jl_value_t *waiters_head;   // Union{Nothing, Base.WaitEntry}
     jl_value_t *waiters_tail;
+    // Parked watcher entries awaiting cancellation of *this* source as an
+    // event (`wait(::CancellationToken)`): `nothing`, or the head of a
+    // singly-linked list of `Base.WaitEntry` registrations through their
+    // `next` fields (each entry's `queue` points back here as the membership
+    // witness), guarded by `_lock`. Distinct from `waiters_head`: the
+    // cancellation walk *completes* these waits, delivering the request as a
+    // value rather than as an exception. Strong references (marked with the
+    // waiter slots).
+    jl_value_t *watchers;    // Union{Nothing, Base.WaitEntry}
     // 0x00 = uncancelled; otherwise the (nonzero) severity at which the
     // source is cancelled (0x1 SAFE, 0x3 ABANDON_EXTERNAL, 0x4 ABANDON_ALL).
     // Monotonic (CAS-max).
