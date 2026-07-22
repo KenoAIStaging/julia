@@ -536,7 +536,13 @@ function _atexit(exitcode::Cint)
             end
         end
     end
+    # We are exiting: any pending cancellation of this task's scope is moot
+    # and would only disrupt the atexit hooks - run them in a shielded scope.
     ccall(:jl_disarm_sigint_rescue_timer, Cvoid, ())
+    return with_cancel_token(() -> _run_atexit_hooks(exitcode), nothing)
+end
+
+function _run_atexit_hooks(exitcode::Cint)
     # Don't hold the lock around the iteration, just in case any other thread executing in
     # parallel tries to register a new atexit hook while this is running. We don't want to
     # block that thread from proceeding, and we can allow it to register its hook which we

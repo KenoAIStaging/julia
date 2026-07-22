@@ -306,6 +306,28 @@ function _cached_wait_entry(waiter::Task)
     return w
 end
 
+## Delivery semantics
+#
+# Cancellation is uniformly level-triggered: while the governing token is
+# cancelled, every cancellation point and every blocking-operation entry
+# check throws the `CancellationRequest`. There is no per-task
+# acknowledgement state; cleanup code that must block under a cancelled
+# scope explicitly shields itself (`cancel = nothing`, or
+# `with_cancel_token(f, nothing)`), and the interactive machinery re-arms
+# with a *fresh* episode source between epochs (see `sigint_new_episode!`),
+# detaching any still-unwinding work from the ^C target.
+
+# Record that a cancellation of `src` at severity `sev` was delivered to
+# (observed by) some task: either thrown at one of its cancellation points,
+# or handed to it by the cancellation walk waking its parked wait. Feeds the
+# ^C episode state machine ("was the request ever seen?").
+# TODO: propagate the delivered bits up the parent chain, so that a delivery
+# against a nested scope's source is visible on the episode source too.
+function _mark_delivered!(src::CancellationTokenSource, sev::UInt8)
+    @atomic :monotonic src.delivered |= (0x01 << sev)
+    return nothing
+end
+
 @noinline function _wait_registration_error()
     throw(ConcurrencyViolationError("Task is already registered on a wait queue"))
 end
@@ -494,6 +516,7 @@ function _cancel_walk_node!(node::CancellationTokenSource, sev::UInt8,
         else
             # The claimed wait-queue entry stays linked; the waiter's own
             # cleanup (or a later notify) lazily unlinks it.
+            _mark_delivered!(node, sev)
             schedule(t, creq, error=true)
         end
     end
@@ -547,6 +570,7 @@ function _cancel_running!(src::CancellationTokenSource, sev::UInt8)
     for t in tasks
         t = t::Task
         istaskdone(t) && continue
+
         if t === ct
             # The canceller itself is governed by the cancelled subtree;
             # deliver to ourselves last (below), so that the remaining tasks
@@ -566,6 +590,7 @@ function _cancel_running!(src::CancellationTokenSource, sev::UInt8)
     end
     if self_bound && sev >= CANCEL_REQUEST_ABANDON_ALL.request
         # Self-cancellation with ABANDON_ALL: unwind with the request.
+        _mark_delivered!(src, sev)
         throw(creq)
     end
     # A SAFE/ABANDON_EXTERNAL self-cancellation is observed at the caller's
@@ -612,6 +637,7 @@ end
     # re-read: deliver the severity current at throw time, not the one the
     # fast path happened to observe
     st = @atomic :acquire src.state
+    _mark_delivered!(src, st)
     throw(CancellationRequest(st))
 end
 
@@ -648,7 +674,10 @@ macro cancel_check(tok)
 end
 
 # Throw the `CancellationRequest` if `src` is cancelled (level-triggered:
-# no per-task state is consulted).
+# no per-task state is consulted). This is the entry check of every blocking
+# API taking a `cancel` keyword argument: it must run *before* the operation
+# has any side effects. Unlike `@cancel_check` this is not a compiled
+# cancellation point (it opens no async-interruptible region).
 @inline function checkcancel(src::CancellationTokenSource)
     st = @atomic :monotonic src.state
     st == 0x00 && return nothing
@@ -658,7 +687,12 @@ end
 checkcancel(::Nothing) = nothing
 checkcancel(tok::CancellationToken) = checkcancel(tok.source)
 
-## CANCEL_TOKEN
+## The scoped default token
+
+# The scoped-value key under which the governing cancellation token is
+# carried. `AbstractScopedValue` so the ScopedValues API (`@with
+# Base.CANCEL_TOKEN => tok ...`) works on it; the accessors below avoid the
+# ScopedValues module so they are usable during early bootstrap.
 struct CancelTokenKey <: AbstractScopedValue{Union{Nothing, CancellationToken}} end
 
 """
@@ -748,25 +782,12 @@ const MaybeToken = Union{Nothing, CancellationToken}
 @inline resolve_cancel_token(::UseDefaultToken) = default_cancel_token()
 @inline resolve_cancel_token(tok::Union{CancellationToken, Nothing}) = tok
 
-# The entry check of a public API taking a `cancel` keyword argument,
-# returning the resolved token. The two forms differ deliberately:
-#  - the scoped default is acknowledgement-gated (`checkcancel`): a task
-#    already handling the cancellation of its scope may still perform
-#    blocking cleanup work under it;
-#  - an *explicitly* passed token that is already cancelled always throws:
-#    passing `cancel = tok` states that this operation must not run once
-#    `tok` fired, no matter who asks.
+# The entry check of a public API taking a `cancel` keyword argument:
+# resolve the token and throw if it is already cancelled (uniformly
+# level-triggered for the scoped default and explicit tokens alike).
 @inline function check_cancel_arg(cancel::CancelTokenArg)
-    if cancel === DEFAULT_CANCEL
-        tok = default_cancel_token()
-        tok === nothing || checkcancel(tok.source)
-        return tok
-    end
     tok = resolve_cancel_token(cancel)
-    if tok !== nothing
-        st = @atomic :acquire tok.source.state
-        st == 0x00 || throw(CancellationRequest(st & SEVERITY_MASK))
-    end
+    tok === nothing || checkcancel(tok.source)
     return tok
 end
 

@@ -496,13 +496,13 @@ end
     @test_throws TaskFailedException wait(t)
     @test t.result isa CancellationRequest
 
-    # After catching (acknowledging) the request, cleanup code may still park
+    # After catching the request, cleanup that must block shields itself
     t2, src2 = cancellable() do
         try
             sleep(1000)
         catch e
             e isa CancellationRequest || rethrow()
-            sleep(0.01; cancel=nothing) # shielded: parking for cleanup is permitted
+            sleep(0.01; cancel=nothing) # shielded: parking for cleanup
             return :cleanup_ok
         end
     end
@@ -1002,6 +1002,30 @@ end
     # cancellation propagated to the children
     @test timedwait(() -> istaskdone(t1[]) && istaskdone(t2[]), 10.0) == :ok
     @test istaskfailed(t1[]) && istaskfailed(t2[])
+end
+
+@testset "cancelled scopes are level-triggered" begin
+    t, src = cancellable() do
+        try
+            sleep(1000)
+        catch e
+            e isa CancellationRequest || rethrow()
+        end
+        # The scope stays cancelled: unshielded blocking operations keep
+        # throwing until the task leaves the scope or shields.
+        rethrew = try
+            sleep(0.01)
+            false
+        catch e
+            e isa CancellationRequest
+        end
+        # Shielded IO still works, and the severity remains observable.
+        sleep(0.01; cancel=nothing)
+        rethrew && Base.ambient_cancel_severity() === CANCEL_REQUEST_SAFE
+    end
+    spin()
+    cancel!(src)
+    @test fetch(t)
 end
 
 @testset "threaded cancellation (subprocess with -t2)" begin
