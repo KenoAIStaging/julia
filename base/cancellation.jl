@@ -518,6 +518,11 @@ function cancel!(src::CancellationTokenSource,
 end
 
 function _cancel_walk!(src::CancellationTokenSource, sev::UInt8)
+    # Iterative worklist (no recursion): a deep source chain must not
+    # overflow the canceller's stack, and a reconverging ("linked") graph
+    # must deliver at each node once, not once per path (deduplicated by the
+    # visited set - both for fresh cancellations and for redeliveries, whose
+    # walks advance no states).
     visited = IdSet{CancellationTokenSource}()
     push!(visited, src)
     pending = CancellationTokenSource[src]
@@ -530,13 +535,18 @@ end
 function _cancel_walk_node!(node::CancellationTokenSource, sev::UInt8,
                             pending::Vector{CancellationTokenSource},
                             visited::IdSet{CancellationTokenSource})
+    towake = nothing
+    tonotify = nothing
+    _lock_source(node)
     # Deliver at least the node's current severity: a concurrent higher-
     # severity cancel! may have raised the state after this walk's own
     # transition, and its walk can find the waiters already unlinked by
     # this one - the claim below must then honor the escalated request.
-    # seq_cst (matching the C-side propagate): when this walk's own raise of
-    # the node was lost, this load is the walk's sole operation on the state
-    # that can order the winner's write before the child_head read below.
+    # (Read under the node's lock so the claim section below cannot act on
+    # a stale, lower severity.) seq_cst, matching the C-side propagate: when
+    # this walk's own raise of the node was lost, this load is the walk's
+    # sole operation on the state that can order the winner's write before
+    # the child_head read below.
     st = @atomic :sequentially_consistent node.state
     sev < st && (sev = st)
     creq = CancellationRequest(sev)
@@ -544,9 +554,6 @@ function _cancel_walk_node!(node::CancellationTokenSource, sev::UInt8,
     # the lock is released: waking may take other locks (a frozen task's
     # donenotify), and waiters take their waitee's lock *before* this node's
     # lock, so waking under it could deadlock.
-    towake = nothing
-    tonotify = nothing
-    _lock_source(node)
     w = node.waiters_head
     while w isa WaitEntry
         wnext = w.tnext
