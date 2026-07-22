@@ -1,18 +1,29 @@
 # This file is a part of Julia. License is MIT: https://julialang.org/license
 
 using Base: cancel!, CancellationRequest, CancellationToken, CancellationTokenSource,
-    CANCEL_REQUEST_SAFE, CANCEL_REQUEST_ACK, CANCEL_REQUEST_ABANDON_EXTERNAL,
-    CANCEL_REQUEST_ABANDON_ALL, CANCEL_TOKEN
+    CANCEL_REQUEST_SAFE, CANCEL_REQUEST_ABANDON_EXTERNAL, CANCEL_REQUEST_ABANDON_ALL,
+    CANCEL_TOKEN
 using Base.ScopedValues: with, ScopedValue
 
-# Threads.@spawn-style cancellable task (non-sticky, explicitly on the
-# default pool - a compute-bound victim must not land on the interactive/io
-# thread); returns (task, source).
-function cancellable_spawn(f)
+# Start `f` as an @async-style (sticky, co-scheduled) task governed by a
+# fresh cancellation source; returns (task, source).
+function cancellable(f)
     src = CancellationTokenSource()
-    t = with(() -> Threads.@spawn(f()), CANCEL_TOKEN => CancellationToken(src))
+    t = Base.with_cancel_token(() -> @async(f()), CancellationToken(src))
     return t, src
 end
+
+# Threads.@spawn-style variant (non-sticky, explicitly on the default pool -
+# a compute-bound victim must not land on the interactive/io thread).
+function cancellable_spawn(f)
+    src = CancellationTokenSource()
+    t = Base.with_cancel_token(() -> Threads.@spawn(f()), CancellationToken(src))
+    return t, src
+end
+
+# whether `t` is parked (its wait registration is enqueued on some waitee)
+is_parked(t::Task) = (w = @atomic :acquire t.waiting_on; w isa Base.WaitEntry && w.queue !== nothing)
+parked_on(t::Task, @nospecialize(x)) = (w = @atomic :acquire t.waiting_on; w isa Base.WaitEntry && w.queue === x)
 
 @testset "cancellation token graph semantics" begin
     # cancel! marks all descendants, level-triggered
@@ -331,10 +342,11 @@ end
                 yield()
             end
         end
-        try
-            wait(inner)
-        catch
-        end
+        # A cancellable wait would be interrupted by the delivery before
+        # `inner` observes the cancellation at its own cancellation point;
+        # the assertion is about `inner`'s own observation, so wait for its
+        # completion shielded.
+        Base._wait(inner, nothing)
         inner_result[] = inner.result
     end
     spin_started = timedwait(() -> istaskstarted(t2), 30.0)
@@ -400,30 +412,109 @@ eval(collatz_code)
 # wait a little, so cancellation targets are (most likely) started and parked
 spin(n=4) = for _ in 1:n; yield(); end
 
+@testset "cancellation token tree semantics" begin
+    # cancel! marks the whole subtree, level-triggered
+    root = CancellationTokenSource()
+    child = CancellationTokenSource(CancellationToken(root))
+    grandchild = CancellationTokenSource(CancellationToken(child))
+    @test !Base.iscancelled(grandchild)
+    @test cancel!(root)
+    @test Base.iscancelled(root) && Base.iscancelled(child) && Base.iscancelled(grandchild)
+    @test !cancel!(root) # idempotent at the same severity
+
+    # a source attached under an already-cancelled parent is born cancelled
+    late = CancellationTokenSource(CancellationToken(child))
+    @test Base.iscancelled(late)
+    @test Base.cancel_severity(late) === CANCEL_REQUEST_SAFE
+
+    # escalation is monotonic and propagates down
+    @test cancel!(root, CANCEL_REQUEST_ABANDON_EXTERNAL)
+    @test Base.cancel_severity(grandchild) === CANCEL_REQUEST_ABANDON_EXTERNAL
+    @test !cancel!(grandchild, CANCEL_REQUEST_SAFE) # never de-escalates
+
+    # cancellation is uniformly level-triggered: after catching the request,
+    # unshielded waits under the cancelled scope keep throwing; shielded
+    # cleanup proceeds
+    src = CancellationTokenSource()
+    phase = Ref{Any}(:init)
+    t = Base.with_cancel_token(CancellationToken(src)) do
+        @async try
+            sleep(1000)
+        catch e
+            e isa CancellationRequest || rethrow()
+            phase[] = :caught
+            rethrew = try
+                sleep(1000)
+                false
+            catch e2
+                e2 isa CancellationRequest
+            end
+            sleep(0.01; cancel=nothing) # shielded cleanup is permitted
+            phase[] = rethrew ? :done : :no_retrigger
+        end
+    end
+    spin()
+    cancel!(src)
+    @test timedwait(() -> istaskdone(t), 10.0) == :ok
+    @test phase[] === :done
+
+    # an internal teardown re-park (min_severity) is woken only by escalation
+    srcm = CancellationTokenSource()
+    cancel!(srcm)
+    inner = @async sleep(5)
+    tm = @async Base._wait(inner, CancellationToken(srcm); min_severity=0x01)
+    spin()
+    cancel!(srcm, CANCEL_REQUEST_ABANDON_EXTERNAL)
+    @test_throws TaskFailedException wait(tm)
+    @test tm.result isa CancellationRequest
+
+    # the current scoped token is discoverable
+    tok = CancellationToken(CancellationTokenSource())
+    @test Base.with_cancel_token(Base.cancellation_token, tok) === tok
+end
+
 @testset "cancellation of waiting tasks" begin
-    # Cancellation of a task that was never started
-    t = @task nothing
-    @test cancel!(t)
-    @test t.state === :cancelled
-    @test istaskfailed(t)
-    @test_throws TaskFailedException wait(t)
-    @test t.result isa CancellationRequest
-    # Scheduling a cancelled task transitions it to failed, without running it
+    # A task spawned under an already-cancelled scope starts but observes the
+    # cancellation before running any user code
+    src = CancellationTokenSource()
+    body_ran = Ref(false)
+    t = Base.with_cancel_token(CancellationToken(src)) do
+        @task (body_ran[] = true)
+    end
+    @test cancel!(src)
     schedule(t)
-    @test t.state === :failed
+    @test timedwait(() -> istaskdone(t), 10.0) == :ok
+    @test istaskfailed(t)
+    @test t.result isa CancellationRequest
+    @test !body_ran[]
+    @test_throws TaskFailedException wait(t)
 
     # Cancellation of `sleep`
-    t = @async sleep(1000)
+    t, src = cancellable(() -> sleep(1000))
     spin()
-    cancel!(t)
+    cancel!(src)
     @test_throws TaskFailedException wait(t)
     @test t.result isa CancellationRequest
+
+    # After catching (acknowledging) the request, cleanup code may still park
+    t2, src2 = cancellable() do
+        try
+            sleep(1000)
+        catch e
+            e isa CancellationRequest || rethrow()
+            sleep(0.01; cancel=nothing) # shielded: parking for cleanup is permitted
+            return :cleanup_ok
+        end
+    end
+    spin()
+    cancel!(src2)
+    @test fetch(t2) === :cleanup_ok
 
     # Cancellation of a task blocked on a Channel
     c = Channel{Int}(0)
-    t = @async take!(c)
+    t, src = cancellable(() -> take!(c))
     spin()
-    cancel!(t)
+    cancel!(src)
     @test_throws TaskFailedException wait(t)
     @test t.result isa CancellationRequest
     # The channel remains usable
@@ -431,24 +522,40 @@ spin(n=4) = for _ in 1:n; yield(); end
     put!(c, 7)
     @test fetch(t2) == 7
 
-    # Cancellation of a task waiting on another task propagates
-    t_in = @async sleep(1000)
-    t = @async wait(t_in)
+    # Cancelling a scope reaches a task waiting on another task; the waited-on
+    # task (in the same scope) is cancelled through the same tree
+    local t_in
+    t, src = cancellable() do
+        t_in = @async sleep(1000)
+        wait(t_in)
+    end
     spin()
-    cancel!(t)
+    cancel!(src)
     @test_throws TaskFailedException wait(t)
-    @test istaskdone(t_in) && istaskfailed(t_in)
+    @test timedwait(() -> istaskdone(t_in), 10.0) == :ok
+    @test istaskfailed(t_in)
+
+    # ... but a task waited on from a *different* scope is unaffected by the
+    # waiter's cancellation
+    t_out = @async sleep(5)
+    t, src = cancellable(() -> wait(t_out))
+    spin()
+    cancel!(src)
+    @test_throws TaskFailedException wait(t)
+    @test !istaskdone(t_out)
+    wait(t_out)
+    @test istaskdone(t_out) && !istaskfailed(t_out)
 end
 
 @testset "cancellation of lock and condition waits" begin
     # Task blocked in lock(::ReentrantLock)
     lk = ReentrantLock()
     lock(lk)
-    t = @async lock(lk)
+    t, src = cancellable(() -> lock(lk))
     spin()
     # let it spin through the fast path and park
-    @test timedwait(() -> t.queue !== nothing, 5.0) == :ok
-    cancel!(t)
+    @test timedwait(() -> is_parked(t), 5.0) == :ok
+    cancel!(src)
     @test_throws TaskFailedException wait(t)
     @test t.result isa CancellationRequest
     # the lock remains functional
@@ -461,9 +568,9 @@ end
     # Task blocked in put! on a full channel
     c = Channel{Int}(1)
     put!(c, 1)
-    t = @async put!(c, 2)
+    t, src = cancellable(() -> put!(c, 2))
     spin()
-    cancel!(t)
+    cancel!(src)
     @test_throws TaskFailedException wait(t)
     @test t.result isa CancellationRequest
     @test take!(c) == 1
@@ -472,33 +579,35 @@ end
 
     # Task blocked in wait(::Threads.Condition)
     cond = Threads.Condition()
-    t = @async @lock cond wait(cond)
+    t, src = cancellable(() -> @lock cond wait(cond))
     spin()
-    cancel!(t)
+    cancel!(src)
     @test_throws TaskFailedException wait(t)
     @test t.result isa CancellationRequest
     @lock cond notify(cond) # still functional (no waiters)
 
     # Task blocked in wait(::Base.Process); the process itself keeps running
     p = run(`sleep 1000`; wait=false)
-    t = @async wait(p)
+    t, src = cancellable(() -> wait(p))
     spin()
-    cancel!(t)
+    cancel!(src)
     @test_throws TaskFailedException wait(t)
     @test t.result isa CancellationRequest
     @test process_running(p)
     kill(p); wait(p)
 
-    # Task blocked in waitany
-    t1 = @async sleep(1000)
-    t2 = @async sleep(1000)
-    t = @async waitany([t1, t2])
+    # Task blocked in waitany; the awaited tasks live in different scopes and
+    # remain unaffected by the waiter's cancellation
+    t1, src1 = cancellable(() -> sleep(1000))
+    t2, src2 = cancellable(() -> sleep(1000))
+    t, src = cancellable(() -> waitany([t1, t2]))
     spin()
-    cancel!(t)
+    cancel!(src)
     @test_throws TaskFailedException wait(t)
     @test t.result isa CancellationRequest
-    # the awaited tasks remain unaffected and cancellable
-    cancel!(t1); cancel!(t2)
+    @test !istaskdone(t1) && !istaskdone(t2)
+    # their own scopes' cancellation reaches them
+    cancel!(src1); cancel!(src2)
     @test_throws TaskFailedException wait(t1)
     @test_throws TaskFailedException wait(t2)
 end
@@ -507,9 +616,9 @@ end
     # Base.Semaphore: a cancelled acquire does not leak a permit
     sem = Base.Semaphore(1)
     Base.acquire(sem)
-    t = @async Base.acquire(sem)
+    t, src = cancellable(() -> Base.acquire(sem))
     spin()
-    cancel!(t)
+    cancel!(src)
     @test_throws TaskFailedException wait(t)
     @test t.result isa CancellationRequest
     Base.release(sem)
@@ -519,9 +628,9 @@ end
     # Sockets.accept
     Sockets = Base.require(Base.PkgId(Base.UUID("6462fe0b-24de-5631-8697-dd941f90decc"), "Sockets"))
     port, server = Sockets.listenany(Sockets.localhost, 0)
-    t = @async Sockets.accept(server)
+    t, src = cancellable(() -> Sockets.accept(server))
     spin()
-    cancel!(t)
+    cancel!(src)
     @test_throws TaskFailedException wait(t)
     @test t.result isa CancellationRequest
     # the server keeps accepting afterwards
@@ -535,18 +644,18 @@ end
     p = Pipe()
     Base.link_pipe!(p, reader_supports_async=true, writer_supports_async=true)
     fd = Base._fd(p.out)
-    t = @async FileWatching.wait(fd; readable=true) # nothing is ever written
+    t, src = cancellable(() -> FileWatching.wait(fd; readable=true)) # nothing is ever written
     spin()
-    cancel!(t)
+    cancel!(src)
     @test_throws TaskFailedException wait(t)
     @test t.result isa CancellationRequest
     close(p)
 
     path = tempname()
     touch(path)
-    t = @async FileWatching.watch_file(path, 100.0) # the file never changes
+    t, src = cancellable(() -> FileWatching.watch_file(path, 100.0)) # the file never changes
     spin()
-    cancel!(t)
+    cancel!(src)
     @test_throws TaskFailedException wait(t)
     @test t.result isa CancellationRequest
     rm(path)
@@ -555,9 +664,9 @@ end
     # through the same channel-based wait path on the caller side
     Distributed = Base.require(Base.PkgId(Base.UUID("8ba89e20-285c-5b6f-9357-94700520ee1b"), "Distributed"))
     fut = Distributed.Future()
-    t = @async fetch(fut)
+    t, src = cancellable(() -> fetch(fut))
     spin()
-    cancel!(t)
+    cancel!(src)
     @test_throws TaskFailedException wait(t)
     @test t.result isa CancellationRequest
     put!(fut, 1) # the future remains usable
@@ -565,29 +674,29 @@ end
 end
 
 @testset "cancellation of computing tasks" begin
-    # The polling victim never yields, so a second thread must run the
-    # canceller. (Signal-side delivery that also covers -t1 arrives with the
-    # ^C machinery later in this series; the checkless reset_ctx variant runs
+    # The victims never yield, so a second thread must run the canceller.
+    # (Signal-side delivery that also covers -t1 arrives with the ^C
+    # machinery later in this series; the checkless reset_ctx variant runs
     # in the -t2 exec subprocess.)
     if Threads.nthreads() > 1
         # Polling cancellation via @cancel_check
-        t = Threads.@spawn find_collatz_counterexample()
+        t, src = cancellable_spawn(find_collatz_counterexample)
         sleep(0.2)
-        cancel!(t)
+        cancel!(src)
         @test_throws TaskFailedException wait(t)
         @test t.result isa CancellationRequest
     end
 end
 
 @testset "structured cancellation of @sync" begin
-    t = @async begin
+    t, src = cancellable() do
         @sync begin
             @async sleep(1000)
             @async sleep(1000)
         end
     end
     spin()
-    cancel!(t)
+    cancel!(src)
     @test_throws TaskFailedException wait(t)
     @test t.result isa CompositeException
     @test length(t.result.exceptions) == 2
@@ -595,14 +704,14 @@ end
 
 @testset "structured cancellation of Experimental.@sync" begin
     t1 = Ref{Task}(); t2 = Ref{Task}()
-    t = @async begin
+    t, src = cancellable() do
         Base.Experimental.@sync begin
             t1[] = @async sleep(1000)
             t2[] = @async sleep(1000)
         end
     end
     spin()
-    cancel!(t)
+    cancel!(src)
     @test_throws TaskFailedException wait(t)
     @test t.result isa CancellationRequest
     # cancellation propagated to the children
@@ -616,10 +725,10 @@ end
     try
         # A write far exceeding the OS pipe buffer blocks until cancelled
         big = zeros(UInt8, 200_000_000)
-        t = @async write(p, big)
+        t, src = cancellable(() -> write(p, big))
         sleep(0.5)
-        @test t.queue === p.in
-        cancel!(t)
+        @test parked_on(t, p.in)
+        cancel!(src)
         @test_throws TaskFailedException wait(t)
         @test t.result isa CancellationRequest
     finally
@@ -634,15 +743,15 @@ end
         # A blocked write keeps the shutdown request (which queues behind it)
         # from completing; the closewrite wait must still be interruptible.
         big = zeros(UInt8, 200_000_000)
-        tw = @async write(p, big)
+        tw, srcw = cancellable(() -> write(p, big))
         sleep(0.5)
-        @test tw.queue === p.in
-        ts = @async closewrite(p.in)
-        @test timedwait(() -> ts.queue === p.in, 5.0) == :ok
-        cancel!(ts)
+        @test parked_on(tw, p.in)
+        ts, srcs = cancellable(() -> closewrite(p.in))
+        @test timedwait(() -> parked_on(ts, p.in), 5.0) == :ok
+        cancel!(srcs)
         @test_throws TaskFailedException wait(ts)
         @test ts.result isa CancellationRequest
-        cancel!(tw)
+        cancel!(srcw)
         @test_throws TaskFailedException wait(tw)
     finally
         close(p)
@@ -652,14 +761,16 @@ end
 @testset "unfriendly cancellation modes" begin
     # Acknowledgment preserves the request's severity.
     seen = Ref{Any}(nothing)
-    t = @async try
-        sleep(1000)
-    catch e
-        seen[] = (e, Base.acknowledged_cancellation_severity(), Base.abandoning_external_waits())
-        rethrow()
+    t, src = cancellable() do
+        try
+            sleep(1000)
+        catch e
+            seen[] = (e, Base.ambient_cancel_severity(), Base.abandoning_external_waits())
+            rethrow()
+        end
     end
     spin()
-    cancel!(t, CANCEL_REQUEST_ABANDON_EXTERNAL)
+    cancel!(src, CANCEL_REQUEST_ABANDON_EXTERNAL)
     @test timedwait(() -> istaskdone(t), 10.0) == :ok
     e, sev, abandoning = seen[]
     @test e === CANCEL_REQUEST_ABANDON_EXTERNAL
@@ -668,36 +779,44 @@ end
 
     # SAFE acknowledgments report SAFE severity and permit external waits.
     seen2 = Ref{Any}(nothing)
-    t2 = @async try
-        sleep(1000)
-    catch
-        seen2[] = (Base.acknowledged_cancellation_severity(), Base.abandoning_external_waits())
-        rethrow()
+    t2, src2 = cancellable() do
+        try
+            sleep(1000)
+        catch
+            seen2[] = (Base.ambient_cancel_severity(), Base.abandoning_external_waits())
+            rethrow()
+        end
     end
     spin()
-    cancel!(t2)
+    cancel!(src2)
     @test timedwait(() -> istaskdone(t2), 10.0) == :ok
     @test seen2[] === (CANCEL_REQUEST_SAFE, false)
 
     # ABANDON_ALL freezes a parked task immediately: no unwind, no cleanup.
     cleanup_ran = Ref(false)
-    t3 = @async try
-        sleep(1000)
-    finally
-        cleanup_ran[] = true
+    t3, src3 = cancellable() do
+        try
+            sleep(1000)
+        finally
+            cleanup_ran[] = true
+        end
     end
     spin()
-    @test cancel!(t3, CANCEL_REQUEST_ABANDON_ALL)
+    @test cancel!(src3, CANCEL_REQUEST_ABANDON_ALL)
     @test istaskdone(t3)
     @test t3.state === :abandoned
     @test istaskfailed(t3)
     @test !cleanup_ran[]
     @test_throws TaskFailedException wait(t3)
 
-    # ABANDON_ALL of a never-started task completes it too.
-    t4 = @task nothing
-    @test cancel!(t4, CANCEL_REQUEST_ABANDON_ALL)
-    @test istaskdone(t4)
+    # A task spawned into an ABANDON_ALL-cancelled scope never runs its body.
+    src4 = CancellationTokenSource()
+    body_ran = Ref(false)
+    t4 = Base.with_cancel_token(() -> @task(body_ran[] = true), CancellationToken(src4))
+    @test cancel!(src4, CANCEL_REQUEST_ABANDON_ALL)
+    schedule(t4)
+    @test timedwait(() -> istaskdone(t4), 10.0) == :ok
+    @test !body_ran[]
 
     # ABANDON_EXTERNAL interrupts a blocked stream write without waiting for
     # the write's cancellation to complete.
@@ -705,9 +824,9 @@ end
     Base.link_pipe!(p, reader_supports_async=true, writer_supports_async=true)
     try
         big = zeros(UInt8, 200_000_000)
-        tw = @async write(p, big)
+        tw, srcw = cancellable(() -> write(p, big))
         spin()
-        cancel!(tw, CANCEL_REQUEST_ABANDON_EXTERNAL)
+        cancel!(srcw, CANCEL_REQUEST_ABANDON_EXTERNAL)
         @test timedwait(() -> istaskdone(tw), 10.0) == :ok
         @test istaskfailed(tw)
         @test tw.result === CANCEL_REQUEST_ABANDON_EXTERNAL
@@ -718,36 +837,66 @@ end
 
 @testset "^C escalation severity ladder" begin
     # Episode classification for the ^C escalation ladder.
-    @test Base.sigint_active_severity(nothing) === nothing
-    @test Base.sigint_active_severity(UInt8(0x00)) === nothing # fresh C-side ^C marker
-    @test Base.sigint_active_severity(CANCEL_REQUEST_SAFE) === CANCEL_REQUEST_SAFE
-    @test Base.sigint_active_severity(CancellationRequest(0x80)) === CANCEL_REQUEST_SAFE
-    @test Base.sigint_active_severity(CANCEL_REQUEST_ABANDON_EXTERNAL) === CANCEL_REQUEST_ABANDON_EXTERNAL
-    @test Base.sigint_active_severity(CancellationRequest(0x83)) === CANCEL_REQUEST_ABANDON_EXTERNAL
-    @test Base.sigint_active_severity(CANCEL_REQUEST_ABANDON_ALL) === CANCEL_REQUEST_ABANDON_ALL
-    @test Base.sigint_active_severity(CancellationRequest(0x84)) === CANCEL_REQUEST_ABANDON_ALL
+    src = CancellationTokenSource()
+    @test Base.sigint_active_severity(src) === nothing
+    @test cancel!(src)
+    @test Base.sigint_active_severity(src) === CANCEL_REQUEST_SAFE
+    @test cancel!(src, CANCEL_REQUEST_ABANDON_EXTERNAL)
+    @test Base.sigint_active_severity(src) === CANCEL_REQUEST_ABANDON_EXTERNAL
+    @test cancel!(src, CANCEL_REQUEST_ABANDON_ALL)
+    @test Base.sigint_active_severity(src) === CANCEL_REQUEST_ABANDON_ALL
+    # severities never de-escalate
+    @test !cancel!(src, CANCEL_REQUEST_SAFE)
+    @test Base.sigint_active_severity(src) === CANCEL_REQUEST_ABANDON_ALL
 end
 
-@testset "acknowledged requests do not re-trigger" begin
-    t = @async begin
-        try
-            sleep(1000)
-        catch e
-            e isa CancellationRequest || rethrow()
+@testset "unfriendly cancellation of Experimental.@sync" begin
+    # ABANDON_EXTERNAL propagates through the token tree to the children.
+    t1 = Ref{Task}(); t2 = Ref{Task}()
+    t, src = cancellable() do
+        Base.Experimental.@sync begin
+            t1[] = @async sleep(1000)
+            t2[] = @async sleep(1000)
         end
-        # The request was delivered (and acknowledged); this task can still
-        # perform IO and sleep.
-        sleep(0.01)
-        Base.conform_cancellation_request(@atomic :acquire current_task().cancellation_request) === CANCEL_REQUEST_ACK
     end
     spin()
-    cancel!(t)
-    @test fetch(t)
+    cancel!(src, CANCEL_REQUEST_ABANDON_EXTERNAL)
+    @test_throws TaskFailedException wait(t)
+    @test timedwait(() -> istaskdone(t1[]) && istaskdone(t2[]), 10.0) == :ok
+    @test istaskfailed(t1[]) && istaskfailed(t2[])
+
+    # ABANDON_ALL freezes the parent and the children alike (they are all
+    # parked under the cancelled subtree).
+    t3 = Ref{Task}()
+    tp, srcp = cancellable() do
+        Base.Experimental.@sync begin
+            t3[] = @async sleep(1000)
+        end
+    end
+    spin()
+    @test cancel!(srcp, CANCEL_REQUEST_ABANDON_ALL)
+    @test tp.state === :abandoned
+    @test timedwait(() -> istaskdone(t3[]), 10.0) == :ok
+    @test t3[].state === :abandoned
 end
 
-# Tests that need real thread parallelism (asynchronous interruption through
-# the reset_ctx mechanism, task abandonment) always run with 2 threads,
-# regardless of how the test driver was started.
+@testset "structured cancellation of Experimental.@sync" begin
+    t1 = Ref{Task}(); t2 = Ref{Task}()
+    t, src = cancellable() do
+        Base.Experimental.@sync begin
+            t1[] = @async sleep(1000)
+            t2[] = @async sleep(1000)
+        end
+    end
+    spin()
+    cancel!(src)
+    @test_throws TaskFailedException wait(t)
+    @test t.result isa CancellationRequest
+    # cancellation propagated to the children
+    @test timedwait(() -> istaskdone(t1[]) && istaskdone(t2[]), 10.0) == :ok
+    @test istaskfailed(t1[]) && istaskfailed(t2[])
+end
+
 @testset "threaded cancellation (subprocess with -t2)" begin
     cmd = `$(Base.julia_cmd()) --depwarn=error --startup-file=no --threads=2 $(joinpath(@__DIR__, "cancellation_exec.jl"))`
     p = run(pipeline(cmd, stdout=stdout, stderr=stderr), wait=false)
@@ -784,20 +933,21 @@ end
         return fetch(reader), p
     end
 
-    # Catching ^C in a script
+    # Catching ^C in a script: continuing requires re-arming a fresh ^C
+    # epoch (the script's cancelled scope stays cancelled otherwise)
     output, p = run_with_sigint("""
         try
             sleep(100)
             println("FAIL: not cancelled")
         catch e
-            println("caught: ", typeof(e))
+            Base.with_cancel_token(Base.sigint_new_episode!()) do
+                println("caught: ", typeof(e))
+                println("continued")
+                sleep(0.1) # cancellable operations work again
+            end
         end
-        println("continued")
     """, [1.0])
-    # TODO(port): the rescue-timer offer may interleave with the caught-print
-    # under load until script episodes can be closed (the epoch rework
-    # restores the strict single-string assertion).
-    @test occursin("caught: ", output) && occursin("Base.CancellationRequest", output)
+    @test occursin("caught: Base.CancellationRequest", output)
     @test occursin("continued", output)
     @test p.exitcode == 0
 

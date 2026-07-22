@@ -2630,16 +2630,6 @@ JL_CALLABLE(jl_f__equiv_typedef)
 static void (*runtime_fp[num_intrinsics])(void);
 static unsigned intrinsic_nargs[num_intrinsics];
 
-JL_CALLABLE(jl_f_cancellation_point)
-{
-    JL_NARGS(cancellation_point, 0, 0);
-    jl_task_t *ct = jl_current_task;
-    jl_value_t *cr = jl_atomic_load_relaxed(&ct->cancellation_request);
-    if (cr == NULL || cr == jl_nothing)
-        return jl_nothing;
-    return jl_atomic_load_acquire(&ct->cancellation_request);
-}
-
 JL_CALLABLE(jl_f_intrinsic_call)
 {
     enum intrinsic f = (enum intrinsic)*(uint32_t*)jl_data_ptr(F);
@@ -2675,6 +2665,30 @@ JL_CALLABLE(jl_f_intrinsic_call)
     }
     jl_gc_debug_fprint_critical_error(ios_safe_stderr);
     abort();
+}
+
+// cancellation_point!(src::Union{Nothing, Core.CancellationTokenSource})::UInt8
+// Returns a status byte: 0x00 nothing pending; the (nonzero) severity if
+// `src` is cancelled; the 0x40 bit is set if a preempt (cooperative yield)
+// request is pending.
+// N.B.: this runtime version only *checks* the source. Publishing the source
+// into `ct->bound_cancel_token` is done exclusively by the codegen'ed
+// lowering: the binding describes the async-interruptible region that the
+// CancellationLowering pass produces around the compiled cancellation point
+// (reset_ctx), which has no interpreter equivalent.
+JL_CALLABLE(jl_f_cancellation_point)
+{
+    JL_NARGS(cancellation_point!, 1, 1);
+    jl_task_t *ct = jl_current_task;
+    jl_value_t *src = args[0];
+    uint8_t st = 0;
+    if (src != jl_nothing) {
+        JL_TYPECHK(cancellation_point!, cancel_source, src);
+        st = jl_atomic_load_relaxed(&((jl_cancel_source_t*)src)->state);
+    }
+    if (jl_atomic_load_relaxed(&ct->preempt_request))
+        st |= 0x40;
+    return jl_box_uint8(st);
 }
 
 JL_DLLEXPORT const char *jl_intrinsic_name(int f)

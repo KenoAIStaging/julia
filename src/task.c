@@ -1124,6 +1124,8 @@ JL_DLLEXPORT jl_task_t *jl_new_task(jl_value_t *start, jl_value_t *completion_fu
     jl_atomic_store_relaxed(&t->running_time_ns, 0);
     jl_atomic_store_relaxed(&t->finished_at, 0);
     jl_timing_task_init(t);
+    jl_atomic_store_relaxed(&t->bound_cancel_token, jl_nothing);
+    jl_atomic_store_relaxed(&t->preempt_request, 0);
     t->reset_ctx = NULL;
 
     if (t->ctx.copy_stack)
@@ -1183,15 +1185,17 @@ void jl_init_tasks(void)
 static void NOINLINE JL_NORETURN _start_task(void) JL_CANSAFEPOINT;
 #endif
 
-static void NOINLINE _handle_start_task_cancellation(jl_value_t *creq) JL_CANSAFEPOINT
+// Give a task starting under a dynamic scope a chance to observe a cancelled
+// scope token before its body runs (e.g. a task spawned into an
+// ABANDON_ALL-frozen scope must not start). Resolves the scoped default token
+// and throws the corresponding CancellationRequest if it is cancelled.
+static void NOINLINE _start_task_cancel_check(void) JL_CANSAFEPOINT
 {
-    jl_value_t *cancel_handler = jl_get_global(jl_base_module, jl_symbol("handle_cancellation!"));
-    if (!cancel_handler) {
-        jl_safe_printf("Task cancellation requested but Base.handle_cancellation! is not defined\n");
-        jl_exit(1);
-    }
-    jl_value_t *fargs[2] = { cancel_handler, creq };
-    jl_apply(fargs, 2);
+    jl_value_t *checkf = jl_get_global(jl_base_module, jl_symbol("start_task_cancel_check"));
+    if (!checkf)
+        return; // early bootstrap: no cancellation machinery yet
+    jl_value_t *fargs[1] = { checkf };
+    jl_apply(fargs, 1);
 }
 
 static void NOINLINE JL_NORETURN JL_NO_ASAN start_task(void) JL_CANSAFEPOINT
@@ -1254,16 +1258,10 @@ CFI_NORETURN
                 jl_sigint_safepoint(ptls);
             }
             JL_TIMING(ROOT, ROOT);
-            for (;;) {
-                jl_value_t *creq = jl_atomic_load_relaxed(&ct->cancellation_request);
-                if (creq == jl_nothing)
-                    break;
-                _handle_start_task_cancellation(creq);
-                // If the handler returned without throwing (e.g. an already
-                // acknowledged request), do not spin on it.
-                if (jl_atomic_load_relaxed(&ct->cancellation_request) == creq)
-                    break;
-            }
+            // Fast path: a task with no dynamic scope cannot be governed by a
+            // cancellation token.
+            if (ct->scope != jl_nothing && ct->scope != NULL)
+                _start_task_cancel_check();
             res = jl_apply(&ct->start, 1);
         }
         JL_CATCH {
@@ -1601,6 +1599,8 @@ jl_task_t *jl_init_root_task(jl_ptls_t ptls, void *stack_lo, void *stack_hi)
         jl_atomic_store_relaxed(&ct->first_enqueued_at, 0);
         jl_atomic_store_relaxed(&ct->last_started_running_at, 0);
     }
+    jl_atomic_store_relaxed(&ct->bound_cancel_token, jl_nothing);
+    jl_atomic_store_relaxed(&ct->preempt_request, 0);
     ct->reset_ctx = NULL;
     ptls->abandon_to = NULL;
     ptls->root_task = ct;
@@ -1661,13 +1661,79 @@ JL_DLLEXPORT int8_t jl_get_task_threadpoolid(jl_task_t *t)
     return t->threadpoolid;
 }
 
+// Whether `src` is an ancestor of (or equal to) `node` in the cancellation
+// DAG. `parent` link entries are const after construction, so the walk needs
+// no locks. Multi-parent ("linked") sources make this a DAG search; the work
+// is bounded so that a pathological diamond lattice cannot stall the
+// canceller. On exhaustion (deep chains, wide fan-in) the node is
+// conservatively treated as a MEMBER: the consumer sends a best-effort
+// interruption signal whose delivery re-checks the task's own bound source,
+// so over-approximating is harmless, while a miss would strand a running
+// computation whose code has no later cancellation point.
+static int cancel_source_subtree_member(jl_value_t *node, jl_value_t *src) JL_NOTSAFEPOINT
+{
+    jl_value_t *stack[32];
+    size_t top = 0;
+    int steps = 0;
+    while (node != NULL && node != jl_nothing) {
+        if (node == src)
+            return 1;
+        if (++steps >= 256)
+            return 1; // budget exhausted: conservatively a member
+        jl_cancel_source_t *cs = (jl_cancel_source_t*)node;
+        size_t np = cs->nparents;
+        jl_cancel_parent_link_t *links = jl_cancel_source_links(cs);
+        for (size_t i = 1; i < np; i++) {
+            if (top < sizeof(stack) / sizeof(stack[0]))
+                stack[top++] = (jl_value_t*)links[i].parent;
+            else
+                return 1; // dropped a parent edge: conservatively a member
+        }
+        node = np == 0 ? NULL : (jl_value_t*)links[0].parent;
+        if ((node == NULL || node == jl_nothing) && top > 0)
+            node = stack[--top];
+    }
+    return 0;
+}
+
+// Collect the tasks currently running on some thread whose published bound
+// cancellation token lies in the subtree rooted at `src` (i.e. `src` is an
+// ancestor of, or equal to, the task's bound token source). The result is a
+// snapshot: tasks may migrate or rebind concurrently; callers must tolerate
+// both misses (recovered level-triggered at the task's next cancellation
+// point) and stale hits (the interrupt re-checks and is harmless).
+JL_DLLEXPORT jl_value_t *jl_cancel_collect_bound(jl_value_t *src)
+{
+    jl_array_t *out = jl_alloc_vec_any(0);
+    // `t` must stay rooted across the allocating push below: the snapshotted
+    // thread can switch tasks in the meantime, dropping what may be the last
+    // other reference.
+    jl_task_t *t = NULL;
+    JL_GC_PUSH2(&out, &t);
+    int nthreads = jl_atomic_load_acquire(&jl_n_threads);
+    jl_ptls_t *allstates = jl_atomic_load_relaxed(&jl_all_tls_states);
+    for (int tid = 0; tid < nthreads; tid++) {
+        jl_ptls_t ptls2 = allstates[tid];
+        if (ptls2 == NULL)
+            continue;
+        t = jl_atomic_load_relaxed(&ptls2->current_task);
+        if (t == NULL)
+            continue;
+        jl_value_t *bound = jl_atomic_load_acquire(&t->bound_cancel_token);
+        if (bound != NULL && bound != jl_nothing &&
+            cancel_source_subtree_member(bound, src)) {
+            jl_array_ptr_1d_push(out, (jl_value_t*)t);
+        }
+    }
+    JL_GC_POP();
+    return (jl_value_t*)out;
+}
+
 JL_DLLEXPORT void jl_preempt_thread_task(int16_t tid) JL_NOTSAFEPOINT
 {
     jl_ptls_t ptls2 = jl_atomic_load_relaxed(&jl_all_tls_states)[tid];
     jl_task_t *task = jl_atomic_load_relaxed(&ptls2->current_task);
-    jl_value_t *expected = jl_nothing;
-    // If the task is already being cancelled, that's good enough for preemption
-    jl_atomic_cmpswap(&task->cancellation_request, &expected, jl_box_uint8(0x5));
+    jl_atomic_store_relaxed(&task->preempt_request, 1);
     jl_send_cancellation_signal(tid);
 }
 
@@ -1755,13 +1821,15 @@ JL_DLLEXPORT void jl_abandon_task(jl_task_t *t, jl_task_t *next_task) JL_NOTSAFE
     // Store the target task and set up the abandoned task's state
     ptls2->abandon_to = next_task;
 
-    // Set the cancellation request to CANCEL_REQUEST_ABANDON_ALL (0x4)
-    jl_value_t *creq = jl_atomic_load_relaxed(&t->cancellation_request);
-    if (creq == jl_nothing || creq == NULL) {
-        creq = jl_box_uint8(0x4); // CANCEL_REQUEST_ABANDON_ALL
+    // Record the abandonment as the task's result. Julia-side callers
+    // (freeze_task!/unsafe_abandon!) set a proper CancellationRequest
+    // beforehand; the C direct-abandon path cannot allocate here (signal
+    // context), so fall back to the interned severity byte.
+    if (t->result == jl_nothing || t->result == NULL) {
+        jl_value_t *creq = jl_box_uint8(0x4); // CANCEL_REQUEST_ABANDON_ALL
+        t->result = creq;
+        jl_gc_wb(t, creq);
     }
-    t->result = creq;
-    jl_gc_wb(t, creq);
     jl_atomic_store_relaxed(&t->_isexception, 1);
 
     // Mark the task as abandoned - this must happen before the signal
@@ -1873,7 +1941,11 @@ JL_DLLEXPORT jl_value_t *jl_new_cancel_source(jl_value_t **parents, size_t np)
             jl_gc_set_weak_processing_target(ct->ptls, parents[i]);
     }
     jl_atomic_store_relaxed(&src->child_head, jl_nothing);
+    src->waiters_head = jl_nothing;
+    src->waiters_tail = jl_nothing;
     jl_atomic_store_relaxed(&src->state, 0);
+    jl_atomic_store_relaxed(&src->delivered, 0);
+    jl_atomic_store_relaxed(&src->_lock, 0);
     src->nparents = (uint16_t)np;
     // Initialize every link entry before publishing the node under *any*
     // parent: a concurrent cancellation walk that reaches the node through
