@@ -1758,12 +1758,13 @@ if !Sys.iswindows() && !running_under_rr()
             # the marker is split so the pty echo of the input line does not match it
             write(ptm, "println(\"LOOP\", \"START\"); while true; sleep(0.05); end\n")
             @test expect_output(output, "LOOPSTART")
-            # a single SIGINT can be missed on a loaded machine, so resend until
-            # the InterruptException surfaces
+            # ^C is delivered as a cancellation request (InterruptException is
+            # what packages may still rethrow it as); a single SIGINT can be
+            # missed on a loaded machine, so resend until it surfaces
             interrupted = false
             for _ in 1:5
                 kill(p, 2) # SIGINT
-                if expect_output(output, "InterruptException"; timeout=10)
+                if expect_output(output, r"InterruptException|CancellationRequest"; timeout=10)
                     interrupted = true
                     break
                 end
@@ -1804,9 +1805,56 @@ if !Sys.iswindows() && !running_under_rr()
             @test process_exited(p)
             wait(reader) # wait for iob to reach EOF
             err = read(iob, String)
-            @test occursin("InterruptException", err)
+            # ^C is delivered as a cancellation request (InterruptException is
+            # what packages may still rethrow it as)
+            @test occursin(r"InterruptException|CancellationRequest", err)
             @test !has_internal_err(err)
         finally
+            process_running(p) && kill(p, Base.SIGKILL)
+            wait(p)
+        end
+    end
+
+    if Base.identify_package("Distributed") !== nothing
+        @testset "Distributed.interrupt reaches a busy worker" begin
+            # delivery on the worker is timing-sensitive: the InterruptException
+            # lands in whichever task last parked in the scheduler, which may be
+            # the message loop (killing the worker) instead of the executor, so
+            # retry with a fresh worker; a swallowed interrupt ("completed") is
+            # an outright failure
+            script = """
+                using Distributed
+                function attempt()
+                    w = addprocs(1)[1]
+                    ready = RemoteChannel(() -> Channel{Bool}(1))
+                    r = @spawnat w (put!(ready, true); sleep(30); "completed")
+                    take!(ready)
+                    interrupt(w)
+                    try
+                        fetch(r)
+                    catch e
+                        e
+                    end
+                end
+                for i in 1:3
+                    v = attempt()
+                    v == "completed" && exit(1)
+                    (v isa RemoteException || v isa InterruptException) && exit(0)
+                end
+                exit(1)
+                """
+            cmd = addenv(`$(Base.julia_cmd()) --startup-file=no -e $script`,
+                         Dict("JULIA_LOAD_PATH" => "@stdlib"))
+            p = run(pipeline(cmd; stdout=devnull, stderr=devnull); wait=false)
+            exited = timedwait(() -> process_exited(p), 120) === :ok
+            # Known-broken under cancellation semantics: the worker's message
+            # infrastructure is spawned under its startup ^C episode scope, so
+            # the SIGINT sent by `interrupt` cancels the connection-serving
+            # tasks along with the in-flight request and the worker stops
+            # responding. Distributed needs to shield its infrastructure and
+            # scope only request execution to the interrupt (worker-side
+            # follow-up to the cancellation rework).
+            @test_broken exited && p.exitcode == 0
             process_running(p) && kill(p, Base.SIGKILL)
             wait(p)
         end
