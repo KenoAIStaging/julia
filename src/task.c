@@ -1947,6 +1947,7 @@ JL_DLLEXPORT jl_value_t *jl_new_cancel_source(jl_value_t **parents, size_t np)
     jl_atomic_store_relaxed(&src->child_head, jl_nothing);
     src->waiters_head = jl_nothing;
     src->waiters_tail = jl_nothing;
+    src->watchers = jl_nothing;
     jl_atomic_store_relaxed(&src->state, 0);
     jl_atomic_store_relaxed(&src->delivered, 0);
     jl_atomic_store_relaxed(&src->_lock, 0);
