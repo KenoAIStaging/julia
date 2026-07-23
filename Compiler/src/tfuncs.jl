@@ -528,10 +528,6 @@ end
 function _const_sizeof(@nospecialize(f), @nospecialize(x))
     # Constant GenericMemory does not have constant size
     isa(x, GenericMemory) && return Int
-    # CancellationTokenSource instances are variable-sized (the datatype
-    # size covers only the fixed fields), so their type gives no constant
-    # size; a *constant instance* still folds fine below.
-    x === Core.CancellationTokenSource && return Int
     size = try
             f(x)
         catch ex
