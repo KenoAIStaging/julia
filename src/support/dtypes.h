@@ -73,13 +73,13 @@ typedef intptr_t ssize_t;
 #ifdef _OS_WINDOWS_
 #define STDCALL  __stdcall
 # ifdef JL_LIBRARY_EXPORTS_INTERNAL
-#  define JL_DLLEXPORT __declspec(dllexport)
+#  define JL_DLLEXPORT __declspec(dllexport) __attribute__ ((visibility("default")))
 # endif
 # ifdef JL_LIBRARY_EXPORTS_CODEGEN
-#  define JL_DLLEXPORT_CODEGEN __declspec(dllexport)
+#  define JL_DLLEXPORT_CODEGEN __declspec(dllexport) __attribute__ ((visibility("default")))
 # endif
 #define JL_HIDDEN
-#define JL_DLLIMPORT   __declspec(dllimport)
+#define JL_DLLIMPORT   __declspec(dllimport) __attribute__ ((visibility("default")))
 #else
 #define STDCALL
 #define JL_DLLIMPORT __attribute__ ((visibility("default")))
