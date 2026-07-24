@@ -425,7 +425,9 @@ end
 function uv_sendcb_task(req::Ptr{Cvoid}, status::Cint)
     d = uv_req_data(req)
     if d == C_NULL || d == Base.UV_REQ_DETACHED
-        # No owner for this req (the waiter departed and left the freeing to us).
+        # No waiter for this req (it departed and left the freeing to us):
+        # release the message root, if one was recorded, and the request.
+        Base._unroot_detached_uvreq!(req)
         Libc.free(req)
     else
         # Mark the callback as done; the waiter (which inspects the req under
@@ -499,6 +501,7 @@ function send(sock::UDPSocket, ipaddr::IPAddr, port::Integer, msg;
         # The token was cancelled since the entry check: don't park; detach
         # the request (its completion callback frees it) and deliver.
         uv_req_set_data(uvw, Base.UV_REQ_DETACHED)
+        Base._root_detached_uvreq!(uvw, msg)
         w.queue = nothing
         w.uvreq = C_NULL
         @atomicreplace ct.waiting_on w => nothing
@@ -525,6 +528,7 @@ function send(sock::UDPSocket, ipaddr::IPAddr, port::Integer, msg;
             # a UDP send cannot be cancelled; detach the request (its
             # completion callback frees it)
             uv_req_set_data(uvw, Base.UV_REQ_DETACHED)
+            Base._root_detached_uvreq!(uvw, msg)
         end
         w.queue = nothing
         w.uvreq = C_NULL
@@ -548,6 +552,7 @@ function send(sock::UDPSocket, ipaddr::IPAddr, port::Integer, msg;
         # `schedule`): make sure we won't get spurious notifications later
         # and leave the freeing to the callback
         uv_req_set_data(uvw, Base.UV_REQ_DETACHED)
+        Base._root_detached_uvreq!(uvw, msg)
     end
     iolock_end()
     unpreserve_handle(ct)
