@@ -882,21 +882,6 @@ end
     @test t7.result isa CancellationRequest
 end
 
-@testset "cancellation of computing tasks" begin
-    # The victims never yield, so a second thread must run the canceller.
-    # (Signal-side delivery that also covers -t1 arrives with the ^C
-    # machinery later in this series; the checkless reset_ctx variant runs
-    # in the -t2 exec subprocess.)
-    if Threads.nthreads() > 1
-        # Polling cancellation via @cancel_check
-        t, src = cancellable_spawn(find_collatz_counterexample)
-        sleep(0.2)
-        cancel!(src)
-        @test_throws TaskFailedException wait(t)
-        @test t.result isa CancellationRequest
-    end
-end
-
 @testset "structured cancellation of @sync" begin
     t, src = cancellable() do
         @sync begin
@@ -1281,7 +1266,10 @@ end
         end
     """, [1.0, 2.5, 2.5]; forcekill=true)
     @test occursin("Cancellation is in progress, but has not completed", output)
-    @test occursin(r"Abandoning (the )?current task", output)
+    # single-threaded sessions reach the abandonment through the C-side
+    # direct path ("Abandoned ... and switched to a rescue task"); threaded
+    # ones through the listener's rung ("Abandoning ...")
+    @test occursin(r"Abandon(ing|ed) the current task", output)
 
     # ^C stops a swarm of print-flooding tasks and the script continues
     # (issue #47839)
@@ -1386,7 +1374,50 @@ if Sys.isunix()
             @test status == :ok
         end
         sendline(s) = write(ptm, s * "\n")
+        # Wait until every needle appears at-or-after the cursor, in any
+        # order, then advance the cursor past all of them: the single-thread
+        # endgame's messages (rescue warning, error display, fresh prompt)
+        # interleave nondeterministically.
+        function expect_all(needles::String...; timeout::Real=30.0)
+            last_end = Ref(cursor[])
+            status = timedwait(timeout; pollint=0.05) do
+                s = snapshot()
+                stop = cursor[]
+                for needle in needles
+                    idx = findnext(needle, s, cursor[])
+                    idx === nothing && return false
+                    stop = max(stop, last(idx) + 1)
+                end
+                last_end[] = stop
+                return true
+            end
+            if status !== :ok
+                @error "expect_all timed out" needles tail=snapshot()[max(1, cursor[]):end]
+            else
+                cursor[] = last_end[]
+            end
+            @test status == :ok
+        end
 
+        expect("julia> ")
+        # In a child with a single thread IN TOTAL, the julia-side listener -
+        # the engine of the graded SAFE -> ABANDON_EXTERNAL -> ABANDON_ALL
+        # ladder - is starved while the victim monopolizes it: a repeat press
+        # re-offers the first rung, and the third press reaches the C-side
+        # direct abandonment instead of the listener's rungs. An unadorned
+        # `julia -i` session has an interactive-pool thread besides the
+        # default one, and its interactive-pool listener runs the full
+        # ladder; only an explicit JULIA_NUM_THREADS=1 (CI's test workers)
+        # leaves no spare thread. Probe the child's total count directly.
+        sendline("print(\"NTQ\", Threads.nthreads(:default) + Threads.nthreads(:interactive), \"QTN\")")
+        @test timedwait(30.0; pollint=0.05) do
+            m = match(r"NTQ(\d+)QTN", snapshot(), cursor[])
+            m === nothing && return false
+            cursor[] = m.offset + lastindex(m.match)
+            return true
+        end === :ok
+        m = match(r"NTQ(\d+)QTN", snapshot())
+        single_threaded = m !== nothing && m[1] == "1"
         expect("julia> ")
         # A task that acknowledges SAFE cancellation but hangs in its cleanup:
         # walks the full escalation ladder with a guided message per rung.
@@ -1404,13 +1435,20 @@ if Sys.isunix()
                 kill(p, Sys.isbsd() ? Base.SIGINFO : Base.SIGUSR1)
                 expect("signal ("; timeout=10.0) # the backtrace dump header
             end
-            kill(p, Base.SIGINT) # press 2: ABANDON_EXTERNAL
-            expect("No longer waiting for external resources")
-            expect("Press ^C again to forcibly abandon"; timeout=6.0)
-            kill(p, Base.SIGINT) # press 3: ABANDON_ALL freezes the task
-            expect("Abandoning the current task")
-            expect("CancellationRequest")
-            expect("julia> ")
+            if single_threaded
+                kill(p, Base.SIGINT) # press 2: retried, re-offering rung 1
+                expect("Press ^C again to also stop waiting for external resources"; timeout=6.0)
+                kill(p, Base.SIGINT) # press 3: C-side direct abandonment
+                expect_all("Abandoned the current task", "CancellationRequest", "julia> ")
+            else
+                kill(p, Base.SIGINT) # press 2: ABANDON_EXTERNAL
+                expect("No longer waiting for external resources")
+                expect("Press ^C again to forcibly abandon"; timeout=6.0)
+                kill(p, Base.SIGINT) # press 3: ABANDON_ALL freezes the task
+                expect("Abandoning the current task")
+                expect("CancellationRequest")
+                expect("julia> ")
+            end
             # the rescued session works
             sendline("$episode + $episode")
             expect(string(2episode))

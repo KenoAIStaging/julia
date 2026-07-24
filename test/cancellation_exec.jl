@@ -77,6 +77,32 @@ function find_collatz_counterexample2()
     Base.@cancel_check
     return find_collatz_counterexample_inner()
 end
+function find_collatz_counterexample()
+    collatz(n) = (n & 1) == 1 ? (3n + 1) : (n ÷ 2)
+    i = 1
+    while true
+        j = i
+        while true
+            Base.@cancel_check
+            j = collatz(j)
+            j == 1 && break
+            j == i && error("$j is a collatz counterexample")
+        end
+        i += 1
+    end
+end
+
+# A compute-bound victim only observes the cancellation at its own polling
+# points; the cancelling task needs a thread of its own to run on, which is
+# why this lives in the threaded subprocess.
+@testset "cancellation of computing tasks" begin
+    # Polling cancellation via @cancel_check
+    t, src = cancellable_spawn(find_collatz_counterexample)
+    sleep(0.2)
+    cancel!(src)
+    @test_throws TaskFailedException wait(t)
+    @test t.result isa CancellationRequest
+end
 
 @testset "async interruption of checkless loops (reset_ctx)" begin
     t, src = cancellable_spawn(find_collatz_counterexample2)
