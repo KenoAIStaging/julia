@@ -1132,6 +1132,14 @@ end
 @testset "^C" begin
     function run_with_sigint(code::String, delays; forcekill::Bool=false,
                              open_stdin::Bool=false, threads::Int=0)
+        # A readiness marker printed from user code proves the runtime is up
+        # (signal handling armed, the script started) before any SIGINT is
+        # sent - on a loaded machine startup alone can outlast the first delay
+        # and an early SIGINT kills the child with no output at all. (The
+        # marker's write is also the root task's first blocking operation:
+        # its cancellation point binds the task under the ^C episode scope,
+        # which the direct-abandonment rung now requires.)
+        code = "println(\"CHILD-READY\")\n" * code
         out = Pipe()
         cmd = threads > 0 ?
             `$(Base.julia_cmd()) --startup-file=no --threads=$threads -e $code` :
@@ -1140,6 +1148,7 @@ end
         p = run(pipeline(cmd, stdin=inpipe, stdout=out, stderr=out), wait=false)
         close(out.in)
         open_stdin && close(inpipe.out)
+        readuntil(out, "CHILD-READY\n") # returns early (at EOF) if the child dies
         reader = @async read(out, String)
         killer = @async begin
             for d in delays
@@ -1208,7 +1217,7 @@ end
         end
         """, [1.0, 2.5]; forcekill=true)
     @test occursin("failed to acknowledge SIGINT", output)
-    @test occursin("Abandoned the current task", output)
+    @test occursin("Abandoning the current task", output)
     @test p.exitcode == 128 + 2
 
     # ^C with a stray @async task pending is catchable and the script exits
@@ -1267,9 +1276,9 @@ end
     """, [1.0, 2.5, 2.5]; forcekill=true)
     @test occursin("Cancellation is in progress, but has not completed", output)
     # single-threaded sessions reach the abandonment through the C-side
-    # direct path ("Abandoned ... and switched to a rescue task"); threaded
-    # ones through the listener's rung ("Abandoning ...")
-    @test occursin(r"Abandon(ing|ed) the current task", output)
+    # direct path; threaded ones through the listener's rung - both announce
+    # with "Abandoning the current task"
+    @test occursin("Abandoning the current task", output)
 
     # ^C stops a swarm of print-flooding tasks and the script continues
     # (issue #47839)
@@ -1439,7 +1448,7 @@ if Sys.isunix()
                 kill(p, Base.SIGINT) # press 2: retried, re-offering rung 1
                 expect("Press ^C again to also stop waiting for external resources"; timeout=6.0)
                 kill(p, Base.SIGINT) # press 3: C-side direct abandonment
-                expect_all("Abandoned the current task", "CancellationRequest", "julia> ")
+                expect_all("Abandoning the current task", "CancellationRequest", "julia> ")
             else
                 kill(p, Base.SIGINT) # press 2: ABANDON_EXTERNAL
                 expect("No longer waiting for external resources")
@@ -1537,7 +1546,7 @@ if Sys.isunix()
         kill(p, Base.SIGINT)
         expect("failed to acknowledge SIGINT"; timeout=15.0)
         kill(p, Base.SIGINT)
-        expect("Abandoned the current task")
+        expect("Abandoning the current task")
         expect("julia> ")
 
         # the rescued REPL still evaluates
