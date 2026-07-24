@@ -743,15 +743,17 @@ end
 
     # FileWatching: fd polling and file watching
     FileWatching = Base.require(Base.PkgId(Base.UUID("7b1f6079-737a-58dc-b8bc-7a2ca5c1b5ee"), "FileWatching"))
-    p = Pipe()
-    Base.link_pipe!(p, reader_supports_async=true, writer_supports_async=true)
-    fd = Base._fd(p.out)
-    t, src = cancellable(() -> FileWatching.wait(fd; readable=true)) # nothing is ever written
-    spin()
-    cancel!(src)
-    @test_throws TaskFailedException wait(t)
-    @test t.result isa CancellationRequest
-    close(p)
+    if !Sys.iswindows() # fd polling requires a socket on Windows (ENOTSOCK)
+        p = Pipe()
+        Base.link_pipe!(p, reader_supports_async=true, writer_supports_async=true)
+        fd = Base._fd(p.out)
+        t, src = cancellable(() -> FileWatching.wait(fd; readable=true)) # nothing is ever written
+        spin()
+        cancel!(src)
+        @test_throws TaskFailedException wait(t)
+        @test t.result isa CancellationRequest
+        close(p)
+    end
 
     path = tempname()
     touch(path)
@@ -1121,7 +1123,9 @@ end
     # A cancellation-delivery regression can wedge the child completely (a
     # surviving spin loop blocks GC's stop-the-world, which also blocks all
     # signal processing), in which case not even SIGTERM gets through.
-    # SIGKILL it rather than hanging the test suite.
+    # SIGKILL it rather than hanging the test suite. The budget is generous:
+    # on an oversubscribed CI box the child's compute-heavy testsets alone
+    # can take several minutes.
     if timedwait(() -> process_exited(p), 600.0) !== :ok
         kill(p, Base.SIGKILL)
     end
@@ -1129,7 +1133,9 @@ end
     @test success(p)
 end
 
-@testset "^C" begin
+# On Windows uv_kill(SIGINT) terminates the child outright instead of
+# delivering a console ^C, so none of these scenarios can run there.
+Sys.isunix() && @testset "^C" begin
     function run_with_sigint(code::String, delays; forcekill::Bool=false,
                              open_stdin::Bool=false, threads::Int=0)
         # A readiness marker printed from user code proves the runtime is up
