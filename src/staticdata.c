@@ -2321,6 +2321,22 @@ static uint32_t write_gvars(jl_serializer_state *s, arraylist_t *globals, arrayl
 }
 
 // Pointer relocation for native-code referenced global variables
+//
+// GC INVARIANT: gvar slots are NOT GC roots. An image object referenced only
+// from gvar slots (e.g. a global whose module binding table was stripped by
+// `--trim`) is invisible to the mark phase, so its liveness — and that of
+// everything it references at runtime — depends entirely on the image-object
+// GC regime from #61474: image objects load permanently marked
+// (GC_OLD_MARKED | GC_IN_IMAGE), so their write barrier is armed from birth,
+// and the first pointer store into them enrolls them (via the
+// GC_IN_IMAGE_REMSET header bit, once) in the persistent `image_remset`,
+// which marking scans as an extra root set after every full sweep (image
+// objects act as a third, permanent GC generation). Before #61474 image
+// objects loaded *unmarked* (GC_OLD | GC_IN_IMAGE) with barriers gated on
+// GC_OLD_MARKED, so mutating a gvar-only image object (e.g. `resize!` of an
+// image-resident Vector) recorded the old->young edge nowhere and the GC
+// swept the live child — a use-after-free. Do not regress this when touching
+// gvar or image-tag machinery; test/trimming/gc_image_wb.jl guards it.
 static void jl_update_all_gvars(jl_serializer_state *s, jl_image_t *image, uint32_t external_fns_begin)
 {
     if (image->gvars_base == NULL)
