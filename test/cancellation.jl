@@ -359,3 +359,432 @@ end
     @test t3.result isa CancellationRequest
     @test t3.result == CANCEL_REQUEST_ABANDON_EXTERNAL
 end
+
+## Request-delivery tests (cancellation of waiting tasks)
+
+# Start `f` as an @async-style (sticky, co-scheduled) task governed by a
+# fresh cancellation source; returns (task, source).
+function cancellable(f)
+    src = CancellationTokenSource()
+    t = with(() -> @async(f()), CANCEL_TOKEN => CancellationToken(src))
+    return t, src
+end
+
+# wait a little, so cancellation targets are (most likely) started and parked
+spin(n=4) = for _ in 1:n; yield(); end
+
+# whether `t` is parked (its wait registration is enqueued on some waitee)
+is_parked(t::Task) = (w = @atomic :acquire t.waiting_on; w isa Base.WaitEntry && w.queue !== nothing)
+parked_on(t::Task, @nospecialize(x)) = (w = @atomic :acquire t.waiting_on; w isa Base.WaitEntry && w.queue === x)
+
+@testset "level-triggered delivery and shielding" begin
+    # cancellation is uniformly level-triggered: after catching the request,
+    # unshielded waits under the cancelled scope keep throwing; shielded
+    # cleanup proceeds, and the severity remains observable under the shield
+    src = CancellationTokenSource()
+    phase = Ref{Any}(:init)
+    t = with(CANCEL_TOKEN => CancellationToken(src)) do
+        @async try
+            sleep(1000)
+        catch e
+            e isa CancellationRequest || rethrow()
+            phase[] = :caught
+            rethrew = try
+                sleep(1000)
+                false
+            catch e2
+                e2 isa CancellationRequest
+            end
+            sleep(0.01; cancel=nothing) # shielded cleanup is permitted
+            rethrew &= Base.ambient_cancel_severity() === CANCEL_REQUEST_SAFE
+            phase[] = rethrew ? :done : :no_retrigger
+        end
+    end
+    spin()
+    cancel!(src)
+    @test timedwait(() -> istaskdone(t), 10.0) == :ok
+    @test phase[] === :done
+
+    # an internal teardown re-park (min_severity) is woken only by escalation
+    srcm = CancellationTokenSource()
+    cancel!(srcm)
+    inner = @async sleep(5)
+    tm = @async Base._wait(inner, CancellationToken(srcm); min_severity=0x01)
+    spin()
+    cancel!(srcm, CANCEL_REQUEST_ABANDON_EXTERNAL)
+    @test_throws TaskFailedException wait(tm)
+    @test tm.result isa CancellationRequest
+end
+
+@testset "cancellation of waiting tasks" begin
+    # Cancellation of `sleep`
+    t, src = cancellable(() -> sleep(1000))
+    spin()
+    cancel!(src)
+    @test_throws TaskFailedException wait(t)
+    @test t.result isa CancellationRequest
+
+    # After catching the request, cleanup that must block shields itself
+    t2, src2 = cancellable() do
+        try
+            sleep(1000)
+        catch e
+            e isa CancellationRequest || rethrow()
+            sleep(0.01; cancel=nothing) # shielded: parking for cleanup
+            return :cleanup_ok
+        end
+    end
+    spin()
+    cancel!(src2)
+    @test fetch(t2) === :cleanup_ok
+
+    # Cancellation of a task blocked on a Channel
+    c = Channel{Int}(0)
+    t, src = cancellable(() -> take!(c))
+    spin()
+    cancel!(src)
+    @test_throws TaskFailedException wait(t)
+    @test t.result isa CancellationRequest
+    # The channel remains usable
+    t2 = @async take!(c)
+    put!(c, 7)
+    @test fetch(t2) == 7
+
+    # Cancelling a scope reaches a task waiting on another task; the waited-on
+    # task (in the same scope) is cancelled through the same tree
+    local t_in
+    t, src = cancellable() do
+        t_in = @async sleep(1000)
+        wait(t_in)
+    end
+    spin()
+    cancel!(src)
+    @test_throws TaskFailedException wait(t)
+    @test timedwait(() -> istaskdone(t_in), 10.0) == :ok
+    @test istaskfailed(t_in)
+
+    # ... but a task waited on from a *different* scope is unaffected by the
+    # waiter's cancellation
+    t_out = @async sleep(5)
+    t, src = cancellable(() -> wait(t_out))
+    spin()
+    cancel!(src)
+    @test_throws TaskFailedException wait(t)
+    @test !istaskdone(t_out)
+    wait(t_out)
+    @test istaskdone(t_out) && !istaskfailed(t_out)
+end
+
+@testset "cancellation of lock and condition waits" begin
+    # Task blocked in lock(::ReentrantLock)
+    lk = ReentrantLock()
+    lock(lk)
+    t, src = cancellable(() -> lock(lk))
+    spin()
+    # let it spin through the fast path and park
+    @test timedwait(() -> is_parked(t), 5.0) == :ok
+    cancel!(src)
+    @test_throws TaskFailedException wait(t)
+    @test t.result isa CancellationRequest
+    # the lock remains functional
+    unlock(lk)
+    @test trylock(lk)
+    unlock(lk)
+    t2 = @async (lock(lk); unlock(lk); true)
+    @test fetch(t2)
+
+    # Task blocked in put! on a full channel
+    c = Channel{Int}(1)
+    put!(c, 1)
+    t, src = cancellable(() -> put!(c, 2))
+    spin()
+    cancel!(src)
+    @test_throws TaskFailedException wait(t)
+    @test t.result isa CancellationRequest
+    @test take!(c) == 1
+    put!(c, 3) # channel remains functional
+    @test take!(c) == 3
+
+    # Task blocked in wait(::Threads.Condition)
+    cond = Threads.Condition()
+    t, src = cancellable(() -> @lock cond wait(cond))
+    spin()
+    cancel!(src)
+    @test_throws TaskFailedException wait(t)
+    @test t.result isa CancellationRequest
+    @lock cond notify(cond) # still functional (no waiters)
+
+    # Task blocked in wait(::Base.Process); the process itself keeps running
+    p = run(`sleep 1000`; wait=false)
+    t, src = cancellable(() -> wait(p))
+    spin()
+    cancel!(src)
+    @test_throws TaskFailedException wait(t)
+    @test t.result isa CancellationRequest
+    @test process_running(p)
+    kill(p); wait(p)
+
+    # Task blocked in waitany; the awaited tasks live in different scopes and
+    # remain unaffected by the waiter's cancellation
+    t1, src1 = cancellable(() -> sleep(1000))
+    t2, src2 = cancellable(() -> sleep(1000))
+    t, src = cancellable(() -> waitany([t1, t2]))
+    spin()
+    cancel!(src)
+    @test_throws TaskFailedException wait(t)
+    @test t.result isa CancellationRequest
+    @test !istaskdone(t1) && !istaskdone(t2)
+    # their own scopes' cancellation reaches them
+    cancel!(src1); cancel!(src2)
+    @test_throws TaskFailedException wait(t1)
+    @test_throws TaskFailedException wait(t2)
+end
+
+@testset "cancellation of stdlib waits (Sockets, FileWatching, Semaphore)" begin
+    # Base.Semaphore: a cancelled acquire does not leak a permit
+    sem = Base.Semaphore(1)
+    Base.acquire(sem)
+    t, src = cancellable(() -> Base.acquire(sem))
+    spin()
+    cancel!(src)
+    @test_throws TaskFailedException wait(t)
+    @test t.result isa CancellationRequest
+    Base.release(sem)
+    Base.acquire(sem) # the permit is still available
+    Base.release(sem)
+
+    # Sockets.accept
+    Sockets = Base.require(Base.PkgId(Base.UUID("6462fe0b-24de-5631-8697-dd941f90decc"), "Sockets"))
+    port, server = Sockets.listenany(Sockets.localhost, 0)
+    t, src = cancellable(() -> Sockets.accept(server))
+    spin()
+    cancel!(src)
+    @test_throws TaskFailedException wait(t)
+    @test t.result isa CancellationRequest
+    # the server keeps accepting afterwards
+    t2 = @async Sockets.accept(server)
+    sock = Sockets.connect(Sockets.localhost, port)
+    @test fetch(t2) isa Sockets.TCPSocket
+    close(sock); close(server)
+
+    # FileWatching: fd polling and file watching
+    FileWatching = Base.require(Base.PkgId(Base.UUID("7b1f6079-737a-58dc-b8bc-7a2ca5c1b5ee"), "FileWatching"))
+    if !Sys.iswindows() # fd polling requires a socket on Windows (ENOTSOCK)
+        p = Pipe()
+        Base.link_pipe!(p, reader_supports_async=true, writer_supports_async=true)
+        fd = Base._fd(p.out)
+        t, src = cancellable(() -> FileWatching.wait(fd; readable=true)) # nothing is ever written
+        spin()
+        cancel!(src)
+        @test_throws TaskFailedException wait(t)
+        @test t.result isa CancellationRequest
+        close(p)
+    end
+
+    path = tempname()
+    touch(path)
+    t, src = cancellable(() -> FileWatching.watch_file(path, 100.0)) # the file never changes
+    spin()
+    cancel!(src)
+    @test_throws TaskFailedException wait(t)
+    @test t.result isa CancellationRequest
+    rm(path)
+end
+
+@testset "explicit cancel keyword arguments" begin
+    Sockets = Base.require(Base.PkgId(Base.UUID("6462fe0b-24de-5631-8697-dd941f90decc"), "Sockets"))
+    FileWatching = Base.require(Base.PkgId(Base.UUID("7b1f6079-737a-58dc-b8bc-7a2ca5c1b5ee"), "FileWatching"))
+    cancelled_src = CancellationTokenSource()
+    cancel!(cancelled_src)
+    ctok = CancellationToken(cancelled_src)
+
+    # a pre-cancelled token throws at entry, before any side effect
+    p = Pipe()
+    Base.link_pipe!(p, reader_supports_async=true, writer_supports_async=true)
+    @test_throws CancellationRequest read(p.out, 10; cancel=ctok)
+    @test_throws CancellationRequest read(p.out; cancel=ctok)
+    @test_throws CancellationRequest read(p.out, String; cancel=ctok)
+    @test_throws CancellationRequest read(p.out, UInt8; cancel=ctok)
+    @test_throws CancellationRequest read!(p.out, zeros(UInt8, 4); cancel=ctok)
+    @test_throws CancellationRequest readbytes!(p.out, zeros(UInt8, 4); cancel=ctok)
+    @test_throws CancellationRequest readline(p.out; cancel=ctok)
+    @test_throws CancellationRequest readuntil(p.out, 0x0a; cancel=ctok)
+    @test_throws CancellationRequest readavailable(p.out; cancel=ctok)
+    @test_throws CancellationRequest eof(p.out; cancel=ctok)
+    @test_throws CancellationRequest write(p.in, zeros(UInt8, 8); cancel=ctok)
+    @test_throws CancellationRequest write(p.in, "hello"; cancel=ctok)
+    @test_throws CancellationRequest write(p.in, "a", "b"; cancel=ctok)
+    @test_throws CancellationRequest flush(p.in; cancel=ctok)
+    @test_throws CancellationRequest sleep(10; cancel=ctok)
+    @test_throws CancellationRequest wait(Timer(10); cancel=ctok)
+    @test_throws CancellationRequest run(`sleep 5`; cancel=ctok)
+    @test_throws CancellationRequest success(`sleep 5`; cancel=ctok)
+    @test_throws CancellationRequest read(`sleep 5`; cancel=ctok)
+    @test_throws CancellationRequest readchomp(`sleep 5`; cancel=ctok)
+    @test_throws CancellationRequest Sockets.getalladdrinfo("localhost"; cancel=ctok)
+    @test_throws CancellationRequest Sockets.getaddrinfo("localhost"; cancel=ctok)
+    @test_throws CancellationRequest Sockets.getnameinfo(Sockets.localhost; cancel=ctok)
+    @test_throws CancellationRequest FileWatching.watch_file(tempdir(), 5.0; cancel=ctok)
+    @test_throws CancellationRequest FileWatching.poll_fd(Base._fd(p.out), 5.0; readable=true, cancel=ctok)
+
+    # `cancel = nothing` shadows an (already cancelled) outer scope
+    write(p.in, "ab\n")
+    with(CANCEL_TOKEN => ctok) do
+        @test read(p.out, 2; cancel=nothing) == b"ab"
+    end
+    close(p)
+
+    # live cancellation through an explicit token: blocked read
+    p2 = Pipe()
+    Base.link_pipe!(p2, reader_supports_async=true, writer_supports_async=true)
+    src = CancellationTokenSource()
+    t = @async read(p2.out, 10; cancel=CancellationToken(src))
+    spin()
+    cancel!(src)
+    @test_throws TaskFailedException wait(t)
+    @test t.result isa CancellationRequest
+    close(p2)
+
+    # live cancellation: blocked write
+    p3 = Pipe()
+    Base.link_pipe!(p3, reader_supports_async=true, writer_supports_async=true)
+    src3 = CancellationTokenSource()
+    big = zeros(UInt8, 200_000_000)
+    t3 = @async write(p3.in, big; cancel=CancellationToken(src3))
+    sleep(0.5)
+    cancel!(src3)
+    @test_throws TaskFailedException wait(t3)
+    @test t3.result isa CancellationRequest
+    close(p3)
+
+    # live cancellation: Sockets.accept and recv with explicit tokens
+    port, server = Sockets.listenany(Sockets.localhost, 0)
+    src4 = CancellationTokenSource()
+    t4 = @async Sockets.accept(server; cancel=CancellationToken(src4))
+    spin()
+    cancel!(src4)
+    @test_throws TaskFailedException wait(t4)
+    @test t4.result isa CancellationRequest
+    close(server)
+
+    udp = Sockets.UDPSocket()
+    Sockets.bind(udp, Sockets.localhost, 0)
+    src5 = CancellationTokenSource()
+    t5 = @async Sockets.recv(udp; cancel=CancellationToken(src5))
+    spin()
+    cancel!(src5)
+    @test_throws TaskFailedException wait(t5)
+    @test t5.result isa CancellationRequest
+    close(udp)
+
+    # live cancellation: FileWatching.watch_file with an explicit token
+    path = tempname()
+    touch(path)
+    src6 = CancellationTokenSource()
+    t6 = @async FileWatching.watch_file(path, 100.0; cancel=CancellationToken(src6))
+    spin()
+    cancel!(src6)
+    @test_throws TaskFailedException wait(t6)
+    @test t6.result isa CancellationRequest
+    rm(path)
+
+    # live cancellation: run with an explicit token; the child process is
+    # not reaped by the cancelled wait
+    src7 = CancellationTokenSource()
+    t7 = @async run(`sleep 5`; cancel=CancellationToken(src7))
+    sleep(0.5)
+    cancel!(src7)
+    @test_throws TaskFailedException wait(t7)
+    @test t7.result isa CancellationRequest
+end
+
+@testset "cancellation of blocked stream writes" begin
+    p = Pipe()
+    Base.link_pipe!(p, reader_supports_async=true, writer_supports_async=true)
+    try
+        # A write far exceeding the OS pipe buffer blocks until cancelled
+        big = zeros(UInt8, 200_000_000)
+        t, src = cancellable(() -> write(p, big))
+        @test timedwait(() -> parked_on(t, p.in), 10.0) == :ok
+        cancel!(src)
+        @test_throws TaskFailedException wait(t)
+        @test t.result isa CancellationRequest
+    finally
+        close(p)
+    end
+end
+
+@testset "cancellation of closewrite (shutdown) waits" begin
+    p = Pipe()
+    Base.link_pipe!(p, reader_supports_async=true, writer_supports_async=true)
+    try
+        # A blocked write keeps the shutdown request (which queues behind it)
+        # from completing; the closewrite wait must still be interruptible.
+        big = zeros(UInt8, 200_000_000)
+        tw, srcw = cancellable(() -> write(p, big))
+        @test timedwait(() -> parked_on(tw, p.in), 10.0) == :ok
+        ts, srcs = cancellable(() -> closewrite(p.in))
+        @test timedwait(() -> parked_on(ts, p.in), 5.0) == :ok
+        cancel!(srcs)
+        @test_throws TaskFailedException wait(ts)
+        @test ts.result isa CancellationRequest
+        cancel!(srcw)
+        @test_throws TaskFailedException wait(tw)
+    finally
+        close(p)
+    end
+end
+
+@testset "cancelled condition waiter reacquiring a contended lock" begin
+    # A cancelled `wait(::Threads.Condition)` must rethrow the
+    # CancellationRequest after reacquiring the condition lock, even when
+    # the reacquire is contended: the waiter's stale (lazily collected)
+    # condition-queue entry stays linked while it parks on the lock with a
+    # fresh wait entry, and must not corrupt either queue.
+    cond = Threads.Condition()
+    src = Base.CancellationTokenSource()
+    waiter_result = Channel{Any}(1)
+    waiter = Threads.@spawn begin
+        try
+            Base.ScopedValues.with(Base.CANCEL_TOKEN => Base.CancellationToken(src)) do
+                lock(cond)
+                try
+                    wait(cond)
+                finally
+                    unlock(cond)
+                end
+            end
+            put!(waiter_result, :completed)
+        catch e
+            put!(waiter_result, e)
+        end
+    end
+    # wait until the waiter is parked on the condition
+    @test timedwait(10) do
+        lock(cond)
+        parked = !isempty(cond)
+        unlock(cond)
+        parked
+    end === :ok
+    # a holder keeps the condition lock while the cancellation is delivered
+    held = Base.Event()
+    release = Base.Event()
+    holder = Threads.@spawn begin
+        lock(cond)
+        notify(held)
+        wait(release; cancel=nothing)
+        unlock(cond)
+    end
+    wait(held)
+    Base.cancel!(src)
+    # give the woken waiter time to reach the contended reacquire and park
+    sleep(0.5)
+    notify(release)
+    wait(waiter)
+    result = take!(waiter_result)
+    @test result isa Base.CancellationRequest
+    # the condition lock must be intact and uncontended afterwards
+    @test trylock(cond.lock)
+    unlock(cond.lock)
+    wait(holder)
+end
