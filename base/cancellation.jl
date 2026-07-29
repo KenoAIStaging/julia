@@ -90,6 +90,10 @@ frozen in place and never scheduled again.
 """
 const CANCEL_REQUEST_ABANDON_ALL = CancellationRequest(0x4)
 
+# A request's payload is the plain severity under the simplified state
+# encoding; kept as an accessor for the delivery layer's comparisons.
+severity(cr::CancellationRequest) = cr.request
+
 """
     cancel_severity(src::CancellationTokenSource) -> Union{Nothing, CancellationRequest}
     cancel_severity(tok::CancellationToken)
@@ -615,4 +619,22 @@ end
     cancel === DEFAULT_CANCEL && return f()
     tok = check_cancel_arg(cancel)
     return _run_with_cancel_token(f, tok)
+end
+
+# The severity of the current dynamic scope's cancellation, or `nothing` if
+# the scope is not cancelled (or there is no scoped token).
+function ambient_cancel_severity()
+    src = default_cancel_source()
+    src === nothing && return nothing
+    return cancel_severity(src)
+end
+
+# Whether the current dynamic scope was cancelled at a severity that directs
+# it to abandon external (I/O) waits without safe teardown. External wait
+# entry points consult this: when true, they must not park waiting for
+# external resources (they issue their operation, if any, and return
+# immediately).
+function abandoning_external_waits()
+    sev = ambient_cancel_severity()
+    return sev !== nothing && severity(sev) >= severity(CANCEL_REQUEST_ABANDON_EXTERNAL)
 end
