@@ -457,6 +457,11 @@ Constant *literal_pointer_val_slot(jl_codegen_params_t &params, Module *M, jl_va
 {
     // emit a pointer to a jl_value_t* which will allow it to be valid across reloading code
     // also, try to give it a nice name for gdb, for easy identification
+    //
+    // NOTE: the gvar slot this creates is NOT a GC root; under `--trim` it may
+    // become the only reference to an image object. See the GC INVARIANT
+    // comment at jl_update_all_gvars in staticdata.c (#61474,
+    // test/trimming/gc_image_wb.jl).
     if (JuliaVariable *gv = julia_const_gv(p)) {
         // if this is a known special object, use the existing GlobalValue
         return prepare_global_in(M, gv);
