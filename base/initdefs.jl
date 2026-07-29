@@ -514,7 +514,34 @@ function _atexit(exitcode::Cint)
     # this exit came from a signal for example), then try to clear that state
     # to minimize scheduler issues later
     ct = current_task()
-    q = ct.queue; q === nothing || list_deletefirst!(q::StickyWorkqueue, ct)
+    q = ct.queue
+    if q !== nothing
+        try
+            list_deletefirst!(q::StickyWorkqueue, ct)
+        catch
+            # best-effort cleanup on the way out
+        end
+    end
+    w = @atomicswap ct.waiting_on = nothing
+    if w isa WaitEntry
+        # If this task's wait registration is still armed (e.g. this exit
+        # came from a signal while parked), best-effort detach it from its
+        # source's waiter list; the waitee-queue entry is stale and gets
+        # dropped by whoever pops it.
+        tok = w.token
+        if tok isa CancellationTokenSource
+            try
+                unregister_cancellation!(tok, w)
+            catch
+            end
+        end
+    end
+    # We are exiting: any pending cancellation of this task's scope is moot
+    # and would only disrupt the atexit hooks - run them in a shielded scope.
+    return ScopedValues.@with(CANCEL_TOKEN => nothing, _run_atexit_hooks(exitcode))
+end
+
+function _run_atexit_hooks(exitcode::Cint)
     # Don't hold the lock around the iteration, just in case any other thread executing in
     # parallel tries to register a new atexit hook while this is running. We don't want to
     # block that thread from proceeding, and we can allow it to register its hook which we

@@ -392,10 +392,11 @@ task.
 !!! compat "Julia 1.1"
     `v` now gets converted to the channel's type with [`convert`](@ref) as `put!` is called.
 """
-function put!(c::Channel{T}, v) where T
+function put!(c::Channel{T}, v; cancel::CancelTokenArg=DEFAULT_CANCEL) where T
     check_channel_state(c)
     v = convert(T, v)
-    return isbuffered(c) ? put_buffered(c, v) : put_unbuffered(c, v)
+    cancel === DEFAULT_CANCEL || (cancel = check_cancel_arg(cancel))
+    return isbuffered(c) ? put_buffered(c, v, cancel) : put_unbuffered(c, v, cancel)
 end
 
 # Atomically update channel n_avail, *assuming* we hold the channel lock.
@@ -408,16 +409,19 @@ function _increment_n_avail(c, inc)
     @atomic :monotonic c.n_avail_items = newlen
 end
 
-function put_buffered(c::Channel, v)
+function put_buffered(c::Channel, v, cancel::CancelTokenArg=DEFAULT_CANCEL)
     lock(c)
     did_buffer = false
     try
         # Increment channel n_avail eagerly (before push!) to count data in the
         # buffer as well as offers from tasks which are blocked in wait().
         _increment_n_avail(c, 1)
-        while length(c.data) == c.sz_max
-            check_channel_state(c)
-            wait(c.cond_put)
+        if length(c.data) == c.sz_max
+            tok = resolve_cancel_token(cancel)
+            while length(c.data) == c.sz_max
+                check_channel_state(c)
+                wait(c.cond_put, tok)
+            end
         end
         check_channel_state(c)
         push!(c.data, v)
@@ -433,16 +437,17 @@ function put_buffered(c::Channel, v)
     return v
 end
 
-function put_unbuffered(c::Channel, v)
+function put_unbuffered(c::Channel, v, cancel::CancelTokenArg=DEFAULT_CANCEL)
     lock(c)
     taker = try
         _increment_n_avail(c, 1)
+        tok = resolve_cancel_token(cancel)
         local taker
         while true
             while isempty(c.cond_take.waitq)
                 check_channel_state(c)
                 notify(c.cond_wait)
-                wait(c.cond_put)
+                wait(c.cond_put, tok)
             end
             check_channel_state(c)
             # unfair scheduled version of: notify(c.cond_take, v, false, false); yield()
@@ -489,13 +494,19 @@ julia> collect(c)  # item is not removed
  3
 ```
 """
-fetch(c::Channel) = isbuffered(c) ? fetch_buffered(c) : fetch_unbuffered(c)
-function fetch_buffered(c::Channel)
+function fetch(c::Channel; cancel::CancelTokenArg=DEFAULT_CANCEL)
+    cancel === DEFAULT_CANCEL || (cancel = check_cancel_arg(cancel))
+    return isbuffered(c) ? fetch_buffered(c, cancel) : fetch_unbuffered(c)
+end
+function fetch_buffered(c::Channel, cancel::CancelTokenArg=DEFAULT_CANCEL)
     lock(c)
     try
-        while isempty(c.data)
-            check_channel_state(c)
-            wait(c.cond_take)
+        if isempty(c.data)
+            tok = resolve_cancel_token(cancel)
+            while isempty(c.data)
+                check_channel_state(c)
+                wait(c.cond_take, tok)
+            end
         end
         return c.data[1]
     finally
@@ -534,13 +545,19 @@ julia> take!(c)
 1
 ```
 """
-take!(c::Channel) = isbuffered(c) ? take_buffered(c) : take_unbuffered(c)
-function take_buffered(c::Channel)
+function take!(c::Channel; cancel::CancelTokenArg=DEFAULT_CANCEL)
+    cancel === DEFAULT_CANCEL || (cancel = check_cancel_arg(cancel))
+    return isbuffered(c) ? take_buffered(c, cancel) : take_unbuffered(c, cancel)
+end
+function take_buffered(c::Channel, cancel::CancelTokenArg=DEFAULT_CANCEL)
     lock(c)
     try
-        while isempty(c.data)
-            check_channel_state(c)
-            wait(c.cond_take)
+        if isempty(c.data)
+            tok = resolve_cancel_token(cancel)
+            while isempty(c.data)
+                check_channel_state(c)
+                wait(c.cond_take, tok)
+            end
         end
         v = popfirst!(c.data)
         _increment_n_avail(c, -1)
@@ -552,12 +569,12 @@ function take_buffered(c::Channel)
 end
 
 # 0-size channel
-function take_unbuffered(c::Channel{T}) where T
+function take_unbuffered(c::Channel{T}, cancel::CancelTokenArg=DEFAULT_CANCEL) where T
     lock(c)
     try
         check_channel_state(c)
         notify(c.cond_put, nothing, false, false)
-        return wait(c.cond_take)::T
+        return wait(c.cond_take, resolve_cancel_token(cancel))::T
     finally
         unlock(c)
     end
@@ -678,13 +695,17 @@ julia> istaskdone(task)  # task is now unblocked
 true
 ```
 """
-function wait(c::Channel)
+function wait(c::Channel; cancel::CancelTokenArg=DEFAULT_CANCEL)
+    cancel === DEFAULT_CANCEL || (cancel = check_cancel_arg(cancel))
     isready(c) && return
     lock(c)
     try
-        while !isready(c)
-            check_channel_state(c)
-            wait(c.cond_wait)
+        if !isready(c)
+            tok = resolve_cancel_token(cancel)
+            while !isready(c)
+                check_channel_state(c)
+                wait(c.cond_wait, tok)
+            end
         end
     finally
         unlock(c)
