@@ -190,8 +190,11 @@ pub unsafe fn scan_julia_object<SV: SlotVisitor<JuliaVMSlot>>(obj: Address, clos
             // (strong) `parent` slot of each entry is traced; `child_head`
             // and the `next`/`pprev` slots are weak references with
             // unlink-on-death semantics (see jl_gc_sweep_weak_processing)
-            // and must not be traced.
+            // and must not be traced. The waiter-list head/tail are strong
+            // fixed slots.
             let cs = obj.to_ptr::<jl_cancel_source_t>();
+            process_slot(closure, obj + offset_of!(jl_cancel_source_t, waiters_head));
+            process_slot(closure, obj + offset_of!(jl_cancel_source_t, waiters_tail));
             let np = (*cs).nparents as usize;
             let mut slot = obj + std::mem::size_of::<jl_cancel_source_t>();
             for _ in 0..np {

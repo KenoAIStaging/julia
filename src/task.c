@@ -1743,7 +1743,10 @@ JL_DLLEXPORT jl_value_t *jl_new_cancel_source(jl_value_t **parents, size_t np)
             jl_gc_set_weak_processing_target(ct->ptls, parents[i]);
     }
     jl_atomic_store_relaxed(&src->child_head, jl_nothing);
+    src->waiters_head = jl_nothing;
+    src->waiters_tail = jl_nothing;
     jl_atomic_store_relaxed(&src->state, 0);
+    jl_atomic_store_relaxed(&src->_lock, 0);
     src->nparents = (uint16_t)np;
     // Initialize every link entry before publishing the node under *any*
     // parent: a concurrent cancellation walk that reaches the node through

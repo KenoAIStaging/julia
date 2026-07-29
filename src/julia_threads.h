@@ -283,10 +283,19 @@ struct _jl_cancel_source_t {
     // Weak (spliced by the GC): most recently attached live child;
     // `jl_nothing`-terminated. Union{Nothing, CancellationTokenSource}.
     _Atomic(jl_value_t*) child_head;
+    // Parked waiters: an intrusive doubly-linked list of `Base.WaitEntry`
+    // registrations (their `tnext`/`tprev` halves), where the cancellation
+    // walk finds tasks blocked under this source. Strong references (the
+    // GC's special-cased marking traces them), guarded by `_lock`.
+    jl_value_t *waiters_head;   // Union{Nothing, Base.WaitEntry}
+    jl_value_t *waiters_tail;
     // 0x00 = uncancelled; otherwise the (nonzero) severity at which the
     // source is cancelled (0x1 SAFE, 0x3 ABANDON_EXTERNAL, 0x4 ABANDON_ALL).
     // Monotonic (CAS-max).
     _Atomic(uint8_t) state;
+    // Spinlock guarding the waiter list only; attachment and state stay
+    // lock-free (see the concurrency notes above).
+    _Atomic(uint8_t) _lock;
     // Number of parent links following the fixed fields. Const.
     uint16_t nparents;
     // jl_cancel_parent_link_t links[nparents];  (see jl_cancel_source_links)
