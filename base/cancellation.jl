@@ -11,8 +11,8 @@
 # may only *react* to cancellation; the source is the capability to *request*
 # it.
 #
-# For convenience, the scoped value `CANCEL_TOKEN` carries the governing token
-# carries the default cancellation token.
+# For convenience, the scoped value `CANCEL_TOKEN` carries the default
+# cancellation token governing the current dynamic extent.
 
 const CancellationTokenSource = Core.CancellationTokenSource
 
@@ -179,6 +179,170 @@ function _raise_state!(src::CancellationTokenSource, sev::UInt8)
     end
 end
 
+## Wait registrations (used by condition.jl and every parked wait)
+
+# A task's registration on a wait queue. All fields are plain: `next` and
+# `queue` are protected by the waitee's lock (`queue` holds the queue's
+# identity - see `waitqueue` - while the entry is enqueued, acting as the
+# "am I registered, and on what" witness, and `nothing` otherwise); `task`
+# is written by the owning task before enqueueing, so it is ordered by the
+# same lock for lock-holding readers.
+#
+# The wake-claim protocol: a parked task `t` points to its current
+# registration through the atomic field `t.waiting_on`. Whoever wants to wake
+# it must first claim the wake by atomically clearing that field:
+#
+#   - `notify` (holding the waitee's lock) pops an entry `w` and claims via
+#     CAS(t.waiting_on, w => nothing). The expected-value CAS makes stale
+#     entries harmless: if `t` was interrupted and has since registered
+#     elsewhere, the CAS fails and the popped corpse is simply dropped.
+#   - an interrupter (`schedule(t, exc, error=true)`) claims via an
+#     unconditional swap: it is directed at the *task*, not at any particular
+#     wait, so claiming whatever `t` is currently registered on is correct.
+#     It then opportunistically unlinks the claimed entry under the waitee's
+#     lock via `trylock` (see `try_unlink_claimed!`); if the lock is
+#     unavailable the entry stays linked and is collected lazily, either by
+#     the interrupted task's own wait cleanup or by the `notify` that pops
+#     and drops it. The cancellation walk claims like `notify` (expected-entry
+#     CAS) but leaves the entry linked for the same lazy collection.
+#   - wake sources directed at one *specific* wait (e.g. the timeout task of
+#     `Experimental.wait_with_timeout`) must register the wait with a fresh,
+#     single-use entry: single-use-ness is what guarantees their
+#     expected-value CAS cannot mistakenly claim a later, unrelated wait.
+#
+# Entries are heap objects. A task whose interrupted wait left a stale registration
+# behind can immediately register anew - e.g. park on a lock during its cleanup - with a fresh entry.
+mutable struct WaitEntry
+    task::Union{Task, Nothing}
+    next::Union{WaitEntry, Nothing}
+    queue::Any
+    # The cancellation half of the registration: while the wait runs under a
+    # cancellation token, `token` holds its source and `tnext`/`tprev` link
+    # this entry into that source's waiter list (guarded by the source's
+    # `_lock`), where the cancellation walk finds and claims the parked
+    # task. `min_severity` admits teardown waits that re-park until an
+    # escalation. See `register_cancellation!`.
+    token::Union{Nothing, Core.CancellationTokenSource}
+    tnext::Union{Nothing, WaitEntry}
+    tprev::Union{Nothing, WaitEntry}
+    min_severity::UInt8
+    WaitEntry(task::Union{Task, Nothing}) =
+        new(task, nothing, nothing, nothing, nothing, nothing, 0x00)
+end
+
+# Return the cached entry of `waiter` if it is free, else a fresh (and newly
+# cached) one.
+function _cached_wait_entry(waiter::Task)
+    w = waiter.cached_wait_entry
+    if w isa WaitEntry && w.queue === nothing
+        w.task = waiter
+    else
+        w = WaitEntry(waiter)
+        waiter.cached_wait_entry = w
+    end
+    return w
+end
+
+@noinline function _wait_registration_error()
+    throw(ConcurrencyViolationError("Task is already registered on a wait queue"))
+end
+
+# Publish `w` as `waiter`'s only armed wait registration.
+function _arm_wait(waiter::Task, w::WaitEntry)
+    armed = @atomicreplace :release :monotonic waiter.waiting_on nothing => w
+    armed.success || _wait_registration_error()
+    return w
+end
+
+# Claim the wake of the wait that `w` was registered for (returns whether the
+# claim succeeded). `w` must be an entry armed for `t` by `_wait2`.
+function claim_wait(t::Task, w::WaitEntry)
+    return (@atomicreplace t.waiting_on w => nothing).success
+end
+
+## Waiter registration
+
+# Spinlock guarding a source's waiter list only; attachment and state stay
+# lock-free (see the C-side concurrency notes on jl_cancel_source_t).
+@inline function _lock_source(src::CancellationTokenSource)
+    while !(@atomicreplace :acquire :monotonic src._lock 0x00 => 0x01).success
+        ccall(:jl_cpu_suspend, Cvoid, ())
+    end
+    return nothing
+end
+@inline function _unlock_source(src::CancellationTokenSource)
+    @atomic :release src._lock = 0x00
+    return nothing
+end
+
+# Register the armed wait entry `w` (see `_wait2`/`_arm_wait`) on `src`'s
+# waiter list, so the cancellation walk can find and claim the parked task.
+# Refuses (returns `false`) when `src` is already cancelled at or above
+# `min_severity`: the caller delivers the cancellation itself instead of
+# parking. `min_severity` admits teardown waits that must survive lower
+# severities and re-park until an escalation.
+function register_cancellation!(src::CancellationTokenSource, w::WaitEntry;
+                                min_severity::UInt8=0x00)
+    _lock_source(src)
+    st = @atomic :monotonic src.state
+    if st != 0x00 && st >= min_severity
+        _unlock_source(src)
+        return false
+    end
+    w.token = src
+    w.min_severity = min_severity
+    tail = src.waiters_tail
+    w.tprev = tail isa WaitEntry ? tail : nothing
+    w.tnext = nothing
+    if tail isa WaitEntry
+        tail.tnext = w
+    else
+        src.waiters_head = w
+    end
+    src.waiters_tail = w
+    _unlock_source(src)
+    return true
+end
+
+# Remove `w` from `src`'s waiter list; a no-op if the cancellation walk
+# already unlinked it.
+function unregister_cancellation!(src::CancellationTokenSource, w::WaitEntry)
+    _lock_source(src)
+    if w.tprev !== nothing || w.tnext !== nothing || src.waiters_head === w
+        _unlink_waiter!(src, w)
+    end
+    w.token = nothing
+    _unlock_source(src)
+    return nothing
+end
+
+# Deliver the cancellation that made `register_cancellation!` refuse (the
+# caller has already withdrawn its partial registration and released any
+# locks the throw must not hold).
+@noinline function _deliver_refused_cancellation(src::CancellationTokenSource)
+    checkcancel(src)
+    error("cancellation registration refused, but the source is not cancelled")
+end
+
+# caller must hold src's lock and have checked membership
+function _unlink_waiter!(src::CancellationTokenSource, w::WaitEntry)
+    prev = w.tprev
+    next = w.tnext
+    if prev === nothing
+        src.waiters_head = next === nothing ? nothing : next
+    else
+        prev.tnext = next
+    end
+    if next === nothing
+        src.waiters_tail = prev === nothing ? nothing : prev
+    else
+        next.tprev = prev
+    end
+    w.tnext = nothing
+    w.tprev = nothing
+    return nothing
+end
+
 ## Cancellation
 #
 # Cancellation is uniformly level-triggered: while the governing token is
@@ -210,12 +374,19 @@ function cancel!(src::CancellationTokenSource,
         throw(ArgumentError("invalid cancellation severity $(repr(request.request))"))
     end
     raised = _raise_state!(src, sev)
+    # Mark the cancelled subgraph (waking parked waiters): each node is
+    # marked before its children so a concurrent construction of a child
+    # source is level-triggered.
     _cancel_walk!(src, sev)
     Threads.atomic_fence_heavy()
     return raised
 end
 
 function _cancel_walk!(src::CancellationTokenSource, sev::UInt8)
+    # Iterative worklist (no recursion): a deep source chain must not
+    # overflow the canceller's stack, and a reconverging ("linked") graph
+    # must deliver at each node once, not once per path (deduplicated by the
+    # visited set).
     visited = IdSet{CancellationTokenSource}()
     push!(visited, src)
     pending = CancellationTokenSource[src]
@@ -228,8 +399,60 @@ end
 function _cancel_walk_node!(node::CancellationTokenSource, sev::UInt8,
                             pending::Vector{CancellationTokenSource},
                             visited::IdSet{CancellationTokenSource})
+    towake = nothing
+    _lock_source(node)
+    # Deliver at least the node's current severity: a concurrent higher-
+    # severity cancel! may have raised the state after this walk's own
+    # transition, and its walk can find the waiters already unlinked by
+    # this one - the claim below must then honor the escalated request.
+    # (Read under the node's lock so the claim section below cannot act on
+    # a stale, lower severity.) seq_cst, matching the C-side propagate: when
+    # this walk's own raise of the node was lost, this load is the walk's
+    # sole operation on the state that can order the winner's write before
+    # the child_head read below.
     st = @atomic :sequentially_consistent node.state
     sev < st && (sev = st)
+    creq = CancellationRequest(sev)
+    # Claim and unlink waiters at this node. The actual wakes happen after
+    # the lock is released: waiters take their waitee's lock *before* this
+    # node's lock, so waking (which may take other locks) under it could
+    # deadlock.
+    w = node.waiters_head
+    while w isa WaitEntry
+        wnext = w.tnext
+        if w.min_severity <= sev
+            t = w.task
+            claimed = t isa Task && (@atomicreplace t.waiting_on w => nothing).success
+            _unlink_waiter!(node, w)
+            w.token = nothing
+            if claimed
+                towake = (t::Task, towake)
+            end
+            # !claimed: a completion (or another interrupter) won the race;
+            # the waiter resumes normally and unregisters its (now unlinked)
+            # entry itself.
+        end
+        w = wnext
+    end
+    _unlock_source(node)
+    while towake !== nothing
+        (t, towake) = towake::Tuple{Task, Any}
+        # The claimed wait-queue entry stays linked; the waiter's own
+        # cleanup (or a later notify) lazily unlinks it.
+        # N.B.: an ABANDON_ALL request currently also delivers by
+        # interruption; freezing the task in place instead arrives with the
+        # escalation machinery.
+        schedule(t, creq, error=true)
+    end
+    # Walk the node's (weak, intrusive) child list, advancing every child to
+    # this severity and queueing the ones not yet visited (a reconverging
+    # graph must deliver at each node once, not once per path). The seq_cst
+    # `child_head` read below (paired with the seq_cst state access above)
+    # closes the race against a concurrent attach: a child that this read
+    # misses was published after our state write, so its constructor
+    # observes that write and the child is born at (at least) this severity.
+    # Children attached concurrently *during* the walk are prepended before
+    # the list positions already traversed and are likewise born cancelled.
     c = @atomic node.child_head
     while c !== nothing
         c = c::CancellationTokenSource
@@ -287,7 +510,9 @@ macro cancel_check(tok)
 end
 
 # Throw the `CancellationRequest` if `src` is cancelled (level-triggered:
-# no per-task state is consulted).
+# no per-task state is consulted). This is the entry check of every blocking
+# API taking a `cancel` keyword argument: it must run *before* the operation
+# has any side effects.
 @inline function checkcancel(src::CancellationTokenSource)
     st = @atomic :monotonic src.state
     st == 0x00 && return nothing
@@ -339,4 +564,55 @@ end
     tok = default_cancel_token()
     tok === nothing && return nothing
     return (tok::CancellationToken).source
+end
+
+## `cancel` keyword-argument plumbing
+
+# The sentinel default for `cancel` keyword arguments: "use the scoped
+# default token". Resolution to a concrete token happens once, at the first
+# potential-block point of an operation, so fast paths never pay for the
+# scope lookup. `cancel = nothing` makes a wait explicitly non-cancellable.
+#
+# N.B.: a resolved token (`Union{Nothing, CancellationToken}`) is passed
+# through *positional* arguments internally: passing the union as a keyword
+# argument builds an abstractly-typed NamedTuple whose kwcall the optimizer
+# cannot devirtualize (which, among other things, breaks `juliac --trim`).
+struct UseDefaultToken end
+const DEFAULT_CANCEL = UseDefaultToken()
+const CancelTokenArg = Union{UseDefaultToken, CancellationToken, Nothing}
+const MaybeToken = Union{Nothing, CancellationToken}
+
+@inline resolve_cancel_token(::UseDefaultToken) = default_cancel_token()
+@inline resolve_cancel_token(tok::Union{CancellationToken, Nothing}) = tok
+
+# The entry check of a public API taking a `cancel` keyword argument:
+# resolve the token and throw if it is already cancelled (uniformly
+# level-triggered for the scoped default and explicit tokens alike).
+@inline function check_cancel_arg(cancel::CancelTokenArg)
+    tok = resolve_cancel_token(cancel)
+    tok === nothing || checkcancel(tok.source)
+    return tok
+end
+
+# Run `f()` in a dynamic scope governed by `tok` - the raw `Scope` form of
+# `ScopedValues.@with(CANCEL_TOKEN => tok, f())`, which is not yet available
+# at this point of bootstrap.
+@eval function _run_with_cancel_token(f, tok::Union{Nothing, CancellationToken})
+    $(Expr(:tryfinally, :(f()), nothing,
+           :(Scope(Core.current_scope()::Union{Nothing, Scope}, CANCEL_TOKEN => tok))))
+end
+
+# Implementation of a `cancel` keyword argument as dynamic-scope sugar: with
+# the default sentinel, run `f()` as-is (zero overhead; `f`'s blocking points
+# resolve the scoped token themselves); with an explicit argument, check it
+# (throwing before any side effect) and run `f()` in a scope governed by it.
+# This composes with *any* implementation underneath `f` - including methods
+# of user-defined types that know nothing about cancellation keywords - as
+# long as its blocking points use the standard wait machinery. Passing
+# `cancel = nothing` shadows an outer token, making `f`'s waits
+# non-cancellable.
+@inline function _with_cancel_arg(f, cancel::CancelTokenArg)
+    cancel === DEFAULT_CANCEL && return f()
+    tok = check_cancel_arg(cancel)
+    return _run_with_cancel_token(f, tok)
 end
