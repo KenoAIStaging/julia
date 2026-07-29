@@ -97,7 +97,7 @@ typedef struct {
     // Timestamp of the last incremental GC sweep in nanoseconds
     uint64_t last_incremental_sweep;
     // Number of tracked image objects referencing non-image objects
-    uint64_t image_remset_size;
+    uint64_t image_mutated_roots_size;
 } jl_gc_num_t;
 
 // ========================================================================= //

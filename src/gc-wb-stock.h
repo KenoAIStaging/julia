@@ -31,7 +31,7 @@ STATIC_INLINE void jl_gc_multi_wb(const void *parent, const jl_value_t *ptr) JL_
     // ptr is an immutable object
     if (__likely(jl_astaggedvalue(parent)->bits.gc != 3 /* GC_OLD_MARKED */))
         return; // parent is young or in remset
-    if (__unlikely(jl_astaggedvalue(parent)->bits.in_image == 1 /* GC_IN_IMAGE_NOT_REMSET */)) {
+    if (__unlikely(jl_astaggedvalue(parent)->bits.in_image == 1 /* GC_IN_IMAGE_NOT_MUTATED */)) {
         // GC_MARKED optimizations are invalid for generations >= 2
         jl_gc_queue_root((jl_value_t*)parent);
         return;
@@ -51,7 +51,7 @@ STATIC_INLINE void jl_gc_wb_genericmemory_copy_boxed(const jl_value_t *dest_owne
     if (__unlikely(jl_astaggedvalue(dest_owner)->bits.gc == 3 /* GC_OLD_MARKED */ )) {
         jl_value_t *src_owner = jl_genericmemory_owner(src);
         size_t done = 0;
-        if (__unlikely(jl_astaggedvalue(dest_owner)->bits.in_image == 1 /* GC_IN_IMAGE_NOT_REMSET */)) {
+        if (__unlikely(jl_astaggedvalue(dest_owner)->bits.in_image == 1 /* GC_IN_IMAGE_NOT_MUTATED */)) {
             // GC_MARKED optimizations are invalid for generations >= 2
             jl_gc_queue_root(dest_owner);
             return;
@@ -97,7 +97,7 @@ STATIC_INLINE void jl_gc_wb_genericmemory_copy_ptr(const jl_value_t *owner, jl_g
                                           size_t n, jl_datatype_t *dt) JL_NOTSAFEPOINT
 {
     if (__unlikely(jl_astaggedvalue(owner)->bits.gc == 3 /* GC_OLD_MARKED */)) {
-        if (__unlikely(jl_astaggedvalue(owner)->bits.in_image == 1 /* GC_IN_IMAGE_NOT_REMSET */)) {
+        if (__unlikely(jl_astaggedvalue(owner)->bits.in_image == 1 /* GC_IN_IMAGE_NOT_MUTATED */)) {
             // GC_MARKED optimizations are invalid for generations >= 2
             jl_gc_queue_root(owner);
             return;

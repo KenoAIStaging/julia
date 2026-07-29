@@ -73,7 +73,7 @@ struct GC_Num
     # Timestamp of the last incremental GC sweep in nanoseconds
     last_incremental_sweep::Int64
     # Number of tracked image objects referencing non-image objects
-    image_remset_size::Int64
+    image_mutated_roots_size::Int64
 end
 
 gc_num() = ccall(:jl_gc_num, GC_Num, ())

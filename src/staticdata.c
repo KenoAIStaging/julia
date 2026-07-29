@@ -2223,11 +2223,19 @@ static void jl_read_arraylist(ios_t *s, arraylist_t *list)
     ios_read(s, (char*)list->items, list_len * sizeof(void*));
 }
 
-// Persistent set of image objects that reference non-image objects.
-// Used to track GC reachability for mutable objects in the images,
-// treating them as a third, "permanent" GC generation.
-arraylist_t image_remset;
-jl_mutex_t image_remset_lock;
+// Image objects that have had pointers stored into them since the image was
+// loaded, treating image objects as a third, "permanent" GC generation.
+// This list is populated by write-barrier events like a remset, but it is
+// deliberately not named one: unlike the per-thread remsets it is append-only,
+// never cleared, and load-bearing for *reachability* rather than only for
+// generational precision. An entry may be reachable from nothing else (for
+// example an object referenced only by native-code gvar slots after `--trim`
+// strips its module bindings), and its runtime-allocated children stay alive
+// only because marking treats this list as a root set (see
+// gc_queue_image_mutated_roots). Clearing and rebuilding it — the usual remset
+// idiom — would therefore be a use-after-free, not merely a slowdown.
+arraylist_t image_mutated_roots;
+jl_mutex_t image_mutated_roots_lock;
 
 // jl_write_value and jl_read_value are used for storing Julia objects that are adjuncts to
 // the image proper. For example, new methods added to external callables require

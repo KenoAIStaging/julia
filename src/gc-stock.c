@@ -1661,14 +1661,16 @@ JL_DLLEXPORT void jl_gc_queue_root(const jl_value_t *ptr)
     if (header & GC_OLD) { // write barrier has not been triggered in this object yet
         arraylist_push(&ptls->gc_tls.heap.remset, (jl_value_t*)ptr);
         ptls->gc_tls.heap.remset_nptr++; // conservative
-        // Image objects are analogous to a third "permanent" GC
-        // generation, so here we maintain the remset for them.
-        if (__unlikely((header & GC_IN_IMAGE) && !(header & GC_IN_IMAGE_REMSET))) {
-            header = jl_atomic_fetch_or_relaxed((_Atomic(uintptr_t) *)&o->header, GC_IN_IMAGE_REMSET);
-            if (!(header & GC_IN_IMAGE_REMSET)) {
-                JL_LOCK_NOGC(&image_remset_lock);
-                arraylist_push(&image_remset, (void*)ptr);
-                JL_UNLOCK_NOGC(&image_remset_lock);
+        // Image objects are analogous to a third "permanent" GC generation:
+        // the first mutation enrolls them (once, permanently) in
+        // image_mutated_roots, which plays the role a remset would but is
+        // load-bearing for reachability (see its declaration in staticdata.c).
+        if (__unlikely((header & GC_IN_IMAGE) && !(header & GC_IN_IMAGE_MUTATED))) {
+            header = jl_atomic_fetch_or_relaxed((_Atomic(uintptr_t) *)&o->header, GC_IN_IMAGE_MUTATED);
+            if (!(header & GC_IN_IMAGE_MUTATED)) {
+                JL_LOCK_NOGC(&image_mutated_roots_lock);
+                arraylist_push(&image_mutated_roots, (void*)ptr);
+                JL_UNLOCK_NOGC(&image_mutated_roots_lock);
             }
         }
     }
@@ -1678,7 +1680,7 @@ JL_DLLEXPORT void jl_gc_wb_cold(const void *parent, const void *ptr) JL_NOTSAFEP
 {
     if (ptr == NULL)
         return;
-    if (jl_astaggedvalue(parent)->bits.in_image != 1 /* GC_IN_IMAGE_NOT_REMSET */ && // parent is not an unmarked image object
+    if (jl_astaggedvalue(parent)->bits.in_image != 1 /* GC_IN_IMAGE_NOT_MUTATED */ && // parent is not an unmarked image object
         (jl_astaggedvalue(ptr)->bits.gc & 1 /* GC_MARKED */) != 0) // ptr is old
         return;
     jl_gc_queue_root((jl_value_t*)parent);
@@ -3032,10 +3034,14 @@ static void gc_queue_remset(jl_gc_markqueue_t *mq, jl_ptls_t ptls2) JL_NOTSAFEPO
     ptls2->gc_tls.heap.remset_nptr = 0;
 }
 
-static void gc_queue_image_remset(jl_gc_markqueue_t *mq) JL_NOTSAFEPOINT
+// Queue the mutated image objects as roots: this list is barrier-populated
+// like a remset, but permanent and load-bearing for reachability — entries may
+// be reachable from nothing else (e.g. gvar-only image objects under `--trim`),
+// so it must never be cleared and is not named a remset.
+static void gc_queue_image_mutated_roots(jl_gc_markqueue_t *mq) JL_NOTSAFEPOINT
 {
-    size_t len = image_remset.len;
-    void **items = image_remset.items;
+    size_t len = image_mutated_roots.len;
+    void **items = image_mutated_roots.items;
     for (size_t i = 0; i < len; i++) {
         void *_v = items[i];
         jl_value_t *v = (jl_value_t *)((uintptr_t)_v | GC_REMSET_PTR_TAG);
@@ -3173,9 +3179,9 @@ JL_DLLEXPORT jl_gc_num_t jl_gc_num(void)
 {
     jl_gc_num_t num = gc_num;
     combine_thread_gc_counts(&num, 0);
-    JL_LOCK_NOGC(&image_remset_lock);
-    num.image_remset_size = image_remset.len;
-    JL_UNLOCK_NOGC(&image_remset_lock);
+    JL_LOCK_NOGC(&image_mutated_roots_lock);
+    num.image_mutated_roots_size = image_mutated_roots.len;
+    JL_UNLOCK_NOGC(&image_mutated_roots_lock);
     return num;
 }
 
@@ -3311,10 +3317,10 @@ static int _jl_gc_collect(jl_ptls_t ptls, jl_gc_collection_t collection) JL_NOTS
             }
         }
         gc_check_all_remsets_are_empty();
-        // 1.4. in a full sweep, enqueue image remset
+        // 1.4. after a full sweep, enqueue the mutated image objects
         // (image objects are a third, "permanent" GC generation)
         if (prev_sweep_full)
-            gc_queue_image_remset(mq);
+            gc_queue_image_mutated_roots(mq);
 
         // 2. walk roots
         gc_mark_roots(mq);
@@ -3969,8 +3975,8 @@ void jl_gc_init(void)
 {
     JL_MUTEX_INIT(&heapsnapshot_lock, "heapsnapshot_lock");
     JL_MUTEX_INIT(&finalizers_lock, "finalizers_lock");
-    JL_MUTEX_INIT(&image_remset_lock, "image_remset_lock");
-    arraylist_new(&image_remset, 0);
+    JL_MUTEX_INIT(&image_mutated_roots_lock, "image_mutated_roots_lock");
+    arraylist_new(&image_mutated_roots, 0);
     uv_mutex_init(&page_profile_lock);
     uv_mutex_init(&gc_perm_lock);
     uv_mutex_init(&gc_pages_lock);
