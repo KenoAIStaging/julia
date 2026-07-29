@@ -33,7 +33,7 @@ JULIAC_BUILDSCRIPT := $(shell $(JULIA) --startup-file=no -e 'print(joinpath(Sys.
 
 #=============================================================================
 
-release: $(BIN)/hello$(EXE) $(BIN)/trimmability$(EXE) $(BIN)/basic_jll$(EXE) $(BIN)/capplication$(EXE)
+release: $(BIN)/hello$(EXE) $(BIN)/trimmability$(EXE) $(BIN)/basic_jll$(EXE) $(BIN)/capplication$(EXE) $(BIN)/gc_image_wb$(EXE)
 
 # Complete any needed Pkg operations before trimming (some Pkg code may not be trimmable)
 Manifest.toml: $(SRCDIR)/Project.toml
@@ -48,6 +48,9 @@ $(BIN)/trimmability-o.a: $(SRCDIR)/trimmability.jl $(JULIAC_BUILDSCRIPT) Manifes
 $(BIN)/basic_jll-o.a: $(SRCDIR)/basic_jll.jl $(JULIAC_BUILDSCRIPT) Manifest.toml
 	$(JULIA) -t 1 -J $(JULIA_LIBDIR)/julia/sys.$(SHLIB_EXT) --startup-file=no --history-file=no --project=$(SRCDIR) --output-o $@ --output-incremental=no --strip-ir --strip-metadata --experimental --trim $(JULIAC_BUILDSCRIPT) $< --output-exe true
 
+$(BIN)/gc_image_wb-o.a: $(SRCDIR)/gc_image_wb.jl $(JULIAC_BUILDSCRIPT) Manifest.toml
+	$(JULIA) -t 1 -J $(JULIA_LIBDIR)/julia/sys.$(SHLIB_EXT) --startup-file=no --history-file=no --output-o $@ --output-incremental=no --strip-ir --strip-metadata --experimental --trim $(JULIAC_BUILDSCRIPT) $< --output-exe true
+
 $(BIN)/libsimple-o.a: $(SRCDIR)/libsimple.jl $(JULIAC_BUILDSCRIPT)
 	$(JULIA) -t 1 -J $(JULIA_LIBDIR)/julia/sys.$(SHLIB_EXT) --startup-file=no --history-file=no --output-o $@ --output-incremental=no --strip-ir --strip-metadata --experimental --trim $(JULIAC_BUILDSCRIPT) $< --output-lib true $(BIN)/bindinginfo_libsimple.json
 
@@ -60,14 +63,17 @@ $(BIN)/trimmability$(EXE): $(BIN)/trimmability-o.a
 $(BIN)/basic_jll$(EXE): $(BIN)/basic_jll-o.a
 	$(CC) -o $@ $(WHOLE_ARCHIVE) $< $(NO_WHOLE_ARCHIVE) $(CPPFLAGS_ADD) $(CPPFLAGS) $(CFLAGS_ADD) $(CFLAGS) $(LDFLAGS_ADD) $(LDFLAGS)
 
+$(BIN)/gc_image_wb$(EXE): $(BIN)/gc_image_wb-o.a
+	$(CC) -o $@ $(WHOLE_ARCHIVE) $< $(NO_WHOLE_ARCHIVE) $(CPPFLAGS_ADD) $(CPPFLAGS) $(CFLAGS_ADD) $(CFLAGS) $(LDFLAGS_ADD) $(LDFLAGS)
+
 $(BIN)/capplication$(EXE): $(SRCDIR)/capplication.c $(SRCDIR)/libsimple.h $(BIN)/libsimple-o.a
 	$(CC) -I$(BIN) -I$(SRCDIR) -I$(JULIA_LIBDIR) -o $@ $< -Wl,--whole-archive $(BIN)/libsimple-o.a -Wl,--no-whole-archive $(LDFLAGS_ADD) $(LDFLAGS) $(CPPFLAGS_ADD) $(CPPFLAGS) $(CFLAGS_ADD) $(CFLAGS)
 
-check: $(BIN)/hello$(EXE) $(BIN)/trimmability$(EXE) $(BIN)/basic_jll$(EXE) $(BIN)/capplication$(EXE)
+check: $(BIN)/hello$(EXE) $(BIN)/trimmability$(EXE) $(BIN)/basic_jll$(EXE) $(BIN)/capplication$(EXE) $(BIN)/gc_image_wb$(EXE)
 	$(JULIA) --startup-file=no --history-file=no --depwarn=error $(SRCDIR)/trimming.jl $<
 
 clean:
-	-rm -f $(BIN)/hello$(EXE) $(BIN)/trimmability$(EXE) $(BIN)/basic_jll$(EXE) $(BIN)/hello-o.a $(BIN)/trimmability-o.a $(BIN)/basic_jll-o.a $(BIN)/libsimple-o.a $(BIN)/libsimple.$(SHLIB_EXT) $(BIN)/capplication$(EXE) $(BIN)/bindinginfo_libsimple.json $(BIN)/Manifest.toml
+	-rm -f $(BIN)/hello$(EXE) $(BIN)/trimmability$(EXE) $(BIN)/basic_jll$(EXE) $(BIN)/hello-o.a $(BIN)/trimmability-o.a $(BIN)/basic_jll-o.a $(BIN)/libsimple-o.a $(BIN)/libsimple.$(SHLIB_EXT) $(BIN)/capplication$(EXE) $(BIN)/bindinginfo_libsimple.json $(BIN)/Manifest.toml $(BIN)/gc_image_wb$(EXE) $(BIN)/gc_image_wb-o.a
 
 .PHONY: release clean check
 

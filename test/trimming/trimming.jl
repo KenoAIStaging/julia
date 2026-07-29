@@ -25,6 +25,11 @@ let exe_suffix = splitext(Base.julia_exename())[2]
     @test lines[7] == "Version: 1.1.0"
     @test lines[8] == "# preferences: 0"
 
+    gc_image_wb_exe = joinpath(bindir, "gc_image_wb" * exe_suffix)
+    # regression test: write barriers/remsets must work for image-resident
+    # objects that are unreachable from the GC roots after trimming (#61474)
+    @test readchomp(`$gc_image_wb_exe`) == "survived"
+
     basic_jll_exe = joinpath(bindir, "basic_jll" * exe_suffix)
     lines = split(readchomp(`$basic_jll_exe`), "\n")
     @test lines[1] == "Julia! Hello, world!"
