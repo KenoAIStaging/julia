@@ -1575,6 +1575,18 @@ function _promote_one_island_cell!(ir::IR, I::StmtId, graph, cell::StmtId)
     for (bi, m, _) in Iterators.flatten((reads, isdefs))
         pos[m.id] < firstpos(bi) && (upx[bi] = true)
     end
+    # a threaded backedge consumes the reaching value at each `continue`
+    # exactly like a read at that position: seed liveness there so the
+    # store-join phi on its path survives pruning. Without the seed a
+    # read-free latch block is live-out dead, the phi is pruned, and the
+    # symbolic resolution below silently walks the idom chain to the ENTRY
+    # value — the carried cell then circulates its initial value forever
+    # (the `joinpath` accumulate-under-`||` miscompile)
+    for cont in thconts
+        cc = _island_container(ir, bidx, cont)::Tuple{Int,StmtId,Bool}
+        p = cc[2] == cont ? typemax(Int) : pos[cc[2].id]
+        isnull(storebefore(cc[1], p)) && (upx[cc[1]] = true)
+    end
     livein = falses(nb)
     changed = true
     while changed

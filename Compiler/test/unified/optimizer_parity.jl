@@ -559,4 +559,68 @@ op_gr_tuple() = (GlobalRef(OPGRData, :is_even), 1)        # plain data position
     end
 end
 
+# wave 13: a cell promoted inside a cfg ISLAND that a loop carries across
+# iterations threads its value through every `continue`. Block liveness was
+# seeded only from island READS, so a latch block that merely falls through
+# to the backedge counted as live-out dead: the store-join phi was pruned
+# and the `continue`'s carried value resolved through the idom chain to the
+# island ENTRY value. The carried cell then circulated its initial value
+# forever — `joinpath("/a", "b", "c")` returned `"/a"`, and
+# `test_path("Compiler")` the bare `@__DIR__`. The short-circuit `||` is
+# what keeps the loop body an unstructured island (a plain if/else in a
+# `for` structurizes and never reaches this pass).
+function op_accum_join(xs)
+    s = xs[1]
+    for i in 2:length(xs)
+        if isempty(s) || s[end] == '/'    # read-free latch after both arms
+            s *= xs[i]
+        else
+            s *= "/" * xs[i]
+        end
+    end
+    return s
+end
+# Base.joinpath's body verbatim (the original miscompile)
+function op_joinpath_body(paths::Union{Tuple,AbstractVector})
+    path = paths[1]
+    for i in firstindex(paths)+1:lastindex(paths)
+        p = paths[i]
+        if isabspath(p)
+            path = p
+        elseif isempty(path) || path[end] == '/'
+            path *= p
+        else
+            path *= "/" * p
+        end
+    end
+    return path
+end
+# a union-typed carried cell: a stale entry value here would also reach
+# downstream union splits, not just produce a wrong result
+function op_union_carry(n)
+    y = nothing
+    for i in 1:n
+        if isodd(i) || i > 100
+            y = i
+        else
+            y = Float64(i)
+        end
+    end
+    return y
+end
+
+@testset "optimizer parity: wave-13 island backedge liveness" begin
+    for (f, args, want) in ((op_accum_join, (("/a", "b", "c"),), "/a/b/c"),
+                            (op_joinpath_body, (("/x", "y", "z"),), "/x/y/z"),
+                            (op_union_carry, (4,), 4.0))
+        # the executed body must advance the carried cell (pre-fix the
+        # joinpath-shaped cases returned their INITIAL value)
+        ir = OPUnified.typed_ir(f, Any[map(typeof, args)...])
+        irc = OPUnified.ir_to_ircode(ir)
+        irc.argtypes[1] = Tuple{}
+        oc = Core.OpaqueClosure(irc)
+        @test isequal(oc(args...), want)
+    end
+end
+
 end # module UnifiedOptimizerParityTests
