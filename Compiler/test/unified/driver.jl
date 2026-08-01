@@ -9,6 +9,7 @@ drv_try(x) = try; div(10, x); catch; -1; end
 @generated drv_gen(x) = :(x + 1)
 drv_callee(x) = x + 1
 drv_caller(x) = drv_callee(x) * 10
+drv_tailwhile(r) = while true; r[] && break; end
 
 drv_interp() = CC.NativeInterpreter(Base.get_world_counter())
 drv_mi(f, args...) = UnifiedCompiler.lookup_method_instance(f, args...)
@@ -40,6 +41,22 @@ end
     @test ci.rettype === Int
     @test isdefined(ci, :rettype_const) && ci.rettype_const == 42
     @test invoke(drv_const, ci) == 42
+end
+
+@testset "driver: maybe-undef break-block result slot (wave 13)" begin
+    # A tail/value-position `while` lowers to a break-block whose `loop-exit`
+    # result slot is maybe-undef (the taken `break` skips the store; an
+    # `Expr(:isdefined, ...)` guard backfills `nothing`) but carries NO
+    # NewvarNode — lowering materializes the slot after the newvar machinery.
+    # The entry converters must declare the undefined-at-entry state with a
+    # `cell_new`, or the definedness transfer folds the guard to Const(true),
+    # the undef-path store dies, and the compiled body throws
+    # `UndefVarError(:loop-exit)` the moment the break is taken (seen as the
+    # REPL stdlib precompile deadlock: LineEdit `prompt!`'s spawned input
+    # loop dying on its first key dispatch).
+    ci = unified_typeinf(drv_interp(), drv_mi(drv_tailwhile, Ref(true)), CC.SOURCE_MODE_ABI)
+    @test ci isa Core.CodeInstance
+    @test invoke(drv_tailwhile, ci, Ref(true)) === nothing
 end
 
 @testset "driver: try/catch compiles through unified (A4)" begin

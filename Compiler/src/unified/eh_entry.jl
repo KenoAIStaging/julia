@@ -269,6 +269,10 @@ function codeinfo_to_ir_eh(ci::Core.CodeInfo; nargs::Int, name::Symbol)
         c = append_stmt!(b, K"cell", Any; type = Any)
         cellmap[sl] = c
         cellnames[c.id] = ci.slotnames[sl]
+        # slots start UNDEFINED (see codeinfo_entry: a NewvarNode only
+        # RE-undefines) — declare the maybe-undef entry state so definedness
+        # reasoning never assumes assigned-at-entry
+        append_stmt!(b, K"cell_new", UnifiedIR.op_stmt(c))
     end
     democell = Dict{Int,StmtId}()         # demoted SSA idx -> cell
     for i in 1:n

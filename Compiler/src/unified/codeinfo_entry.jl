@@ -146,6 +146,13 @@ function codeinfo_to_ir(ci::Core.CodeInfo; nargs::Int, name::Symbol = :f)
         c = append_stmt!(b, K"cell", Any; type = Any)
         cellmap[sl] = c
         cellnames[c.id] = ci.slotnames[sl]
+        # slots start UNDEFINED — a NewvarNode only RE-undefines, and lowering
+        # omits it for slots it materializes late (e.g. the symbolicblock
+        # `loop-exit` result var, read through an `isdefined` guard). Declare
+        # the maybe-undef entry state explicitly so downstream definedness
+        # reasoning (cell_isdefined/cell_get in transfers.jl keys on the
+        # presence of a cell_new) never assumes assigned-at-entry
+        append_stmt!(b, K"cell_new", UnifiedIR.op_stmt(c))
     end
 
     single = nblocks == 1 && !any(st -> st isa Core.GotoNode || st isa Core.GotoIfNot, code)
