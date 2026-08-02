@@ -900,4 +900,64 @@ op_apply_vasplat(f, xs...) = f(xs...)
     @test op_apply_vasplat(+, 1, 2, 3) === 6
 end
 
+# ---------------------------------------------------------------------------
+# A `Type{X}`-bound static parameter is pinned by `==`, not `===` (wave 14)
+#
+# `jl_isa(x, Type{Int})` accepts every type EQUAL to `Int`, so the pinned
+# bound type intersection reports for `f(::Type{T})` against an argument of
+# type `Type{Int}` names one representative of an equivalence class — the
+# value that actually dispatched may be a different, `!==` type. Baking it
+# as a plain sparam value folds the callee's `T === Int` to `true` and
+# returns the wrong branch (JuliaLang/julia#61323, stock
+# inference.jl:2214). A typevar recovered from inside an APPLIED type
+# (`Type{RefValue{T}}`, the constructor `self` slot) is unaffected: type
+# application is deduplicated by the type cache, so it is pinned by identity
+# — and the port's pinned-marker inlining for those must keep working.
+# ---------------------------------------------------------------------------
+
+@noinline op_61323_call(f, x) = f(Base.inferencebarrier(x)::Type{Int})
+op_61323_sparam(::Type{T}) where {T} = T === Int ? 1 : ""
+op_61323_arg(x) = x === Int ? 1 : ""
+# `S == Int` but `S !== Int`
+const OP_61323_S = (Union{T, U} where {T<:Int, U<:Int})
+
+@testset "optimizer parity: wave-14 Type{X}-bound sparam is == not ===" begin
+    @test OP_61323_S == Int
+    @test OP_61323_S !== Int
+
+    saved = Base.REFLECTION_COMPILER[]
+    try
+        Base.REFLECTION_COMPILER[] = Compiler
+        OPUnified.enable_pipeline!()
+
+        # neither directly nor through the static parameter may the
+        # `Type{Int}`-typed value fold the identity test
+        for f in (op_61323_arg, op_61323_sparam)
+            @test last(only(Base.code_typed(f, (Type{Int},)))) === Union{Int,String}
+            # an egality-pinned query still folds
+            @test last(only(Base.code_typed(f, (Core.TypeEgal{Int},)))) === Int
+            @test last(only(Base.code_typed(op_61323_call, (typeof(f), Any)))) ===
+                  Union{Int,String}
+        end
+
+        # execution of the pipeline's own IR: the caller must return "" for a
+        # type that is `==` Int without being `===` Int
+        for f in (op_61323_arg, op_61323_sparam)
+            ir = OPUnified.typed_ir(op_61323_call, Any[typeof(f), Any])
+            irc = OPUnified.ir_to_ircode(ir)
+            irc.argtypes[1] = Tuple{}
+            oc = Core.OpaqueClosure(irc)
+            @test oc(f, OP_61323_S) === ""
+            @test oc(f, Int) === 1
+        end
+    finally
+        OPUnified.disable_pipeline!()
+        Base.REFLECTION_COMPILER[] = saved
+    end
+
+    @test op_61323_call(op_61323_sparam, OP_61323_S) === ""
+    @test op_61323_call(op_61323_arg, OP_61323_S) === ""
+    @test op_61323_call(op_61323_sparam, Int) === 1
+end
+
 end # module UnifiedOptimizerParityTests

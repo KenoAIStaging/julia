@@ -820,7 +820,48 @@ Type, got Vararg" — so every ≥4-argument call into such a method dies
 (`zeros(3,3,3,3)`)."""
 struct _Unbakeable end
 const _unbakeable = _Unbakeable()
-function bakeable_sparam(@nospecialize(v))
+
+"""Is `tv` bound DIRECTLY by a bare `Type{tv}` slot of the (unwrapped)
+signature `t`? Such a parameter is bound by `==`, not by `===`:
+`jl_isa(x, Type{Int})` accepts every type equal to `Int`, so the
+intersection's pinned bound names only ONE representative of an equivalence
+class and the value that actually dispatched may be a different, `!==` type
+(JuliaLang/julia#61323).
+
+A typevar recovered from INSIDE an applied type — `Type{RefValue{T}}`, the
+usual constructor `self` slot — is not affected: type application is
+deduplicated by the type cache, so an argument equal to `RefValue{Any}` IS
+`RefValue{Any}` and `T` is pinned by identity."""
+function sparam_from_type_slot(@nospecialize(t), tv::TypeVar)
+    if CC.isType(t) && t.parameters[1] === tv
+        return true
+    end
+    if t isa DataType
+        for p in t.parameters
+            sparam_from_type_slot(p, tv) && return true
+        end
+    elseif t isa UnionAll
+        return sparam_from_type_slot(t.body, tv)
+    elseif t isa Union
+        return sparam_from_type_slot(t.a, tv) || sparam_from_type_slot(t.b, tv)
+    end
+    return false
+end
+
+"`m.sig`'s TypeVar for static parameter `i`, or `nothing`."
+function sparam_typevar(m::Method, i::Int)
+    s = m.sig
+    j = 0
+    while s isa UnionAll
+        j += 1
+        j == i && return s.var
+        s = s.body
+    end
+    return nothing
+end
+
+function bakeable_sparam(@nospecialize(v), m::Union{Method,Nothing} = nothing,
+                         i::Int = 0)
     tv = v
     if v isa Core.SimpleVector
         (length(v) == 2 && v[1] isa TypeVar) || return _unbakeable
@@ -828,6 +869,15 @@ function bakeable_sparam(@nospecialize(v))
     end
     if tv isa TypeVar
         tv.lb === tv.ub || return _unbakeable
+        # the pin is only a VALUE when the parameter is bound by `===`. A
+        # parameter reachable from a `Type{...}` slot is bound by `==`, so the
+        # pinned bound is one representative of an equivalence class and the
+        # dispatched value may be a different, `!==` type.
+        if m !== nothing
+            mtv = sparam_typevar(m, i)
+            (mtv === nothing || sparam_from_type_slot(CC.unwrap_unionall(m.sig), mtv)) &&
+                return _unbakeable
+        end
         v = tv.ub
     end
     (CC.isvarargtype(v) || CC.has_free_typevars(v)) && return _unbakeable
@@ -1003,8 +1053,10 @@ function inline_calls2!(ir::UnifiedIR.IR, state::UInferState;
         # only matters when the body actually READS the parameter (stock keys
         # the same decision off spvals_ssa/_compute_sparams; constructors of
         # diagonal-typevar methods are the common never-reads case), and
-        # pinned markers (lb === ub) still have a unique bakeable value
-        spvals = Any[bakeable_sparam(v) for v in mi.sparam_vals]
+        # pinned markers (lb === ub) still have a unique bakeable value when
+        # the parameter is bound by `===` rather than through a `Type{...}` slot
+        spvals = Any[bakeable_sparam(v, m, i)
+                     for (i, v) in enumerate(mi.sparam_vals)]
         spneeded = unbakeable_sparam_reads(callee_ir, spvals)
         spneeded === nothing && continue      # env-depth mismatch
         spstates = nothing
