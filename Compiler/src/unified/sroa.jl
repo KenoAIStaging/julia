@@ -363,8 +363,10 @@ end
     finalizer can never do observable work: the registration is erased
     (no escape analysis needed — this is legal for escaping objects too).
   * `f` is finalizer-inlineable (nothrow ∧ notaskstate) and `obj` is a
-    non-escaping local `new` of a mutable type whose only other uses are
-    field loads/stores: the registration is erased and `f(obj)` is placed
+    non-escaping local `new` of a mutable type whose only other uses —
+    counting the ones reached through the registration's own result, since
+    `Base.finalizer(f, o)` returns `o` — are field loads/stores: the
+    registration is erased and `f(obj)` is placed
     right after the last use's top-level container in the allocation's
     home region (the statically-known end of the object's lifetime; v1
     requires the registration itself to sit in that region, so the call
@@ -441,34 +443,62 @@ function resolve_finalizers!(ir::UnifiedIR.IR, st::UInferState)
         # it — stock EA's no-escape classification; the paired
         # `gc_preserve_end`s join the use set below so the placed call
         # lands after the preserved span)
+        #
+        # The scan runs over the object's ALIASES, not just the `new`:
+        # `Base.finalizer(f, o)` RETURNS `o`, so the registration's own
+        # result carries the object onward, and a `refine` over an alias is
+        # the same value. Skipping the registration without following its
+        # result would make an object that reaches the rest of the program
+        # only through it look DEAD at the registration — exactly the
+        # `finalizer(new(x)) do this … end` constructor, whose body is
+        # optimized on its own before it is inlined: the anchor stays at
+        # `s`, the call is placed right after the registration, and every
+        # caller the constructor is inlined into then runs the finalizer
+        # BEFORE its own `setfield!`s, observing the constructor's initial
+        # field values (the cfg_finalization2/6/7 shapes).
         ok = true
         uses = StmtId[]
-        UnifiedIR.each_ssa_use(ir) do site, used
-            (ok && used == obj) || return
-            site isa UnifiedIR.StmtOperand || (ok = false; return)
-            u = site.user
-            UnifiedIR.is_tombstone(ir, u) && return
-            u == s && return
-            uk = UnifiedIR.stmt_kind(ir, u)
-            if uk === K"extract" && site.opidx == 1
-                push!(uses, u)
-            elseif uk === K"gc_preserve_begin"
-                push!(uses, u)
-            elseif uk === K"call"
-                callee2 = static_operand_value(ir, UnifiedIR.getop(ir, u, 1))
-                nopu = UnifiedIR.nops(ir, u)
-                if (callee2 === Core.getfield || callee2 === Base.getfield) &&
-                   site.opidx == 2 && (nopu == 3 || nopu == 4)
+        aliases = StmtId[obj]
+        # `Core.finalizer` evaluates to `nothing`; only the Base wrapper
+        # forwards the object
+        callee === Base.finalizer && push!(aliases, s)
+        ai = 0
+        while ai < length(aliases)
+            ai += 1
+            a = aliases[ai]
+            UnifiedIR.each_ssa_use(ir) do site, used
+                (ok && used == a) || return
+                site isa UnifiedIR.StmtOperand || (ok = false; return)
+                u = site.user
+                UnifiedIR.is_tombstone(ir, u) && return
+                u == s && return
+                uk = UnifiedIR.stmt_kind(ir, u)
+                if uk === K"refine" && site.opidx == 1
+                    # bound the alias walk: one `each_ssa_use` sweep apiece,
+                    # and declining is always sound
+                    length(aliases) < 16 || (ok = false; return)
+                    any(==(u), aliases) || push!(aliases, u)
+                elseif uk === K"extract" && site.opidx == 1
                     push!(uses, u)
-                elseif (callee2 === Core.setfield! || callee2 === Base.setfield!) &&
-                       site.opidx == 2 && nopu == 4
+                elseif uk === K"gc_preserve_begin"
                     push!(uses, u)
+                elseif uk === K"call"
+                    callee2 = static_operand_value(ir, UnifiedIR.getop(ir, u, 1))
+                    nopu = UnifiedIR.nops(ir, u)
+                    if (callee2 === Core.getfield || callee2 === Base.getfield) &&
+                       site.opidx == 2 && (nopu == 3 || nopu == 4)
+                        push!(uses, u)
+                    elseif (callee2 === Core.setfield! || callee2 === Base.setfield!) &&
+                           site.opidx == 2 && nopu == 4
+                        push!(uses, u)
+                    else
+                        ok = false
+                    end
                 else
                     ok = false
                 end
-            else
-                ok = false
             end
+            ok || break
         end
         ok || continue
         # a preserved object's lifetime extends to the preserve END: add

@@ -736,21 +736,21 @@ end
         @test OPCC.is_nothrow(fx)
         @test OPCC.is_finalizer_inlineable(fx)
     end
-    # `broken`: shapes that STORE the field after the constructor registered
-    # the finalizer. The elided body currently observes the `new`'s initial
-    # field value for those — op_fin_store counts 2n instead of n, the
-    # store-in-arm shapes count 0, op_fin_store_use counts n instead of the
-    # triangular sum. The placement itself is not at fault (hardening the
-    # `resolve_finalizers!` use scan and verifying the insertion point
-    # postdates every use changes nothing); the stale value comes from the
-    # load forwarding that runs against the placed call.
-    for (f, want, broken) in ((op_fin_const, n, false),
-                              (op_fin_ctor_arg, n, false),
-                              (op_fin_store, n, true),
-                              (op_fin_interproc, n, false),
-                              (op_fin_store_in_arm, n, true),
-                              (op_fin_store_chain, n, true),
-                              (op_fin_store_use, div(n * (n + 1), 2), true))
+    # The shapes that STORE the field after the constructor registered the
+    # finalizer (op_fin_store, the store-in-arm pair, op_fin_store_use) are
+    # the ones that pin down WHERE the placed call landed: they used to
+    # observe the `new`'s initial value because `resolve_finalizers!`
+    # discharged the registration inside the CONSTRUCTOR, whose object
+    # reaches the rest of the program only through `Base.finalizer`'s own
+    # result — the use scan skipped it and the object looked dead at the
+    # registration.
+    for (f, want) in ((op_fin_const, n),
+                      (op_fin_ctor_arg, n),
+                      (op_fin_store, n),
+                      (op_fin_interproc, n),
+                      (op_fin_store_in_arm, n),
+                      (op_fin_store_chain, n),
+                      (op_fin_store_use, div(n * (n + 1), 2)))
         ir = OPUnified.typed_ir(f, Any[Int])
         irc = OPUnified.ir_to_ircode(ir)
         elided = !any(irc.stmts.stmt) do @nospecialize(x)
@@ -766,8 +766,6 @@ end
             # declining is a missed optimization, not a bug: the registration
             # survives and the finalizers run at GC time instead
             @test_skip OP_FIN_COUNT[] == want
-        elseif broken
-            @test_broken OP_FIN_COUNT[] == want
         else
             @test OP_FIN_COUNT[] == want
         end
