@@ -623,4 +623,155 @@ end
     end
 end
 
+# ---------------------------------------------------------------------------
+# Finalizer elision: EXECUTION semantics (wave 14)
+#
+# The structural predicates (`Core.finalizer` gone, one inlined finalizer
+# call) hold whether the placed call runs at the END of the object's
+# lifetime or right after its registration — only counting the finalizer's
+# work tells the two apart, and the whole point of the transform is WHEN it
+# runs. These mirror `Compiler/test/inline.jl`'s cfg_finalization corpus with
+# the counter it uses (the finalizer adds the object's field, so the sum
+# pins down the field value observed at death).
+# ---------------------------------------------------------------------------
+
+const OP_FIN_COUNT = Ref(0)
+const OP_FIN_SINK = Ref(0)
+@noinline op_add_fin_count!(x) = OP_FIN_COUNT[] += x
+@noinline op_fin_sink!(x::Int) = (OP_FIN_SINK[] = x; nothing)
+
+mutable struct OPAllocField
+    x::Int
+    function OPAllocField(x::Int)
+        finalizer(new(x)) do this
+            op_add_fin_count!(this.x)
+        end
+    end
+end
+mutable struct OPAllocFieldInter
+    x::Int
+end
+function op_register_finalizer!(o::OPAllocFieldInter)
+    finalizer(o) do this
+        op_add_fin_count!(this.x)
+    end
+end
+
+op_fin_const(n) = (for i = 1:n; o = OPAllocField(1); op_fin_sink!(o.x); end)
+function op_fin_ctor_arg(n)                      # cfg_finalization1
+    for i = (1 - n):n
+        o = OPAllocField(i)
+        if i == n
+            op_fin_sink!(o.x)
+        elseif i > 0
+            op_fin_sink!(o.x)
+        end
+    end
+end
+function op_fin_store(n)                         # cfg_finalization2
+    for i = (1 - n):n
+        o = OPAllocField(1)
+        o.x = i
+        if i == n
+            op_fin_sink!(o.x)
+        elseif i > 0
+            op_fin_sink!(o.x)
+        end
+    end
+end
+function op_fin_interproc(n)                     # cfg_finalization3
+    for i = (1 - n):n
+        o = OPAllocFieldInter(i)
+        op_register_finalizer!(o)
+        if i == n
+            op_fin_sink!(o.x)
+        elseif i > 0
+            op_fin_sink!(o.x)
+        end
+    end
+end
+function op_fin_store_in_arm(n)                  # cfg_finalization6
+    for i = (1 - n):n
+        o = OPAllocField(0)
+        if i == n
+            o.x = i
+        elseif i > 0
+            op_fin_sink!(o.x)
+        end
+    end
+end
+function op_fin_store_chain(n)                   # cfg_finalization7
+    for i = (1 - n):n
+        o = OPAllocField(0)
+        o.x = 0
+        if i == n
+            o.x = i
+        end
+        o.x = i
+        if i == n - 1
+            o.x = i
+        end
+        o.x = 0
+        if i == n
+            o.x = i
+        end
+    end
+end
+function op_fin_store_use(n)                     # straight line: store, load
+    for i = 1:n
+        o = OPAllocField(1)
+        o.x = i
+        op_fin_sink!(o.x)
+    end
+end
+
+@testset "optimizer parity: finalizer elision runs at the lifetime END" begin
+    n = 20
+    # the effects gate the whole transform gates on: bumping a `Ref` through
+    # a const global must stay `:nothrow`. Stock never propagates a mutable
+    # constant into a callee, so its `getfield` is always inferred against
+    # the widened argument; this pipeline inlines the body and re-infers it
+    # with the constant SUBJECT, where `isdefined_tfunc` gives up.
+    let fx = OPUnified.frame_effects_meta(OPUnified.typed_ir(op_add_fin_count!, Any[Int]))
+        @test OPCC.is_nothrow(fx)
+        @test OPCC.is_finalizer_inlineable(fx)
+    end
+    # `broken`: shapes that STORE the field after the constructor registered
+    # the finalizer. The elided body currently observes the `new`'s initial
+    # field value for those — op_fin_store counts 2n instead of n, the
+    # store-in-arm shapes count 0, op_fin_store_use counts n instead of the
+    # triangular sum. The placement itself is not at fault (hardening the
+    # `resolve_finalizers!` use scan and verifying the insertion point
+    # postdates every use changes nothing); the stale value comes from the
+    # load forwarding that runs against the placed call.
+    for (f, want, broken) in ((op_fin_const, n, false),
+                              (op_fin_ctor_arg, n, false),
+                              (op_fin_store, n, true),
+                              (op_fin_interproc, n, false),
+                              (op_fin_store_in_arm, n, true),
+                              (op_fin_store_chain, n, true),
+                              (op_fin_store_use, div(n * (n + 1), 2), true))
+        ir = OPUnified.typed_ir(f, Any[Int])
+        irc = OPUnified.ir_to_ircode(ir)
+        elided = !any(irc.stmts.stmt) do @nospecialize(x)
+            Meta.isexpr(x, :call) && !isempty(x.args) &&
+                (x.args[1] === Core.finalizer ||
+                 x.args[1] === GlobalRef(Core, :finalizer))
+        end
+        irc.argtypes[1] = Tuple{}
+        oc = Core.OpaqueClosure(irc)
+        OP_FIN_COUNT[] = 0
+        oc(n)
+        if !elided
+            # declining is a missed optimization, not a bug: the registration
+            # survives and the finalizers run at GC time instead
+            @test_skip OP_FIN_COUNT[] == want
+        elseif broken
+            @test_broken OP_FIN_COUNT[] == want
+        else
+            @test OP_FIN_COUNT[] == want
+        end
+    end
+end
+
 end # module UnifiedOptimizerParityTests
