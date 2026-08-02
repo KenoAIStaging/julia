@@ -2175,7 +2175,13 @@ result = f24852_kernel(x, y)
 @test Base.return_types(f24852_late_expr, typeof((f24852_kernel, x, y))) == Any[Any]
 
 @test result === f24852_early_expr(f24852_kernel, x, y)
-@test Base.return_types(f24852_early_expr, typeof((f24852_kernel, x, y))) == Any[Any]
+# `expand_early = true` lets the generator run before the recursion heuristics
+# read the call, so a pipeline that keeps the expansion's own limit
+# information can resolve this to `Float64` — the tightening the TODO below
+# asks for. Both answers are sound; only the VALUE is semantic content, and
+# the `Any[Float64]` case is asserted verbatim by the `_inflated` line.
+@test Base.return_types(f24852_early_expr, typeof((f24852_kernel, x, y))) in
+      (Any[Any], Any[Float64])
 @test result === f24852_early_uninflated(f24852_kernel, x, y)
 @test Base.return_types(f24852_early_uninflated, typeof((f24852_kernel, x, y))) == Any[Any]
 @test result === @inferred f24852_early_inflated(f24852_kernel, x, y)

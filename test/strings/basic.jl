@@ -12,9 +12,14 @@ using Random
     v = [0x61,0x62,0x63,0x21]
     v32 = copy(reinterpret(UInt32, v))
     @test String(reinterpret(UInt8, v32)) == "abc!" && !isempty(v32)
+    # `@allocations` counts allocations made by any compilation the expression
+    # triggers, so measure a warmed-up call: the point is that the conversion
+    # itself allocates exactly the one result string.
+    @allocations String(reinterpret(UInt8, v32))
     @test 1 == @allocations String(reinterpret(UInt8, v32))
     m32 = v32.ref.mem
     @test String(reinterpret(UInt8, m32)) == "abc!" && !isempty(m32)
+    @allocations String(reinterpret(UInt8, m32))
     @test 1 == @allocations String(reinterpret(UInt8, m32))
     @test String(reinterpret(UInt8, Tuple{UInt8, UInt64}[])) == ""
     @test_throws Base.PaddingError String(reinterpret(UInt8, [(0x41, 0x4141414141414141)]))
