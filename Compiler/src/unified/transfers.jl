@@ -70,6 +70,46 @@ function getfield_maybe_undef(@nospecialize(f), argl::Vector{Any})
     return und[idx] !== false
 end
 
+"""Definedness-monotonicity carve-out for a `getfield` whose SUBJECT is a
+`Const`. `isdefined_tfunc`'s Const branch gives up on a mutable type whose
+field is not declared `const` — it never falls through to the type-level
+rules (an `isbits` field can never be undefined) that the same load off a
+*widened* argument enjoys — so `getfield_nothrow` refuses `Const(::Ref{Int})`
+while accepting `::Ref{Int}`.
+
+Stock never meets that shape: `is_const_prop_profitable_arg` refuses to
+propagate a mutable constant into a callee, so the load is always inferred
+against the widened argument. This pipeline inlines the callee body into the
+caller's frame and re-infers it there, where the subject IS the constant —
+so the same load comes back maybe-throwing, and a `Ref` bump through a const
+global (`COUNTER[] += x`) loses frame `:nothrow`. That in turn silently
+disables everything gated on it, `resolve_finalizers!`'s
+`is_finalizer_inlineable` check most visibly.
+
+Definedness is MONOTONE (a field, once assigned, is never unassigned), so a
+field observed defined while compiling cannot be undefined when the compiled
+code runs; the remaining `getfield` throw conditions (out-of-range index,
+illegal memory order) are all statically checkable. True when this load
+provably cannot throw. Modules are excluded: `getfield(::Module, ::Symbol)`
+is a binding read, not a field read, and can raise `UndefVarError`."""
+function getfield_const_subject_nothrow(argl::Vector{Any})
+    2 <= length(argl) <= 4 || return false
+    obj = argl[1]
+    obj isa CC.Const || return false
+    v = obj.val
+    v isa Module && return false
+    fld = argl[2]
+    fld isa CC.Const || return false
+    for i in 3:length(argl)
+        e = argl[i] isa CC.Const ? (argl[i]::CC.Const).val : missing
+        # note: `:not_atomic` READS of an atomic field are legal (only writes
+        # require an ordering), so no isfieldatomic guard is needed here
+        (e === true || e === false || e === :not_atomic) || return false
+    end
+    fi = field_index_of(typeof(v), fld.val)
+    return fi isa Int && isdefined(v, fi)
+end
+
 "`CC.builtin_effects`/`CC.intrinsic_effects`, full-width, defensively.
 `rt` must be the LATTICE element (Const-ness drives e.g. apply_type nothrow)."
 function builtin_call_effects(@nospecialize(f), argl::Vector{Any}, @nospecialize(rt))
@@ -86,8 +126,10 @@ function builtin_call_effects(@nospecialize(f), argl::Vector{Any}, @nospecialize
     catch
         CC.Effects()
     end
-    if eff.nothrow && getfield_maybe_undef(f, argl)
-        eff = CC.Effects(eff; nothrow = false)
+    if eff.nothrow
+        getfield_maybe_undef(f, argl) && (eff = CC.Effects(eff; nothrow = false))
+    elseif f === Core.getfield && getfield_const_subject_nothrow(argl)
+        eff = CC.Effects(eff; nothrow = true)
     end
     return eff
 end

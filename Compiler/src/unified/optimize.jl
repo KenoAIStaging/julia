@@ -71,26 +71,13 @@ function refine_effects!(ir::UnifiedIR.IR; interp = CC.NativeInterpreter())
             (flags |= UnifiedIR.FLAG_NOTHROW)
         CC.is_terminates(effects) && (flags |= UnifiedIR.FLAG_TERMINATES)
         if flags & UnifiedIR.FLAG_NOTHROW == 0 &&
-           (fl === Core.getfield || fl === Base.getfield) && length(argl) >= 2
+           (fl === Core.getfield || fl === Base.getfield) &&
+           getfield_const_subject_nothrow(argl)
             # the tfuncs refuse Const-of-mutable subjects, but definedness
             # is MONOTONE (a defined field never becomes undefined), so a
             # field observed defined now cannot throw later; the remaining
             # throw conditions are all statically checkable
-            v = argl[1] isa CC.Const ? (argl[1]::CC.Const).val : nothing
-            fld = argl[2] isa CC.Const ? (argl[2]::CC.Const).val : nothing
-            extra_ok = true
-            for k2 in 3:length(argl)
-                e = argl[k2] isa CC.Const ? (argl[k2]::CC.Const).val : missing
-                (e === true || e === false || e === :not_atomic) || (extra_ok = false; break)
-            end
-            if v !== nothing && extra_ok && length(argl) <= 4
-                # note: not_atomic READS of atomic fields are legal (only
-                # writes require an ordering), so no isfieldatomic guard
-                fi = field_index_of(typeof(v), fld)
-                if fi isa Int && isdefined(v, fi)
-                    flags |= UnifiedIR.FLAG_NOTHROW
-                end
-            end
+            flags |= UnifiedIR.FLAG_NOTHROW
         end
         # inference's transfer results (just published into the flag column)
         # can be strictly more precise than the builtin recompute
