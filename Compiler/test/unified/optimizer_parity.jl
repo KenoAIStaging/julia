@@ -772,4 +772,83 @@ end
     end
 end
 
+# ---------------------------------------------------------------------------
+# Unbakeable sparams: a `Vararg` env entry (wave 14)
+#
+# Type intersection reports a bare `Vararg` for a length parameter the
+# caller's argument type leaves OPEN — matching `f(::NTuple{N,Int})` against
+# the argument type `Tuple{Int,Int,Int,Vararg{Int}}` gives
+# `env = svec(…, Vararg)`. Stock `validate_sparams` rejects that
+# (`isvarargtype`) and keeps the dynamic call; baking it instead splices
+# `apply_type(Array, T, Vararg)`, which infers to `Union{}` and traps at
+# runtime with "in Type, in parameter, expected Type, got Vararg".
+#
+# That open argument type is exactly what a ≥4-argument call to a vararg
+# method compiles against once the specialization is tuple-limited, so the
+# whole class was live in the image: `zeros(3,3,3,3)` threw.
+#
+# Assert on EXECUTION of the emitted IR, not just its shape — the structural
+# predicate "the callee no longer appears as a call" is satisfied by the
+# miscompile too (it inlined; it inlined wrong).
+# ---------------------------------------------------------------------------
+
+op_va_make(::Type{T}, d::NTuple{N,Int}) where {T,N} = Array{T,N}(undef, d)
+# not itself a vararg method: the open tuple argument type alone produces the
+# `Vararg` env entry, which keeps the shape OpaqueClosure-executable
+op_va_open(t::Tuple{Int,Int,Int,Vararg{Int}}) = op_va_make(Float64, t)
+# the same env through a genuinely vararg caller (the `zeros` shape)
+op_va_call(x...) = op_va_make(Float64, x)
+
+@testset "optimizer parity: wave-14 unbakeable Vararg sparam" begin
+    saved = Base.REFLECTION_COMPILER[]
+    try
+        Base.REFLECTION_COMPILER[] = Compiler
+        OPUnified.enable_pipeline!()
+
+        @testset "open tuple argument keeps the length parameter dynamic" begin
+            for (f, at) in ((op_va_open, Tuple{Tuple{Int,Int,Int,Vararg{Int}}}),
+                            (op_va_call, Tuple{Int,Int,Int,Vararg{Int}}))
+                (src, rt) = only(Base.code_typed(f, at))
+                # folding to Union{} means the body was proven to always
+                # throw — the signature of this miscompile
+                @test rt !== Union{}
+                # and no `Vararg` object may reach an apply_type argument
+                @test !any(src.code) do @nospecialize x
+                    Meta.isexpr(x, :call) && any(a -> a isa Core.TypeofVararg, x.args)
+                end
+            end
+        end
+
+        @testset "the emitted code actually builds the array" begin
+            # run the unified pipeline's own IR for the OPEN argument type:
+            # dispatching `op_va_open((3,3,3,3))` normally would specialize
+            # on the concrete `NTuple{4,Int}` and never reach this code
+            ir = OPUnified.typed_ir(op_va_open, Any[Tuple{Int,Int,Int,Vararg{Int}}])
+            irc = OPUnified.ir_to_ircode(ir)
+            irc.argtypes[1] = Tuple{}
+            oc = Core.OpaqueClosure(irc)
+            for n in 3:6
+                d = ntuple(_ -> 3, n)
+                a = oc(d)
+                @test a isa Array{Float64,n}
+                @test size(a) == d
+            end
+        end
+    finally
+        OPUnified.disable_pipeline!()
+        Base.REFLECTION_COMPILER[] = saved
+    end
+
+    # the Base shape this class broke, through whatever pipeline the session
+    # is running: `zeros(dims::DimOrInd...)` reaches
+    # `zeros(::Type{T}, ::NTuple{N,Integer})` through exactly this env
+    for n in 1:8
+        d = ntuple(_ -> 3, n)
+        z = zeros(d...)
+        @test z isa Array{Float64,n}
+        @test size(z) == d
+        @test all(iszero, z)
+    end
+end
+
 end # module UnifiedOptimizerParityTests

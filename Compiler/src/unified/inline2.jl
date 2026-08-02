@@ -802,9 +802,22 @@ through. An unresolved `TypeVar` or a constrained-TypeVar marker
 (`svec(tv, flag)`) is only bakeable when the var's bounds PIN it
 (`lb === ub` — the intersection admits exactly one binding, e.g. the
 invariant `Ref{Any}` position that produces `svec(T>:Any, true)`); those
-bake to the pinned bound. Anything else returns the `_unbakeable` sentinel
-(stock handles the general case with a runtime `Core._compute_sparams`;
-this port declines those splices instead)."""
+bake to the pinned bound. Anything else returns the `_unbakeable` sentinel,
+which routes the entry through `unbakeable_sparam_reads` to the runtime
+`Core._compute_sparams`/`Core._svec_ref` reconstruction at the splice site
+(stock's `spvals_ssa`), or declines the splice when that is unavailable.
+
+The final value is additionally screened by stock `validate_sparams`'
+predicate: a `Vararg` (`Core.TypeofVararg`) or a type with free typevars is
+NOT a splice-able value even though it is neither a `SimpleVector` nor a
+bare `TypeVar`. A `Vararg` entry is what type intersection reports for a
+length parameter that the caller's signature leaves open — e.g. matching
+`f(::NTuple{N,Int})` against the tuple-limited argument type
+`Tuple{Int,Int,Int,Vararg{Int}}` yields `env = svec(..., Vararg)`. Baking
+that reaches codegen as `apply_type(Array, Float64, Vararg)`, which infers
+to `Union{}` and traps at runtime with "in Type, in parameter, expected
+Type, got Vararg" — so every ≥4-argument call into such a method dies
+(`zeros(3,3,3,3)`)."""
 struct _Unbakeable end
 const _unbakeable = _Unbakeable()
 function bakeable_sparam(@nospecialize(v))
@@ -814,9 +827,10 @@ function bakeable_sparam(@nospecialize(v))
         tv = v[1]
     end
     if tv isa TypeVar
-        tv.lb === tv.ub && return tv.ub
-        return _unbakeable
+        tv.lb === tv.ub || return _unbakeable
+        v = tv.ub
     end
+    (CC.isvarargtype(v) || CC.has_free_typevars(v)) && return _unbakeable
     return v
 end
 
