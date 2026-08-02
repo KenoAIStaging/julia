@@ -851,4 +851,53 @@ op_va_call(x...) = op_va_make(Float64, x)
     end
 end
 
+# ---------------------------------------------------------------------------
+# `_apply_iterate` with too few operands is a guaranteed throw (wave 14)
+#
+# Stock `abstract_apply` reads its iterate/function operands through
+# `argtype_by_index`, which reports `Bottom` for an absent operand, and
+# returns `Bottom`/EFFECTS_THROWS. The port widened to `Any` instead, so
+# `Core._apply_iterate()` — an unconditional ArgumentError — inferred as
+# `Any`. That is not merely imprecise: when the runtime compiled such a call
+# before anything queried it, the conservative CodeInstance is what every
+# later query saw (stock inference.jl:3922/3926 assert `Any[Union{}]` right
+# after `@test_throws ArgumentError`).
+# ---------------------------------------------------------------------------
+
+op_apply_none() = Core._apply()
+op_apply_iter_none() = Core._apply_iterate()
+op_apply_ok() = (a = Any[iterate, tuple, (1,)]; Core._apply_iterate(a...))
+op_apply_splat(f, xs) = f(xs...)
+op_apply_vasplat(f, xs...) = f(xs...)
+
+@testset "optimizer parity: wave-14 short _apply operand list throws" begin
+    saved = Base.REFLECTION_COMPILER[]
+    try
+        Base.REFLECTION_COMPILER[] = Compiler
+        OPUnified.enable_pipeline!()
+
+        for f in (op_apply_none, op_apply_iter_none)
+            (_, rt) = only(Base.code_typed(f, ()))
+            @test rt === Union{}
+        end
+        # a well-formed apply is unaffected, including the arm where the
+        # operand list itself ends in a Vararg
+        @test last(only(Base.code_typed(op_apply_ok, ()))) === Any
+        @test last(only(Base.code_typed(op_apply_splat,
+                        (typeof(+), Tuple{Int,Int,Int})))) === Int
+        @test last(only(Base.code_typed(op_apply_vasplat,
+                        (typeof(+), Int, Int, Vararg{Int})))) === Int
+    finally
+        OPUnified.disable_pipeline!()
+        Base.REFLECTION_COMPILER[] = saved
+    end
+
+    # behavior is unchanged: these throw, and the well-formed ones still run
+    @test_throws ArgumentError op_apply_none()
+    @test_throws ArgumentError op_apply_iter_none()
+    @test op_apply_ok() === (1,)
+    @test op_apply_splat(+, (1, 2, 3)) === 6
+    @test op_apply_vasplat(+, 1, 2, 3) === 6
+end
+
 end # module UnifiedOptimizerParityTests

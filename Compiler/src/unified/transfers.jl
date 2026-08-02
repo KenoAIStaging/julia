@@ -1914,7 +1914,19 @@ unroll is then recorded in `ir.meta[:apply_iter_unroll]` (stmt id =>
 [(operand index, element count)...]) for `fold_apply_iterates!` to
 materialize (the stock ApplyCallInfo channel)."
 function infer_apply(fr::Frame, args::Vector{Any}; sid::Int32 = Int32(0))::UResult
-    length(args) >= 3 || return UResult(Any, CC.Effects())
+    if length(args) < 3
+        # stock `abstract_apply` reads its iterate/function operands through
+        # `argtype_by_index`, which reports `Bottom` for an absent operand and
+        # returns `Bottom`/EFFECTS_THROWS: `Core._apply_iterate()` is a
+        # guaranteed ArgumentError. Widening to `Any` here lost that whenever
+        # the runtime compiled the call before anything queried it — the
+        # conservative CodeInstance is what every later query then sees.
+        # A trailing `Vararg` operand may still cover those positions, so only
+        # a fixed-length short operand list is provably throwing.
+        (!isempty(args) && CC.isvarargtype(args[end])) ||
+            return UResult(Union{}, CC.EFFECTS_THROWS)
+        return UResult(Any, CC.Effects())
+    end
     fl = args[3]
     fl === Union{} && return UResult(Union{}, CC.EFFECTS_THROWS)
     flat = Any[fl]
