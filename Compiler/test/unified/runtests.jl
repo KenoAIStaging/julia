@@ -198,6 +198,16 @@ for i in 1:19
 end
 chainf20(x) = x
 chaindriver(x) = chainf1(x)
+# growing-signature self-recursion: a fresh, strictly larger specialization per
+# level, so MethodInstance-identity cycle detection never fires (#13183)
+_false13183 = false
+gg13183(x::X...) where {X} = (_false13183 ? gg13183(x, x) : 0)
+growrec13183(x) = (_false13183 ? growrec13183((x,)) : 0)
+growref13183(x) = (_false13183 ? growref13183(Ref(x)) : 1.0)
+# recursions that must keep their precise specializations
+valrec13183(::Val{N}) where {N} = N <= 0 ? 0 : valrec13183(Val(N - 1)) + 1
+tsum13183(t::Tuple) = first(t) + tsum13183(Base.tail(t))
+tsum13183(::Tuple{}) = 0
 
 @testset "InterConditional (interprocedural Conditional return)" begin
     rt = UnifiedCompiler.infer_return(intercond_f, Any[Union{Int,Nothing}])
@@ -242,6 +252,66 @@ end
     ir2 = UnifiedCompiler.lowered_ir(chaindriver, Tuple{Int64})
     rt2 = UnifiedCompiler.infer_ir!(ir2, Any[CC.Const(chaindriver), Int64]; state = st2)
     @test CC.widenconst(rt2) == Int64
+end
+
+@testset "recursion type-limiting (growing-signature self-calls, #13183)" begin
+    # `st.active` detects recursion by exact MethodInstance identity, which a
+    # self-call over GROWING argument types never trips: every level is a new
+    # specialization. Without limit_type_size these run to the depth cutoff and
+    # then hand a deeply nested type to the stock oracle, whose is_derived_type
+    # walk is exponential in nesting depth (the #13183 hang).
+    #
+    # Serving these bodies from the runtime CodeInstance cache would answer
+    # them without walking a single frame (the sysimage may already hold them),
+    # so the counters below only mean anything with that path off.
+    ciserve = UnifiedCompiler.CI_SERVE_ENABLED[]
+    UnifiedCompiler.CI_SERVE_ENABLED[] = false
+    try
+        # (gg13183 is a vararg method: its single slot holds the PACKED tuple)
+        for (f, tt, argl) in ((gg13183, Tuple{Int64}, Tuple{Int64}),
+                              (growrec13183, Tuple{Int64}, Int64),
+                              (growref13183, Tuple{Int64}, Int64))
+            st = UnifiedCompiler.UInferState()
+            ir = UnifiedCompiler.lowered_ir(f, tt)
+            rt = UnifiedCompiler.infer_ir!(ir, Any[CC.Const(f), argl]; state = st)
+            # terminates, and never deeper than a handful of widening steps
+            @test st.stats.frames < 40
+            # the widening fired, and left the result context-dependent
+            @test st.limited > 0
+            # sound against stock, which limits the same recursion its own way
+            @test Core.Compiler.return_type(f, tt) <: CC.widenconst(rt)
+            # every signature it specialized stayed shallow: the limiter
+            # converged instead of nesting one level deeper per frame
+            for k in Iterators.flatten((keys(st.cache), keys(st.scratch)))
+                k isa Core.MethodInstance || continue
+                @test !UnifiedCompiler.type_nests_deeper(k.specTypes, 8)
+            end
+        end
+        # gg13183 converges on exactly stock's widened signature
+        st = UnifiedCompiler.UInferState()
+        ir = UnifiedCompiler.lowered_ir(gg13183, Tuple{Int64})
+        UnifiedCompiler.infer_ir!(ir, Any[CC.Const(gg13183), Tuple{Int64}]; state = st)
+        @test any(k -> k isa Core.MethodInstance &&
+                       k.specTypes === Tuple{typeof(gg13183),Tuple,Tuple},
+                  Iterators.flatten((keys(st.cache), keys(st.scratch))))
+        # ...while recursions that do NOT grow keep their exact specializations
+        for (f, tt, want) in ((fact, Tuple{Int64}, Int64),
+                              (valrec13183, Tuple{Val{6}}, Int64),
+                              (tsum13183, Tuple{NTuple{4,Int64}}, Int64))
+            st2 = UnifiedCompiler.UInferState()
+            ir2 = UnifiedCompiler.lowered_ir(f, tt)
+            rt2 = UnifiedCompiler.infer_ir!(ir2, Any[CC.Const(f), tt.parameters[1]];
+                                            state = st2)
+            @test CC.widenconst(rt2) == want
+            @test st2.limited == 0
+        end
+    finally
+        UnifiedCompiler.CI_SERVE_ENABLED[] = ciserve
+    end
+    # the cheap depth guard the cutoff path uses
+    @test !UnifiedCompiler.type_nests_deeper(Tuple{Int,Vector{Int}}, 3)
+    @test UnifiedCompiler.type_nests_deeper(Tuple{Tuple{Tuple{Int}}}, 2)
+    @test !UnifiedCompiler.type_nests_deeper(Tuple{Tuple{Tuple{Int}}}, 3)
 end
 
 @testset "UConstKey: dispatch-uniform const-memo keys (wave-7 wedge regression)" begin

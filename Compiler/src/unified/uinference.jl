@@ -268,12 +268,17 @@ mutable struct UInferState
     resolutions::Int                            # resolved-cycle epoch (Bottom
                                                 # scratch entries expire on bump)
     edges::Union{Nothing,UEdges}                # driver-mode edge/world collector
+    entry_mi::Union{Nothing,Core.MethodInstance} # the body the top-level query
+                                                # entered on (depth 0; not in
+                                                # `active`) — the parent frame
+                                                # the recursion type limiter
+                                                # compares against at depth 1
 end
 UInferState(cfg::UInferConfig = UInferConfig()) =
     UInferState(cfg, Dict{Core.MethodInstance,Any}(), Dict{Core.MethodInstance,Int}(),
                 Set{Core.MethodInstance}(), UInferStats(0, 0, 0), Dict{Any,Any}(), 0, 0,
                 Dict{Any,Any}(), Dict{Any,Any}(), Dict{Any,Any}(), typemax(Int), 0, 0, 0, 0,
-                nothing)
+                nothing, nothing)
 
 """Serve a per-request cached result to the trace: reference the span that
 justified it, so enclosing frames' windows stay fact-complete. A hit whose
@@ -389,6 +394,18 @@ mutable struct Frame
     # the flag column (codeinfo_entry.jl carry_ssaflags; accessors
     # stmt_inbounds / stmt_effects_override)
 end
+
+"""The `MethodInstance` whose body `ir` is (`nothing` for bodies entered
+without one: synthetic query frames, toplevel thunks, closure bodies). Entry
+converters publish it under `:mi`, the reflection/optimizer entries under
+`:method_instance`."""
+function ir_mi(ir::UnifiedIR.IR)
+    mi = get(ir.meta, :mi, nothing)
+    mi isa Core.MethodInstance && return mi
+    mi = get(ir.meta, :method_instance, nothing)
+    return mi isa Core.MethodInstance ? mi : nothing
+end
+frame_mi(fr::Frame) = ir_mi(fr.ir)
 
 """May the `latestworld` statement `L` execute after the creation of closure
 `C`? The §5.8 world-split discipline for deferred bodies: a barrier between
@@ -562,6 +579,9 @@ function infer_ir!(ir::UnifiedIR.IR, argtypes::Vector{Any};
         empty!(state.cycle_scratch)
         empty!(state.scc_prev)
         state.stale_depth = typemax(Int)
+        # this body is the depth-0 frame: the recursion type limiter needs it
+        # as the parent of the frames it finds at depth 1
+        state.entry_mi = ir_mi(ir)
     end
     state.stats.frames += 1
     fr = Frame(ir, state, Vector{Any}(nothing, UnifiedIR.nstmts(ir)))

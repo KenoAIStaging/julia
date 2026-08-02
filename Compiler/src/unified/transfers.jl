@@ -1559,8 +1559,11 @@ function infer_call(fr::Frame, args::Vector{Any}; sid::Int32 = Int32(0))::UResul
     fx = CC.EFFECTS_TOTAL
     exct = Union{}
     fully = true
+    # stock's `multiple_matches` hardlimit: an abstract callee reached through
+    # more than one applicable method limits against the method signature
+    hardlimit = length(matches) > 1
     for match in matches
-        r = infer_method(fr, match::Core.MethodMatch, args)
+        r = infer_method(fr, match::Core.MethodMatch, args, hardlimit)
         rt = ⊔(st, rt, r.rt)
         fx = CC.merge_effects(fx, r.effects)
         exct = exct === Any ? Any : CC.tmerge(CC.fallback_lattice, exct, r.exct)
@@ -2391,9 +2394,168 @@ function ci_cache_serve(st::UInferState, mi::Core.MethodInstance)
     return UResult(rt, effects, exct)
 end
 
-function infer_method(fr::Frame, match::Core.MethodMatch, args::Vector{Any})::UResult
+"""The `MethodInstance` running one level above the active frame at depth `d`
+(stock's `cycle_parent`). Depth 1's parent is the body the query entered on,
+which is not itself in `active`."""
+function active_parent(st::UInferState, d::Int)
+    d <= 1 && return st.entry_mi
+    for (ami, ad) in st.active
+        ad == d - 1 && return ami
+    end
+    return nothing
+end
+
+"""Stock `abstract_call_method`'s recursion type-limiting, ported onto the
+unified frame stack. Returns the signature to specialize: `match.spec_types`
+when no limit applies, a widened SUPERTYPE of it otherwise.
+
+`infer_method`'s `st.active` test detects recursion by exact `MethodInstance`
+identity, which is precisely stock's `is_edge_recursed` criterion — and just
+as in stock it is blind to a self-call whose argument types GROW at every
+level (`gg(x::X...) where {X} = gg(x, x)`, #13183): each level intersects to a
+fresh, strictly larger `specTypes`, so no `mi` ever repeats and inference
+would specialize without bound. Stock's answer, ported here, is to detect the
+possible recursion by METHOD identity over the frames on the stack and hand
+the signature to `limit_type_size` before specializing it, which drives the
+growing signature to a fixpoint (`Tuple{typeof(gg),Tuple,Tuple}` for the case
+above) that then does recurse to itself by exact `mi` identity and closes the
+cycle the ordinary way.
+
+The widened signature is a supertype of the requested one, so its result is a
+sound over-approximation for the caller; because whether the limit fires
+depends on the shape of the stack rather than on the call alone, the caller
+marks the result context-dependent (`st.limited`, stock's
+`poison_callstack!`) so it stays out of the permanent caches."""
+function limit_recursion_sig(fr::Frame, match::Core.MethodMatch, hardlimit::Bool)
     st = fr.st
     m = match.method
+    sig = match.spec_types
+    isempty(st.active) && return sig
+    Base.unwrap_unionall(sig) isa DataType || return sig
+    # the innermost active frame running this method (stock keeps the first hit
+    # of its inside-out stack unwind). A frame whose `specTypes` already equals
+    # `sig` is plain self-recursion, which the `active` test below handles
+    # precisely — never widen for it.
+    cand = nothing
+    canddepth = 0
+    for (ami, d) in st.active
+        ami.def === m || continue
+        ami.specTypes == sig && return sig
+        d > canddepth && (cand = ami; canddepth = d)
+    end
+    cand === nothing && return sig
+    # stock's `edge_matches_sv` limits only when the callee's inference-limit
+    # token matches the frame's. Unified frames carry no
+    # `method_for_inference_limit_heuristics` token, so a generated callee that
+    # declares one can never match and is left unlimited.
+    tok = try
+        CC.method_for_inference_heuristics(m, sig, match.sparams, st.cfg.world)
+    catch
+        return sig
+    end
+    tok === nothing || return sig
+    callermi = frame_mi(fr)
+    if !hardlimit
+        # a soft limit additionally requires the candidate's PARENT to run the
+        # same method as the calling frame, so the FIRST self-recursive call —
+        # whose signature has not started growing yet — stays precise
+        pmi = active_parent(st, canddepth)
+        (pmi === nothing || callermi === nothing) && return sig
+        pmi.def === callermi.def || return sig
+        # a declared `recursion_relation` gets the chance to certify that this
+        # recursion is well-founded and needs no widening
+        if isdefined(m, :recursion_relation)
+            ok = try
+                Core._call_in_world_total(Base.get_world_counter(), m.recursion_relation,
+                                          m, nothing, sig, cand.specTypes)
+            catch
+                false
+            end
+            ok === true && return sig
+        end
+    end
+    # a `recursion_relation` is not required to be transitive: apply a hard limit
+    isdefined(m, :recursion_relation) && (hardlimit = true)
+    msig = Base.unwrap_unionall(m.sig)
+    msig isa DataType || return sig
+    spec_len = length(msig.parameters) + 1
+    local comparison
+    if callermi !== nothing && m === callermi.def
+        # under direct self-recursion, permit much greater use of reducers:
+        # complexity(specTypes) is assumed to already dominate complexity(sig)
+        comparison = callermi.specTypes
+        let cmp = Base.unwrap_unionall(comparison)
+            cmp isa DataType && (spec_len = max(spec_len, length(cmp.parameters)))
+        end
+    elseif !hardlimit
+        comparison = cand.specTypes      # without a hardlimit, reducers too
+    else
+        comparison = m.sig
+    end
+    source = hardlimit || callermi === nothing ? comparison : callermi.specTypes
+    return try
+        CC.limit_type_size(sig, comparison, source,
+                           CC.InferenceParams().tuple_complexity_limit_depth, spec_len)
+    catch
+        sig
+    end
+end
+
+"""Does the type tree of `t` nest more than `d` parameter levels deep? The
+walk stops as soon as the bound is exceeded, so it stays cheap even for the
+exponentially sized (subterm-sharing) types a runaway specialization builds —
+unlike `limit_type_size`, whose `is_derived_type` walk is what makes handing
+such a type to the stock oracle hang (#13183)."""
+function type_nests_deeper(@nospecialize(t), d::Int)
+    if t isa DataType
+        isempty(t.parameters) && return false
+        d <= 0 && return true
+        for p in t.parameters
+            type_nests_deeper(p, d - 1) && return true
+        end
+    elseif t isa Union
+        return type_nests_deeper(t.a, d) || type_nests_deeper(t.b, d)
+    elseif t isa UnionAll
+        return type_nests_deeper(t.body, d)
+    elseif CC.isvarargtype(t)
+        return type_nests_deeper(Base.unwrapva(t), d)
+    end
+    return false
+end
+
+"Nesting depth past which a cutoff signature is answered `Any` instead of by
+the stock oracle (see `type_nests_deeper`)."
+const NATIVE_FALLBACK_DEPTH_CAP = 10
+
+function infer_method(fr::Frame, match::Core.MethodMatch, args::Vector{Any},
+                      hardlimit::Bool = false)::UResult
+    st = fr.st
+    m = match.method
+    # recursion type-limiting, BEFORE the signature is specialized: a self-call
+    # over growing argument types has no repeating `mi` for the `active` test
+    # below to catch, so it must be widened to a fixpoint here (#13183)
+    let lsig = limit_recursion_sig(fr, match, hardlimit)
+        if lsig !== match.spec_types
+            # the limit is a property of the stack, not of the call: results
+            # computed on top of it are context-dependent (stock poisons the
+            # callstack instead of caching), which `tainted_limit` enforces
+            st.limited += 1
+            sparams = Core.svec()
+            if m.sig isa UnionAll
+                # the widened signature needs its own static parameters; `sig`
+                # must not be reused for them, since that would re-introduce
+                # exactly the structural complexity just eliminated
+                sparams = try
+                    (ccall(:jl_type_intersection_with_env, Any, (Any, Any),
+                           lsig, m.sig)::Core.SimpleVector)[2]::Core.SimpleVector
+                catch
+                    Core.svec()
+                end
+            end
+            match = Core.MethodMatch(lsig, sparams, m, match.fully_covers)
+            args = Any[]     # const seeds do not survive the widening
+        end
+    end
     mi = CC.specialize_method(match)
     if haskey(st.active, mi)
         st.stats.cycles += 1
@@ -2519,6 +2681,12 @@ function infer_method(fr::Frame, match::Core.MethodMatch, args::Vector{Any})::UR
         # resource cutoff: the result is CONTEXT-dependent — callers must not
         # memoize anything computed on top of it (see `tainted` below)
         st.limited += 1
+        # a growing-signature recursion the limiter above did not catch must
+        # not reach the stock oracle either: `Core.Compiler.return_type` runs
+        # `limit_type_size` over the signature, whose `is_derived_type` walk is
+        # exponential in nesting depth. `Any` is the sound answer.
+        type_nests_deeper(match.spec_types, NATIVE_FALLBACK_DEPTH_CAP) &&
+            return UResult(Any, CC.Effects(), Any)
         return native_result(fr, match)
     end
     srcci = method_src(m, mi, st.cfg.world, st.edges)
