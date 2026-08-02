@@ -369,7 +369,8 @@ function exec_plain!(ir::IR, env::Vector{Any}, s::StmtId, io::IO)
         env[s.id] = true
     elseif k === K"gc_preserve_begin"
         env[s.id] = nothing
-    elseif k === K"gc_preserve_end" || k === K"latestworld" || k === K"coverage_effect"
+    elseif k === K"gc_preserve_end" || k === K"latestworld" || k === K"coverage_effect" ||
+           k === K"aliasscope" || k === K"popaliasscope"
         # no-op
     elseif k === K"new"
         t = opval(ir, env, getop(ir, s, 1))

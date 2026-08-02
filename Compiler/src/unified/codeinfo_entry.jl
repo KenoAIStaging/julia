@@ -357,9 +357,15 @@ function codeinfo_to_ir(ci::Core.CodeInfo; nargs::Int, name::Symbol = :f)
                              UnifiedIR.vop(b.ir, SPARAM_READ_MARKER),
                              UnifiedIR.op_sparam(st.args[1]::Int); type = Any)
             ssamap[i] = UnifiedIR.op_stmt(s)
-        elseif h === :meta || h === :inbounds || h === :loopinfo || h === :aliasscope ||
-               h === :popaliasscope || h === :inline || h === :noinline || h === :purity
+        elseif h === :meta || h === :inbounds || h === :loopinfo ||
+               h === :inline || h === :noinline || h === :purity
             ssamap[i] = UnifiedIR.vop(b.ir, nothing)  # carried as flags/columns later
+        elseif h === :aliasscope || h === :popaliasscope
+            # region brackets consumed by codegen's linear alias-scope stack:
+            # real statements, not metadata (dropping them silently loses the
+            # `@aliasscope`/`Const` noalias annotations)
+            append_stmt!(b, h === :aliasscope ? K"aliasscope" : K"popaliasscope")
+            ssamap[i] = UnifiedIR.vop(b.ir, nothing)
         elseif h === :code_coverage_effect
             append_stmt!(b, K"coverage_effect")
             ssamap[i] = UnifiedIR.vop(b.ir, nothing)

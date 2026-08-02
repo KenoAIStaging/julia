@@ -178,6 +178,29 @@ end
 JoinCtx(joinbb, phis, materialize) = JoinCtx(joinbb, phis, materialize, nothing)
 
 """
+Codegen brackets `@aliasscope` regions by walking the emitted statement array
+in index order, pushing on `Expr(:aliasscope)` and popping on
+`Expr(:popaliasscope)`. Verify the emitted order is a balanced sequence;
+throw `UnsupportedIR` (→ stock fallback) when it is not.
+"""
+function check_aliasscope_balance(stmts::Vector{Any})
+    depth = 0
+    for st in stmts
+        isa(st, Expr) || continue
+        if st.head === :aliasscope
+            depth += 1
+        elseif st.head === :popaliasscope
+            depth -= 1
+            depth < 0 &&
+                throw(UnsupportedIR(":popaliasscope precedes its :aliasscope in the emitted order"))
+        end
+    end
+    depth == 0 ||
+        throw(UnsupportedIR("unbalanced :aliasscope region in the emitted order ($(depth) unclosed)"))
+    return nothing
+end
+
+"""
     ir_to_ircode(ir) -> Compiler.IRCode
 
 Convert dense, typed UnifiedIR (including `try` regions and residual frame
@@ -1286,6 +1309,8 @@ function assemble_ircode(cx::TCtx, ir::UnifiedIR.IR, argmap::Dict{Int32,Int}, ro
         k === K"gc_preserve_end" && return Expr(:gc_preserve_end, ops...)
         k === K"latestworld" && return Expr(:latestworld)
         k === K"coverage_effect" && return Expr(:code_coverage_effect)
+        k === K"aliasscope" && return Expr(:aliasscope)
+        k === K"popaliasscope" && return Expr(:popaliasscope)
         k === K"copyast" && return Expr(:copyast, ops...)
         if k === K"throw_undef_if_not"
             nm = ops[2] isa QuoteNode ? ops[2].value : ops[2]
@@ -1437,6 +1462,15 @@ function assemble_ircode(cx::TCtx, ir::UnifiedIR.IR, argmap::Dict{Int32,Int}, ro
     end
     index = Int[blocks[i].stmts.start for i in 2:length(blocks)]
     cfg = CC.CFG(blocks, index)
+
+    # `@aliasscope` brackets are consumed by codegen's LINEAR walk over the
+    # emitted statement array (a push/pop stack, no CFG involved). Region
+    # linearization can in principle put a `:popaliasscope` ahead of its
+    # `:aliasscope` (or leave the stack unbalanced at the end), which would
+    # pop an empty stack in codegen. The common case — brackets sitting in
+    # one block around a structured region — comes out balanced; anything
+    # else declines to stock rather than emitting a mis-scoped body.
+    check_aliasscope_balance(stmts)
 
     is = CC.InstructionStream(stmts, types, infos, lines, flags)
     di = CC.DebugInfoStream(lines)

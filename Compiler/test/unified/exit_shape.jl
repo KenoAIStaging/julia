@@ -248,4 +248,43 @@ es_newmod0() = es_newmod(:es_anon_mod)
     @test nameof(ES_U.with_unified_compiler(es_newmod0)) === :es_anon_mod
 end
 
+# `@aliasscope` brackets are NOT metadata: codegen walks the emitted statement
+# array linearly, pushing an alias scope on `Expr(:aliasscope)` and popping on
+# `Expr(:popaliasscope)`, and annotates every load in between. The entry
+# converters used to fold both heads away with `:meta`/`:inbounds`, so the
+# emitted body carried no `!alias.scope`/`!noalias` names at all (codegen.jl's
+# `occursin("aliasscope", str)` check on foo31018!).
+function es_aliasscope!(a, b)
+    @Base.Experimental.aliasscope for i in eachindex(a, b)
+        a[i] = Base.Experimental.Const(b)[i]
+    end
+end
+es_aliasscope_straight!(a, b) = @Base.Experimental.aliasscope (a[1] = Base.Experimental.Const(b)[1])
+
+@testset "aliasscope brackets survive to the typed exit, in order" begin
+    for (f, ats) in Any[(es_aliasscope!, Any[Vector{Int}, Vector{Int}]),
+                        (es_aliasscope_straight!, Any[Vector{Int}, Vector{Int}])]
+        uir = ES_U.typed_ir(f, ats)
+        # present in the unified IR as first-class statements (not dropped on entry)
+        kinds = [UnifiedIR.stmt_kind(uir, s) for s in UnifiedIR.each_stmt(uir)]
+        @test count(==(K"aliasscope"), kinds) == 1
+        @test count(==(K"popaliasscope"), kinds) == 1
+        # ...and re-emitted at the boundary, `:aliasscope` strictly first
+        irc = ES_U.ir_to_ircode(uir)
+        heads = [irc[Core.SSAValue(i)][:stmt].head for i in 1:length(irc.stmts)
+                 if Meta.isexpr(irc[Core.SSAValue(i)][:stmt], :aliasscope) ||
+                    Meta.isexpr(irc[Core.SSAValue(i)][:stmt], :popaliasscope)]
+        @test heads == [:aliasscope, :popaliasscope]
+    end
+end
+
+@testset "unbalanced aliasscope emission declines to stock" begin
+    # the balance guard the exit runs over the linearized statement array
+    @test ES_U.check_aliasscope_balance(Any[Expr(:aliasscope), Expr(:popaliasscope)]) === nothing
+    @test_throws ES_U.UnsupportedIR ES_U.check_aliasscope_balance(Any[Expr(:popaliasscope)])
+    @test_throws ES_U.UnsupportedIR ES_U.check_aliasscope_balance(Any[Expr(:aliasscope)])
+    @test_throws ES_U.UnsupportedIR ES_U.check_aliasscope_balance(
+        Any[Expr(:popaliasscope), Expr(:aliasscope)])
+end
+
 end # module UnifiedExitShapeTests

@@ -407,6 +407,10 @@ function emit_stmt!(cx::ExitCtx, s::StmtId, k::UnifiedIR.Kind, loopctxs)
         emitstmt!(cx, Expr(:latestworld))
     elseif k === K"coverage_effect"
         emitstmt!(cx, Expr(:code_coverage_effect))
+    elseif k === K"aliasscope"
+        emitstmt!(cx, Expr(:aliasscope))
+    elseif k === K"popaliasscope"
+        emitstmt!(cx, Expr(:popaliasscope))
     elseif k === K"copyast"
         cx.ssaof[s.id] = emitstmt!(cx, Expr(:copyast, exit_value(cx, UnifiedIR.getop(ir, s, 1))))
     else

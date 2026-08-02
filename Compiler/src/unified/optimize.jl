@@ -1271,6 +1271,7 @@ function ea_scan_inert_kind(k::UnifiedIR.Kind)
            k === K"cell" || k === K"cell_shared" || k === K"cell_get" ||
            k === K"cell_isdefined" || k === K"throw_undef_if_not" ||
            k === K"gc_preserve_begin" || k === K"gc_preserve_end" ||
+           k === K"aliasscope" || k === K"popaliasscope" ||
            k === K"if" || k === K"loop" || k === K"cfg" || k === K"closure"
 end
 

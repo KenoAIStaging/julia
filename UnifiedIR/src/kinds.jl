@@ -493,6 +493,12 @@ register_kind!(CORE_DIALECT, :gc_preserve_end;   result=0, schema=P[:token=>OC_S
 register_kind!(CORE_DIALECT, :boundscheck; result=1, effects=FLAG_REMOVABLE, varargs=true, minops=0)
 register_kind!(CORE_DIALECT, :latestworld; result=0)
 register_kind!(CORE_DIALECT, :coverage_effect; result=0)
+# `@aliasscope` region brackets. Position-sensitive markers: codegen walks the
+# emitted statement array LINEARLY and pushes/pops an alias-scope stack, so the
+# pair must survive the pipeline in order, unduplicated and balanced. Registered
+# without FLAG_REMOVABLE so they are neither DCE'd nor floated (`reorderable`).
+register_kind!(CORE_DIALECT, :aliasscope; result=0)
+register_kind!(CORE_DIALECT, :popaliasscope; result=0)
 register_kind!(CORE_DIALECT, :method_def; result=1, varargs=true, minops=1)
 register_kind!(CORE_DIALECT, :global_decl; result=0, varargs=true, minops=1)
 register_kind!(CORE_DIALECT, :const_decl; result=0, varargs=true, minops=2)

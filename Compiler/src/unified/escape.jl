@@ -885,6 +885,7 @@ function escape_stmt!(astate::EAAnalysisState, s::StmtId, k::UnifiedIR.Kind)
         escape_unanalyzable_obj!(astate, s, astate.estate[s])
     elseif k === K"region_arg" || k === K"value" || k === K"boundscheck" ||
            k === K"latestworld" || k === K"coverage_effect" || k === K"copyast" ||
+           k === K"aliasscope" || k === K"popaliasscope" ||
            k === K"cell_new" || k === K"cell_isdefined" || k === K"isdefined_global" ||
            k === K"unreachable" || k === K"deleted"
         return nothing

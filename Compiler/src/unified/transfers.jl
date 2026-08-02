@@ -873,7 +873,8 @@ function _transfer(fr::Frame, s::StmtId, k::UnifiedIR.Kind)
         condl isa CC.Const && condl.val === false &&
             return (Union{}, CC.EFFECTS_THROWS, UndefVarError)
         return (nothing, CC.EFFECTS_THROWS, UndefVarError)
-    elseif k === K"latestworld" || k === K"coverage_effect"
+    elseif k === K"latestworld" || k === K"coverage_effect" ||
+           k === K"aliasscope" || k === K"popaliasscope"
         # not independently removable, but no observable effect of their own
         return (nothing, CC.Effects(CC.EFFECTS_TOTAL; consistent = CC.ALWAYS_FALSE,
                                     effect_free = CC.EFFECT_FREE_GLOBALLY,
