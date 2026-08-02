@@ -468,6 +468,26 @@ function splice_body!(ir::IR, at::StmtId, callee::IR; argmap::Vector{Operand},
 
     copy_region_into!(root_region(callee), stmt_region(ir, at), at)
 
+    # carry the callee's cell-name channel across the splice: a maybe-undef
+    # cell that only becomes read-before-write AFTER inlining gets its guard
+    # from the CALLER's promote_undef_cells!, which names the UndefVarError
+    # from `meta[:cell_names]` — without the remap the message degrades to
+    # the placeholder `:cell` instead of the source variable
+    let cnames = get(callee.meta, :cell_names, nothing)
+        if cnames isa AbstractDict{Int32,Symbol} && !isempty(cnames)
+            dst = get(ir.meta, :cell_names, nothing)
+            if !(dst isa AbstractDict{Int32,Symbol})
+                dst = Dict{Int32,Symbol}()
+                ir.meta[:cell_names] = dst
+            end
+            for (cid, nm) in cnames
+                o = get(stmtmap, cid, nothing)
+                (o isa Operand && optag(o) == TAG_STMT) || continue
+                dst[asstmt(o).id] = nm
+            end
+        end
+    end
+
     # intersect world validity
     lo = max(ir.valid_worlds[1], callee.valid_worlds[1])
     hi = min(ir.valid_worlds[2], callee.valid_worlds[2])

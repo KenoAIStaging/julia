@@ -68,17 +68,33 @@ end
 
 # Assign an order key strictly between flattened neighbors `lo` and `hi`
 # (StmtId or nothing). Global relabel on gap exhaustion.
+#
+# The key STEPS UP from `lo` by a bounded amount instead of bisecting the whole
+# free range. Bisection halves the gap on every insert, so appending a run of
+# statements after an advancing `lo` towards a fixed `hi` — exactly what
+# `copy_region_into!`/`copy_region_into_fresh!` do when splicing an inlinee —
+# exhausts the gap after ~32 statements and triggers a full `relabel_okeys!`.
+# That walk is O(body) with a `flat_next` that is itself linear in the region
+# nest depth, so splicing into a deeply nested body (e.g. a 1000-block
+# `&&`-chain) burned essentially all of its time relabeling. A bounded step
+# keeps the same invariant (strictly between the neighbors) while making the
+# post-relabel gap last ~2^24 inserts instead of ~32.
+const OKEY_STEP = UInt64(1) << 8   # bounded insertion step (relabel spreads 2^32)
+
 function assign_okey!(ir::IR, s::StmtId, lo::Union{Nothing,StmtId}, hi::Union{Nothing,StmtId})
     e = ir.edit::EditState
-    lokey = lo === nothing ? UInt64(0) : e.okey[lo.id]
-    hikey = hi === nothing ? typemax(UInt64) : e.okey[hi.id]
-    if hikey - lokey < 2
-        relabel_okeys!(ir)
+    for attempt in 1:2
         lokey = lo === nothing ? UInt64(0) : e.okey[lo.id]
         hikey = hi === nothing ? typemax(UInt64) : e.okey[hi.id]
-        hikey - lokey < 2 && error("order-key space exhausted")
+        if hikey - lokey >= 2
+            step = (hikey - lokey) >> 1
+            step > OKEY_STEP && (step = OKEY_STEP)
+            e.okey[s.id] = lokey + step
+            return nothing
+        end
+        attempt == 2 && error("order-key space exhausted")
+        relabel_okeys!(ir)
     end
-    e.okey[s.id] = lokey + (hikey - lokey) >> 1
     return nothing
 end
 
