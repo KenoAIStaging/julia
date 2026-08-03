@@ -146,7 +146,25 @@ mutable struct EditState
     next::Vector{Int32}
     prev::Vector{Int32}
     okey::Vector{UInt64}      # order-key accelerator (global flattened order)
+    # Owned-region accelerator (§4.2). The region step of the flattened walk
+    # (`flat_next`/`flat_prev`/`deep_last`) used to call `owned_regions`, which
+    # scans and allocates over the WHOLE region table; every region boundary of
+    # every `each_stmt` walk therefore cost O(regions). These are the same
+    # owner→regions relation in linked form: `firstreg`/`lastreg` are
+    # statement-indexed heads/tails, `nextsib`/`prevsib` region-indexed links
+    # threading the regions of one owner in table order (dead regions stay in
+    # the chain, exactly as `owned_regions` still reports them). Rebuilt lazily
+    # whenever their lengths fall out of step with the tables (see
+    # `region_links`), so a code path that grows either table without
+    # maintaining them is slow, never wrong.
+    firstreg::Vector{Int32}   # stmt id  -> first region it owns (0 = none)
+    lastreg::Vector{Int32}    # stmt id  -> last region it owns (0 = none)
+    nextsib::Vector{Int32}    # region id -> next region with the same owner
+    prevsib::Vector{Int32}    # region id -> previous region with the same owner
 end
+
+EditState(next::Vector{Int32}, prev::Vector{Int32}, okey::Vector{UInt64}) =
+    EditState(next, prev, okey, Int32[], Int32[], Int32[], Int32[])
 
 """
     IR{Cols}
@@ -346,6 +364,16 @@ end
 "Regions owned by statement `s`, in table order (they are contiguous by construction)."
 function owned_regions(ir::IR, s::StmtId)
     out = RegionId[]
+    if layout(ir) === LAYOUT_EDITABLE
+        # walk the owner's sibling chain instead of the whole region table
+        e = region_links(ir)
+        i = e.firstreg[s.id]
+        while i != 0
+            push!(out, RegionId(i))
+            i = e.nextsib[i]
+        end
+        return out
+    end
     for (i, r) in enumerate(ir.regions)
         r.owner == s && push!(out, RegionId(i))
     end

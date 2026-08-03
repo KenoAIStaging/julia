@@ -38,7 +38,74 @@ function editable(ir::IR)
     ir.edit = EditState(next, prev, okey)
     ir.owner.state = LAYOUT_EDITABLE
     ir.cache.layout_epoch += 1
+    rebuild_region_links!(ir, ir.edit::EditState)
     return ir
+end
+
+# ---- owned-region links (the `flat_next` region step; §4.2) ----
+
+# Ready the owner→regions links for a flattened-walk step. The O(1) check
+# below is the whole validity contract: `alloc_stmt!` and `register_region!`
+# extend the links in step with the statement/region tables, and anything that
+# grows a table without them leaves a length mismatch that costs one rebuild.
+@inline function region_links(ir::IR)
+    e = ir.edit::EditState
+    if length(e.nextsib) != length(ir.regions) || length(e.firstreg) != Int(ir.body.len)
+        rebuild_region_links!(ir, e)
+    end
+    return e
+end
+
+function rebuild_region_links!(ir::IR, e::EditState)
+    n = Int(ir.body.len)
+    nr = length(ir.regions)
+    resize!(e.firstreg, n); fill!(e.firstreg, Int32(0))
+    resize!(e.lastreg, n);  fill!(e.lastreg, Int32(0))
+    resize!(e.nextsib, nr); fill!(e.nextsib, Int32(0))
+    resize!(e.prevsib, nr); fill!(e.prevsib, Int32(0))
+    for i in 1:nr
+        o = ir.regions[i].owner.id
+        (o == 0 || o > n) && continue      # guard/root regions have no owner
+        t = e.lastreg[o]
+        if t == 0
+            e.firstreg[o] = Int32(i)
+        else
+            e.nextsib[t] = Int32(i)
+            e.prevsib[i] = t
+        end
+        e.lastreg[o] = Int32(i)
+    end
+    return nothing
+end
+
+"""
+    register_region!(ir, rid)
+
+Thread a region just appended to `ir.regions` onto its owner's sibling chain
+(editable state; a no-op elsewhere, where the links are rebuilt on entry).
+Regions are only ever appended, so the chain stays in table order.
+"""
+function register_region!(ir::IR, rid::RegionId)
+    layout(ir) === LAYOUT_EDITABLE || return nothing
+    e = ir.edit
+    e === nothing && return nothing
+    e = e::EditState
+    # not in step (some other path grew a table): leave it to the rebuild
+    (length(e.nextsib) == rid.id - 1 && length(e.firstreg) == Int(ir.body.len)) ||
+        return nothing
+    push!(e.nextsib, Int32(0))
+    push!(e.prevsib, Int32(0))
+    o = ir.regions[rid.id].owner.id
+    o == 0 && return nothing
+    t = e.lastreg[o]
+    if t == 0
+        e.firstreg[o] = Int32(rid.id)
+    else
+        e.nextsib[t] = Int32(rid.id)
+        e.prevsib[rid.id] = t
+    end
+    e.lastreg[o] = Int32(rid.id)
+    return nothing
 end
 
 # ---- linked-list primitives ----
@@ -124,6 +191,9 @@ function alloc_stmt!(ir::IR, k::Kind, ops::Vector{Operand};
     s = _append_row!(ir, k, w, type, f, debug, NULL_REGION)
     e = ir.edit::EditState
     push!(e.next, 0); push!(e.prev, 0); push!(e.okey, 0)
+    if length(e.firstreg) == s.id - 1     # keep the owned-region links in step
+        push!(e.firstreg, Int32(0)); push!(e.lastreg, Int32(0))
+    end
     return s
 end
 
@@ -188,11 +258,12 @@ end
 function region_entry_anchor(ir::IR, r::RegionId)
     reg = getregion(ir, r)
     isnull(reg.owner) && return nothing
-    rs = owned_regions(ir, reg.owner)
-    idx = findfirst(==(r), rs)
-    for j in (idx-1):-1:1
-        t = getregion(ir, rs[j]).last
+    e = region_links(ir)
+    q = e.prevsib[r.id]
+    while q != 0
+        t = ir.regions[q].last
         t.id != 0 && return deep_last(ir, StmtId(t.id))
+        q = e.prevsib[q]
     end
     return reg.owner
 end

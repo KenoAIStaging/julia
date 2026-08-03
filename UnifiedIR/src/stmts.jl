@@ -92,13 +92,16 @@ regions, then continues the region list, then pops to the parent's
 continuation.
 """
 function flat_next(ir::IR, s::StmtId)
-    e = ir.edit::EditState
+    # `e.firstreg`/`e.nextsib` make every region step here O(1) and
+    # allocation-free; `owned_regions` would rescan the whole region table.
+    e = region_links(ir)
     # descend into first owned region
     if owns_regions(stmt_kind(ir, s)) && !is_tombstone(ir, s)
-        rs = owned_regions(ir, s)
-        for rid in rs
-            f = getregion(ir, rid).first
+        r = e.firstreg[s.id]
+        while r != 0
+            f = ir.regions[r].first
             f.id != 0 && return StmtId(f.id)
+            r = e.nextsib[r]
         end
     end
     # continue within the region list, else pop upward
@@ -106,15 +109,15 @@ function flat_next(ir::IR, s::StmtId)
     while true
         nxt = e.next[i.id]
         nxt != 0 && return StmtId(nxt)
-        reg = getregion(ir, stmt_region(ir, i))
-        owner = reg.owner
+        cur = stmt_region(ir, i)
+        owner = getregion(ir, cur).owner
         isnull(owner) && return nothing   # end of root
         # next sibling owned region of the same owner?
-        rs = owned_regions(ir, owner)
-        idx = findfirst(==(stmt_region(ir, i)), rs)
-        for j in (idx+1):length(rs)
-            f = getregion(ir, rs[j]).first
+        r = e.nextsib[cur.id]
+        while r != 0
+            f = ir.regions[r].first
             f.id != 0 && return StmtId(f.id)
+            r = e.nextsib[r]
         end
         i = owner
     end
@@ -122,17 +125,17 @@ end
 
 "Predecessor of `s` in flattened order (editable state)."
 function flat_prev(ir::IR, s::StmtId)
-    e = ir.edit::EditState
+    e = region_links(ir)
     p = e.prev[s.id]
     if p == 0
-        reg = getregion(ir, stmt_region(ir, s))
-        owner = reg.owner
+        cur = stmt_region(ir, s)
+        owner = getregion(ir, cur).owner
         isnull(owner) && return nothing
-        rs = owned_regions(ir, owner)
-        idx = findfirst(==(stmt_region(ir, s)), rs)
-        for j in (idx-1):-1:1
-            t = getregion(ir, rs[j]).last
+        r = e.prevsib[cur.id]
+        while r != 0
+            t = ir.regions[r].last
             t.id != 0 && return deep_last(ir, StmtId(t.id))
+            r = e.prevsib[r]
         end
         return owner
     end
@@ -141,16 +144,18 @@ end
 
 "Deepest last statement of the subtree rooted at s (s itself if no regions)."
 function deep_last(ir::IR, s::StmtId)
+    e = region_links(ir)
     while owns_regions(stmt_kind(ir, s)) && !is_tombstone(ir, s)
-        rs = owned_regions(ir, s)
+        r = e.lastreg[s.id]
         found = false
-        for j in length(rs):-1:1
-            t = getregion(ir, rs[j]).last
+        while r != 0
+            t = ir.regions[r].last
             if t.id != 0
                 s = StmtId(t.id)
                 found = true
                 break
             end
+            r = e.prevsib[r]
         end
         found || break
     end

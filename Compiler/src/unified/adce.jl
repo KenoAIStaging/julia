@@ -66,15 +66,17 @@ function block_in_edges(ir::UnifiedIR.IR)
     return tgt
 end
 
-# Containing block of statement `s` among the blocks in `own`
-# (region id -> block index), walking the region ancestry through owner
-# statements; 0 when `s` is not nested inside one of those blocks.
-function _containing_block(ir::UnifiedIR.IR, own::Dict{Int32,Int}, s::StmtId)
+# Containing block of statement `s` among the blocks of island `k`
+# (`island_of`/`blockidx` are region-indexed, see `drop_unreachable_blocks!`),
+# walking the region ancestry through owner statements; 0 when `s` is not
+# nested inside one of that island's blocks.
+function _containing_block(ir::UnifiedIR.IR, island_of::Vector{Int32},
+                           blockidx::Vector{Int32}, k::Int, s::StmtId)
     cur = s
     while true
         r = UnifiedIR.stmt_region(ir, cur)
         UnifiedIR.isnull(r) && return 0
-        haskey(own, r.id) && return own[r.id]
+        island_of[r.id] == k && return Int(blockidx[r.id])
         reg = UnifiedIR.getregion(ir, r)
         UnifiedIR.isnull(reg.owner) && return 0
         cur = reg.owner
@@ -101,39 +103,71 @@ function drop_unreachable_blocks!(ir::UnifiedIR.IR)
     changed = true
     while changed
         changed = false
-        for s in collect(UnifiedIR.each_stmt(ir))
+        # Two body walks per round, not one per `cfg` statement: the edge scan
+        # used to be nested inside the per-cfg loop inside this fixpoint, so a
+        # body with many islands paid O(cfgs x stmts) per round (cubic on the
+        # 1000-block `&&` chain of issue #47065). Round one indexes every
+        # island's live blocks by region id; round two attributes each edge to
+        # the island it targets, so every island's successor graph is built by
+        # the same walk.
+        islands = Vector{RegionId}[]
+        nr = UnifiedIR.nregions(ir)
+        island_of = zeros(Int32, nr)          # region id -> island index
+        blockidx = zeros(Int32, nr)           # region id -> block index
+        for s in UnifiedIR.each_stmt(ir)
             UnifiedIR.is_tombstone(ir, s) && continue
             UnifiedIR.stmt_kind(ir, s) === K"cfg" || continue
             rs = UnifiedIR.live_owned_regions(ir, s)
-            n = length(rs)
-            n == 0 && continue
-            own = Dict{Int32,Int}(r.id => i for (i, r) in enumerate(rs))
-            succs = [Int[] for _ in 1:n]
-            seen = falses(n)
-            stack = Int[1]
-            seen[1] = true                            # entry block
-            for e in UnifiedIR.each_stmt(ir)
-                UnifiedIR.is_tombstone(ir, e) && continue
-                is_edge_kind(UnifiedIR.stmt_kind(ir, e)) || continue
-                for (dest, _) in UnifiedIR.edge_bundles(ir, e)
-                    j = get(own, dest.id, 0)
-                    j == 0 && continue
-                    i = _containing_block(ir, own, e)
-                    if i == 0                         # entry from outside
-                        seen[j] || (seen[j] = true; push!(stack, j))
-                    else
-                        push!(succs[i], j)
-                    end
+            isempty(rs) && continue
+            push!(islands, rs)
+            k = length(islands)
+            for (i, r) in enumerate(rs)
+                island_of[r.id] = Int32(k)
+                blockidx[r.id] = Int32(i)
+            end
+        end
+        isempty(islands) && break
+        nisl = length(islands)
+        succs = Vector{Vector{Int}}[]
+        seen = BitVector[]
+        stacks = Vector{Int}[]
+        for k in 1:nisl
+            nb = length(islands[k])
+            push!(succs, [Int[] for _ in 1:nb])
+            sn = falses(nb)
+            sn[1] = true                                  # entry block
+            push!(seen, sn)
+            push!(stacks, Int[1])
+        end
+        for e in UnifiedIR.each_stmt(ir)
+            UnifiedIR.is_tombstone(ir, e) && continue
+            is_edge_kind(UnifiedIR.stmt_kind(ir, e)) || continue
+            for (dest, _) in UnifiedIR.edge_bundles(ir, e)
+                di = Int(dest.id)
+                (1 <= di <= nr) || continue
+                k = Int(island_of[di])
+                k == 0 && continue
+                j = Int(blockidx[di])
+                i = _containing_block(ir, island_of, blockidx, k, e)
+                if i == 0                         # entry from outside
+                    seen[k][j] || (seen[k][j] = true; push!(stacks[k], j))
+                else
+                    push!(succs[k][i], j)
                 end
             end
-            while !isempty(stack)
-                b = pop!(stack)
-                for c in succs[b]
-                    seen[c] || (seen[c] = true; push!(stack, c))
+        end
+        for k in 1:nisl
+            sn = seen[k]; sc = succs[k]; st = stacks[k]
+            while !isempty(st)
+                b = pop!(st)
+                for c in sc[b]
+                    sn[c] || (sn[c] = true; push!(st, c))
                 end
             end
-            for j in 1:n
-                seen[j] && continue
+            rs = islands[k]
+            for j in 1:length(rs)
+                sn[j] && continue
+                UnifiedIR.getregion(ir, rs[j]).dead && continue   # island already gone
                 UnifiedIR.kill_region!(ir, rs[j])
                 removed += 1
                 changed = true
@@ -214,7 +248,13 @@ function merge_goto_chains!(ir::UnifiedIR.IR)
             UnifiedIR.kill_region!(ir, dest)
             merged += 1
             changed = true
-            break   # region table changed; recompute in-edges
+            # Keep scanning this round instead of restarting: a merge moves
+            # `C`'s terminator into `B` unchanged and drops only the `B → C`
+            # edge, so every OTHER block's in-edge count in `tgt` still holds
+            # (`C` itself is dead now, and dead destinations are skipped
+            # above). Restarting made a chain of k blocks cost k full body
+            # scans; the outer fixpoint still reruns for the merges this
+            # round's snapshot cannot see.
         end
     end
     return merged

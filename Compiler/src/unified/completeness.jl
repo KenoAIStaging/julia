@@ -75,34 +75,71 @@ Dense state.
 function drop_dead_cells!(ir::UnifiedIR.IR)
     UnifiedIR.check_state(ir, UnifiedIR.LAYOUT_DENSE, "drop_dead_cells!")
     UnifiedIR.flush_renames!(ir)
-    dropped = 0
+    n = UnifiedIR.nstmts(ir)
+    # Classify every cell in ONE use walk. Per cell this used to run a fresh
+    # `each_ssa_use` over the whole body, i.e. O(cells x refs) — quadratic on
+    # bodies with many frame cells (the 1000-block `&&` chain of issue #47065
+    # spent most of its optimizer time right here).
+    cellidx = zeros(Int32, n)                 # stmt -> index into `cells`
+    cells = StmtId[]
     for c in UnifiedIR.each_stmt(ir)
         UnifiedIR.is_tombstone(ir, c) && continue
         UnifiedIR.stmt_kind(ir, c) === K"cell" || continue
-        sets = StmtId[]; news = StmtId[]
+        push!(cells, c)
+        cellidx[c.id] = Int32(length(cells))
+    end
+    if isempty(cells)
+        UnifiedIR.flush_renames!(ir)
+        return 0
+    end
+    nc = length(cells)
+    sets = [StmtId[] for _ in 1:nc]
+    news = [StmtId[] for _ in 1:nc]
+    obs = [StmtId[] for _ in 1:nc]            # observing users (get/isdefined/escape)
+    hard = falses(nc)                         # observed from a non-statement site
+    UnifiedIR.each_ssa_use(ir) do site, used
+        used.id <= n || return
+        ci = Int(cellidx[used.id])
+        ci == 0 && return
+        site isa UnifiedIR.StmtOperand || (hard[ci] = true; return)
+        u = site.user
+        k = UnifiedIR.stmt_kind(ir, u)
+        if k === K"cell_set" && site.opidx == 1
+            push!(sets[ci], u)
+        elseif k === K"cell_new"
+            push!(news[ci], u)
+        else
+            push!(obs[ci], u)
+        end
+    end
+    # Statement order, as before: deleting a dead cell's `cell_set`/`cell_new`
+    # can be what leaves a LATER cell unobserved, so observation is re-checked
+    # against what this pass has already killed.
+    killed = falses(n)
+    dropped = 0
+    for ci in 1:nc
+        hard[ci] && continue
         observed = false
-        UnifiedIR.each_ssa_use(ir) do site, used
-            (used == c && !observed) || return
-            site isa UnifiedIR.StmtOperand || (observed = true; return)
-            u = site.user
-            UnifiedIR.is_tombstone(ir, u) && return
-            k = UnifiedIR.stmt_kind(ir, u)
-            if k === K"cell_set" && site.opidx == 1
-                push!(sets, u)
-            elseif k === K"cell_new"
-                push!(news, u)
-            else
-                observed = true          # get / isdefined / escape
+        for u in obs[ci]
+            if !killed[u.id]
+                observed = true
+                break
             end
         end
         observed && continue
-        for st in sets
+        for st in sets[ci]
+            killed[st.id] && continue
             UnifiedIR.delete_stmt!(ir, st)
+            killed[st.id] = true
         end
-        for nw in news
+        for nw in news[ci]
+            killed[nw.id] && continue
             UnifiedIR.delete_stmt!(ir, nw)
+            killed[nw.id] = true
         end
+        c = cells[ci]
         UnifiedIR.delete_stmt!(ir, c)
+        killed[c.id] = true
         dropped += 1
     end
     UnifiedIR.flush_renames!(ir)

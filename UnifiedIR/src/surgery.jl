@@ -43,8 +43,10 @@ function new_region!(ir::IR, owner::StmtId, kind::RegionKind;
         error(LazyString("new_region!: kind ", kindname(stmt_kind(ir, owner)), " does not own regions"))
     reg = Region(kind, owner, stmt_region(ir, owner); activation)
     push!(ir.regions, reg)
+    rid = RegionId(length(ir.regions))
+    register_region!(ir, rid)
     ir.cache.region_epoch += 1
-    return RegionId(length(ir.regions))
+    return rid
 end
 
 """
@@ -423,7 +425,9 @@ function splice_body!(ir::IR, at::StmtId, callee::IR; argmap::Vector{Operand},
                     creg = getregion(callee, crid)
                     nr = Region(creg.kind, new, dest; activation = creg.activation)
                     push!(ir.regions, nr)
-                    regionmap[crid.id] = RegionId(length(ir.regions))
+                    nrid = RegionId(length(ir.regions))
+                    register_region!(ir, nrid)
+                    regionmap[crid.id] = nrid
                 end
                 for crid in crids
                     copy_region_into_fresh!(crid, regionmap[crid.id])
@@ -456,7 +460,9 @@ function splice_body!(ir::IR, at::StmtId, callee::IR; argmap::Vector{Operand},
                     creg = getregion(callee, crid)
                     nr = Region(creg.kind, new, dest; activation = creg.activation)
                     push!(ir.regions, nr)
-                    regionmap[crid.id] = RegionId(length(ir.regions))
+                    nrid = RegionId(length(ir.regions))
+                    register_region!(ir, nrid)
+                    regionmap[crid.id] = nrid
                 end
                 for crid in crids
                     copy_region_into_fresh!(crid, regionmap[crid.id])
