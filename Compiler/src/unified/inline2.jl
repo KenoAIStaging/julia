@@ -833,7 +833,7 @@ usual constructor `self` slot — is not affected: type application is
 deduplicated by the type cache, so an argument equal to `RefValue{Any}` IS
 `RefValue{Any}` and `T` is pinned by identity."""
 function sparam_from_type_slot(@nospecialize(t), tv::TypeVar)
-    if CC.isType(t) && t.parameters[1] === tv
+    if CC.isType(t) && CC.type_parameter(t) === tv
         return true
     end
     if t isa DataType
