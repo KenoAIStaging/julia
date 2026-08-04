@@ -54,16 +54,36 @@ function repl_workload()
     # Event to signal that REPL.activate has been called
     activate_done = Base.Event()
 
+    # If any of the subtasks the workload waits on dies, the event it was
+    # supposed to notify never fires and the waits below would hang the
+    # precompile process forever. Record the failure and wake the waiters
+    # so the error propagates instead.
+    workload_error = Ref{Any}(nothing)
+    function subtask_failed(@nospecialize exc)
+        workload_error[] === nothing && (workload_error[] = exc)
+        notify(prompt_ready)
+        notify(activate_done)
+    end
+    function checked_wait(ev)
+        wait(ev)
+        exc = workload_error[]
+        exc === nothing || throw(exc)
+        nothing
+    end
+
     atreplinit() do repl
         # Set the prompt_ready_event on the repl - run_frontend will copy it to mistate
         if repl isa REPL.LineEditREPL
             repl.prompt_ready_event = prompt_ready
         end
         # Start async task to wait for first prompt then activate the module
-        t = @async begin
+        t = @async try
             wait(prompt_ready)
             REPL.activate(REPL.Precompile; interactive_utils=false)
             notify(activate_done)
+        catch exc
+            subtask_failed(exc)
+            rethrow()
         end
         Base.errormonitor(t)
     end
@@ -148,6 +168,22 @@ function repl_workload()
             close(pts)
         end
         Base.errormonitor(repltask)
+        # Watch for the REPL task dying (or exiting early) so waiters get
+        # woken instead of blocking forever on events it can no longer notify.
+        script_done = Ref(false)
+        watchdog = @async begin
+            exc = try
+                wait(repltask)
+                nothing
+            catch exc
+                exc
+            end
+            if exc !== nothing
+                subtask_failed(exc)
+            elseif !script_done[]
+                subtask_failed(ErrorException("REPL task exited before the precompile workload completed"))
+            end
+        end
         try
             Base.REPL_MODULE_REF[] = REPL
             redirect_stdin(pts)
@@ -160,11 +196,11 @@ function repl_workload()
             end
             schedule(repltask)
             # Wait for the first prompt, then for activate to complete
-            wait(activate_done)
+            checked_wait(activate_done)
             # Send a newline to get the activated prompt
             write(ptm, "\n")
             # Wait for the new prompt to be ready
-            wait(prompt_ready)
+            checked_wait(prompt_ready)
 
             # Input our script
             precompile_lines = split(repl_script::String, '\n'; keepempty=false)
@@ -177,9 +213,10 @@ function repl_workload()
                 else
                     write(ptm, l, "\n")
                     # Wait for REPL to signal it's ready for next input
-                    wait(prompt_ready)
+                    checked_wait(prompt_ready)
                 end
             end
+            script_done[] = true
             write(ptm, "$CTRL_D")
             wait(repltask)
         finally
