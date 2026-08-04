@@ -1,4 +1,8 @@
-LINEARALGEBRA_BRANCH = master
-LINEARALGEBRA_SHA1 = 963bb9dedff36e2df706ef82461e69582e2cf3a0
-LINEARALGEBRA_GIT_URL := https://github.com/JuliaLang/LinearAlgebra.jl.git
-LINEARALGEBRA_TAR_URL = https://api.github.com/repos/JuliaLang/LinearAlgebra.jl/tarball/$1
+# TEMPORARY: fetch from the KenoAIStaging fork carrying the BLAS-cancellation
+# hooks (branch kf/blas-cancellation-2, based on the previously pinned
+# upstream commit 963bb9de); restore the JuliaLang URLs when the staged
+# branch lands upstream.
+LINEARALGEBRA_BRANCH = kf/blas-cancellation-2
+LINEARALGEBRA_SHA1 = b178e56a519344504fca706c51e30d320b9e09b6
+LINEARALGEBRA_GIT_URL := https://github.com/KenoAIStaging/LinearAlgebra.jl.git
+LINEARALGEBRA_TAR_URL = https://api.github.com/repos/KenoAIStaging/LinearAlgebra.jl/tarball/$1
