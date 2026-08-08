@@ -1833,4 +1833,39 @@ if !Sys.iswindows() && !running_under_rr()
             wait(p)
         end
     end
+
+    if Base.identify_package("Distributed") !== nothing
+        @testset "Distributed.interrupt cancels the in-flight request" begin
+            # With cancellation-scoped worker interrupts, `interrupt(w)`
+            # cancels exactly the remotely-submitted in-flight work: the
+            # request fails with a RemoteException (wrapping the
+            # CancellationRequest) and the worker survives to serve the
+            # next request.
+            script = """
+                using Distributed
+                w = addprocs(1)[1]
+                ready = RemoteChannel(() -> Channel{Bool}(1))
+                r = @spawnat w (put!(ready, true); sleep(30); "completed")
+                take!(ready)
+                interrupt(w)
+                v = try
+                    fetch(r)
+                catch e
+                    e
+                end
+                v == "completed" && exit(1)
+                v isa RemoteException || exit(2)
+                # the worker survives and still serves requests
+                remotecall_fetch(+, w, 1, 1) == 2 || exit(3)
+                exit(0)
+                """
+            cmd = addenv(`$(Base.julia_cmd()) --startup-file=no -e $script`,
+                         Dict("JULIA_LOAD_PATH" => "@stdlib"))
+            p = run(pipeline(cmd; stdout=devnull, stderr=devnull); wait=false)
+            exited = timedwait(() -> process_exited(p), 120) === :ok
+            @test exited && p.exitcode == 0
+            process_running(p) && kill(p, Base.SIGKILL)
+            wait(p)
+        end
+    end
 end
