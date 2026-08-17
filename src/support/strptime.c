@@ -401,12 +401,12 @@ literal:
 			continue;
 
 #ifndef TIME_MAX
-#define TIME_MAX	INT64_MAX
+#define TIME_MAX	(sizeof(time_t) == sizeof(int32_t) ? INT32_MAX : INT64_MAX)
 #endif
 		case 's':	/* seconds since the epoch */
 			{
-				time_t sse = 0;
-				uint64_t rulim = TIME_MAX;
+				uint64_t sse = 0;
+				const uint64_t time_max = TIME_MAX;
 
 				if (*bp < '0' || *bp > '9') {
 					bp = NULL;
@@ -414,18 +414,19 @@ literal:
 				}
 
 				do {
-					sse *= 10;
-					sse += *bp++ - '0';
-					rulim /= 10;
-				} while ((sse * 10 <= TIME_MAX) &&
-					 rulim && *bp >= '0' && *bp <= '9');
+					uint64_t digit = *bp++ - '0';
+					if (sse > (time_max - digit) / 10) {
+						bp = NULL;
+						break;
+					}
+					sse = sse * 10 + digit;
+				} while (*bp >= '0' && *bp <= '9');
 
-				if (sse < 0 || (uint64_t)sse > TIME_MAX) {
-					bp = NULL;
+				if (bp == NULL)
 					continue;
-				}
 
-				if (localtime_r(&sse, tm) == NULL)
+				time_t t = (time_t)sse;
+				if (localtime_r(&t, tm) == NULL)
 					bp = NULL;
 				else
 					state |= S_YDAY | S_WDAY |

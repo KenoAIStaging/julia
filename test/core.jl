@@ -5950,6 +5950,20 @@ end
 # issue #19963
 @test_nowarn ccall(:jl_free, Cvoid, (Ptr{Cvoid},), C_NULL)
 
+# Allocation overflow checks must run before sizes are wrapped or divided.
+@test_throws OutOfMemoryError ccall(:jl_gc_allocobj, Ptr{Cvoid}, (Csize_t,), typemax(Csize_t))
+@test_throws OutOfMemoryError ccall(:jl_gc_perm_alloc, Ptr{Cvoid},
+                                    (Csize_t, Cint, Cuint, Cuint),
+                                    typemax(Csize_t), 0, 64, 0)
+@test_throws OutOfMemoryError ccall(:jl_gc_managed_malloc, Ptr{Cvoid},
+                                    (Csize_t,), typemax(Csize_t))
+@test ccall(:jl_calloc, Ptr{Cvoid}, (Csize_t, Csize_t),
+            typemax(Csize_t), 2) == C_NULL
+@test_nowarn begin
+    local p = ccall(:jl_calloc, Ptr{Cvoid}, (Csize_t, Csize_t), 1, 0)
+    ccall(:jl_free, Cvoid, (Ptr{Cvoid},), p)
+end
+
 # Wrong string size on 64bits for large string.
 if Sys.WORD_SIZE == 64
     @noinline function test_large_string20360(slot)
@@ -6244,6 +6258,61 @@ for i in 1:10
     ptr2 = ccall(:jl_box_int64, UInt, (Int64,), i)
     @test ptr1 === ptr2
     @test ptr1 % 16 == 0
+end
+
+# Runtime signed integer boxing must not overflow while checking the cache range.
+@test ccall(:jl_box_int32, Any, (Int32,), typemin(Int32)) === typemin(Int32)
+@test ccall(:jl_box_int32, Any, (Int32,), typemax(Int32)) === typemax(Int32)
+@test ccall(:jl_box_int64, Any, (Int64,), typemin(Int64)) === typemin(Int64)
+@test ccall(:jl_box_int64, Any, (Int64,), typemax(Int64)) === typemax(Int64)
+
+# Invalid IR counts and one-based indices must be rejected before sizing or indexing.
+@test_throws ErrorException Core.eval(Main, Core.SSAValue(typemin(Int)))
+const malformed_thunk_index_module = Module(:MalformedThunkIndexTests)
+Core.eval(malformed_thunk_index_module, :(Base.Experimental.@compiler_options infer=false))
+let
+    seed() = 1
+    for count in (Int(typemin(Int32)), 0)
+        ci = only(code_lowered(seed, ()))
+        ci.ssavaluetypes = count
+        @test_throws ErrorException Core.eval(malformed_thunk_index_module, Expr(:thunk, ci))
+    end
+    ci = only(code_lowered(seed, ()))
+    ci.ssavaluetypes = typemax(Int)
+    @test_throws OutOfMemoryError Core.eval(malformed_thunk_index_module, Expr(:thunk, ci))
+end
+function malformed_thunk_index(last, nssa=2)
+    seed() = 1
+    ci = only(code_lowered(seed, ()))
+    ci.code = Any[Expr(:meta, :force_compile), last]
+    ci.ssavaluetypes = nssa
+    ci.ssaflags = zeros(UInt32, 2)
+    Core.eval(malformed_thunk_index_module, Expr(:thunk, ci))
+end
+for (last, nssa) in ((Core.ReturnNode(Core.SSAValue(typemin(Int))), 2),
+                     (Core.ReturnNode(Core.SlotNumber(typemin(Int))), 2),
+                     (Core.GotoNode(typemin(Int)), 2),
+                     (Core.ReturnNode(1), 1))
+    @test_throws ErrorException redirect_stderr(devnull) do
+        malformed_thunk_index(last, nssa)
+    end
+end
+
+# Method metadata must validate slot offsets and form specialization masks unsigned.
+let
+    argnames = ntuple(i -> Symbol(:x, i), 32)
+    fname = gensym(:nospecialize_overflow)
+    f = Core.eval(@__MODULE__, Expr(:function, Expr(:call, fname, argnames...), 1))
+    m = which(f, Tuple{ntuple(_ -> Any, 32)...})
+    ci = Base.uncompressed_ast(m)
+    ci.code = Any[Expr(:meta, :nospecialize,
+                       Core.SlotNumber(Int(typemin(Int32))),
+                       Core.SlotNumber(33)),
+                  ci.code...]
+    ci.ssavaluetypes = length(ci.code)
+    ci.ssaflags = zeros(UInt32, length(ci.code))
+    ccall(:jl_method_set_source, Cvoid, (Any, Any), m, ci)
+    @test m.nospecialize == typemin(Int32)
 end
 
 # issue #21581
@@ -7336,6 +7405,15 @@ let x = TypeWith24Bits(0x112233), y = TypeWith24Bits(0x445566), z = TypeWith24Bi
         unsafe_store!(p, i % UInt8, i)
     end
     @test V[1:4] == [TypeWith24Bits(0x030201), TypeWith24Bits(0x070605), TypeWith24Bits(0x0b0a09), TypeWith24Bits(0x0f0e0d)]
+end
+
+# Relative MemoryRef indexing must form pointers from the checked absolute offset.
+for T in (UInt8, Any, NTuple{3,UInt8}, Nothing, Union{UInt8,Int8})
+    local m = Memory{T}(undef, 4)
+    local r = Core.memoryrefnew(Core.memoryrefnew(m), 3, true)
+    @test Core.memoryrefoffset(Core.memoryrefnew(r, 0, true)) == 2
+    @test Core.memoryrefoffset(Core.memoryrefnew(r, -1, true)) == 1
+    @test_throws BoundsError Core.memoryrefnew(r, typemin(Int), true)
 end
 
 # issue #29718

@@ -167,6 +167,11 @@
 ; cvalues and arrays
 (assert (equal? (typeof "") '(array byte)))
 (assert-fail (aref #(1) 3) bounds-error)
+
+; I/O slice bounds must be checked without wrapping offset + count.
+(assert-fail (let ((b (buffer)))
+               (io.write b "ab" (size 1) (size -1)))
+             bounds-error)
 (define iarr (array 'int64 32 16 8 7 1))
 (assert (equal? (aref iarr 0) 32))
 (assert (equal? (aref iarr #int8(3)) 7))

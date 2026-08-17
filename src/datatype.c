@@ -1569,8 +1569,8 @@ BOX_FUNC(uint8pointer, uint8_t*,  jl_box)
     JL_DLLEXPORT jl_value_t *jl_box_##typ(c_type x)                     \
     {                                                                   \
         jl_task_t *ct = jl_current_task;                                \
-        c_type idx = x+NBOX_C/2;                                        \
-        if ((u##c_type)idx < (u##c_type)NBOX_C)                         \
+        u##c_type idx = (u##c_type)x + NBOX_C/2;                        \
+        if (idx < (u##c_type)NBOX_C)                                    \
             return boxed_##typ##_cache[idx];                            \
         jl_value_t *v = jl_gc_alloc(ct->ptls, LLT_ALIGN(sizeof(x), sizeof(void*)), \
                                     jl_##typ##_type);                   \

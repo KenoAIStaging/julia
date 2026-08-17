@@ -367,12 +367,12 @@ static inline void malloc_maybe_collect(jl_ptls_t ptls, size_t sz)
     // We do not need to carefully maintain malloc_sz_since_last_poll. We just need to
     // avoid using mmtk_gc_poll too frequently, and try to be precise on our heap usage
     // as much as we can.
-    if (ptls->gc_tls.malloc_sz_since_last_poll > 4096) {
+    size_t curr = jl_atomic_load_relaxed(&ptls->gc_tls.malloc_sz_since_last_poll);
+    if (curr > 4096 || __builtin_add_overflow(curr, sz, &curr)) {
         jl_atomic_store_relaxed(&ptls->gc_tls.malloc_sz_since_last_poll, 0);
         mmtk_gc_poll(ptls);
     } else {
-        size_t curr = jl_atomic_load_relaxed(&ptls->gc_tls.malloc_sz_since_last_poll);
-        jl_atomic_store_relaxed(&ptls->gc_tls.malloc_sz_since_last_poll, curr + sz);
+        jl_atomic_store_relaxed(&ptls->gc_tls.malloc_sz_since_last_poll, curr);
         jl_gc_safepoint_(ptls);
     }
 }
@@ -1102,14 +1102,18 @@ int jl_gc_classify_pools(size_t sz, int *osize)
 // MMTk assumes allocation size is aligned to min alignment.
 STATIC_INLINE size_t mmtk_align_alloc_sz(size_t sz) JL_NOTSAFEPOINT
 {
-    return (sz + MMTK_MIN_ALIGNMENT - 1) & ~(MMTK_MIN_ALIGNMENT - 1);
+    size_t allocsz;
+    if (__builtin_add_overflow(sz, MMTK_MIN_ALIGNMENT - 1, &allocsz))
+        jl_throw(jl_memory_exception);
+    return allocsz & ~(MMTK_MIN_ALIGNMENT - 1);
 }
 
 STATIC_INLINE void* bump_alloc_fast(MMTkMutatorContext* mutator, uintptr_t* cursor, uintptr_t limit, size_t size, size_t align, size_t offset, int allocator) {
     intptr_t delta = (-offset - *cursor) & (align - 1);
-    uintptr_t result = *cursor + (uintptr_t)delta;
+    uintptr_t result;
 
-    if (__unlikely(result + size > limit)) {
+    if (__unlikely(__builtin_add_overflow(*cursor, (uintptr_t)delta, &result) ||
+                   result > limit || size > limit - result)) {
         return (void*) mmtk_alloc(mutator, size, align, offset, allocator);
     } else{
         *cursor = result + size;
@@ -1190,11 +1194,11 @@ JL_DLLEXPORT jl_value_t *jl_mmtk_gc_alloc_big(jl_ptls_t ptls, size_t sz)
     assert(sz >= sizeof(jl_taggedvalue_t) && "sz must include tag");
     static_assert(offsetof(bigval_t, header) >= sizeof(void*), "Empty bigval header?");
     static_assert(sizeof(bigval_t) % JL_HEAP_ALIGNMENT == 0, "");
-    size_t allocsz = LLT_ALIGN(sz + offs, JL_CACHE_BYTE_ALIGNMENT);
-    if (allocsz < sz) { // overflow in adding offs, size was "negative"
-        assert(0 && "Error when allocating big object");
+    size_t allocsz;
+    if (__builtin_add_overflow(sz, offs, &allocsz) ||
+        __builtin_add_overflow(allocsz, JL_CACHE_BYTE_ALIGNMENT - 1, &allocsz))
         jl_throw(jl_memory_exception);
-    }
+    allocsz &= ~(JL_CACHE_BYTE_ALIGNMENT - 1);
 
     bigval_t *v = (bigval_t*)mmtk_alloc_large(&ptls->gc_tls.mmtk_mutator, allocsz, JL_CACHE_BYTE_ALIGNMENT, 0, 2);
 
@@ -1237,12 +1241,13 @@ JL_DLLEXPORT jl_value_t *jl_gc_big_alloc(jl_ptls_t ptls, size_t sz, jl_value_t *
 inline jl_value_t *jl_gc_alloc_(jl_ptls_t ptls, size_t sz, void *ty)
 {
     jl_value_t *v;
-    const size_t allocsz = sz + sizeof(jl_taggedvalue_t);
     if (sz <= GC_MAX_SZCLASS) {
+        const size_t allocsz = sz + sizeof(jl_taggedvalue_t);
         v = jl_mmtk_gc_alloc_default(ptls, allocsz, 16, ty);
     }
     else {
-        if (allocsz < sz) // overflow in adding offs, size was "negative"
+        size_t allocsz;
+        if (__builtin_add_overflow(sz, sizeof(jl_taggedvalue_t), &allocsz))
             jl_throw(jl_memory_exception);
         v = jl_mmtk_gc_alloc_big(ptls, allocsz);
     }
@@ -1318,7 +1323,9 @@ void *jl_gc_perm_alloc(size_t sz, int zero, unsigned align, unsigned offset)
 
 jl_value_t *jl_gc_permobj(jl_ptls_t ptls, size_t sz, void *ty, unsigned align) JL_NOTSAFEPOINT
 {
-    const size_t allocsz = sz + sizeof(jl_taggedvalue_t);
+    size_t allocsz;
+    if (__builtin_add_overflow(sz, sizeof(jl_taggedvalue_t), &allocsz))
+        jl_throw(jl_memory_exception);
     if (align == 0) {
         align = ((sz == 0) ? sizeof(void*) : (allocsz <= sizeof(void*) * 2 ?
                                                  sizeof(void*) * 2 : 16));
@@ -1334,10 +1341,11 @@ jl_value_t *jl_gc_permobj(jl_ptls_t ptls, size_t sz, void *ty, unsigned align) J
 JL_DLLEXPORT void *jl_gc_managed_malloc(size_t sz)
 {
     jl_ptls_t ptls = jl_current_task->ptls;
-    malloc_maybe_collect(ptls, sz);
-    size_t allocsz = LLT_ALIGN(sz, JL_CACHE_BYTE_ALIGNMENT);
-    if (allocsz < sz)  // overflow in adding offs, size was "negative"
+    size_t allocsz;
+    if (__builtin_add_overflow(sz, JL_CACHE_BYTE_ALIGNMENT - 1, &allocsz))
         jl_throw(jl_memory_exception);
+    allocsz &= ~(JL_CACHE_BYTE_ALIGNMENT - 1);
+    malloc_maybe_collect(ptls, sz);
 
     int last_errno = errno;
 #ifdef _OS_WINDOWS_

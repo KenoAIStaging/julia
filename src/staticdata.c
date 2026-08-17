@@ -406,13 +406,13 @@ static int jl_needs_serialization(jl_serializer_state *s, jl_value_t *v) JL_NOTS
         return 0;
     }
     else if (jl_typetagis(v, jl_int64_tag << 4)) {
-        int64_t i64 = *(int64_t*)v + NBOX_C / 2;
-        if ((uint64_t)i64 < NBOX_C)
+        uint64_t i64 = (uint64_t)*(int64_t*)v + NBOX_C / 2;
+        if (i64 < NBOX_C)
             return 0;
     }
     else if (jl_typetagis(v, jl_int32_tag << 4)) {
-        int32_t i32 = *(int32_t*)v + NBOX_C / 2;
-        if ((uint32_t)i32 < NBOX_C)
+        uint32_t i32 = (uint32_t)*(int32_t*)v + NBOX_C / 2;
+        if (i32 < NBOX_C)
             return 0;
     }
     else if (jl_typetagis(v, jl_uint8_tag << 4)) {
@@ -1197,13 +1197,13 @@ static uintptr_t _backref_id(jl_serializer_state *s, jl_value_t *v, jl_array_t *
         return ((uintptr_t)TagRef << RELOC_TAG_OFFSET) + 1;
     }
     else if (jl_typetagis(v, jl_int64_tag << 4)) {
-        int64_t i64 = *(int64_t*)v + NBOX_C / 2;
-        if ((uint64_t)i64 < NBOX_C)
+        uint64_t i64 = (uint64_t)*(int64_t*)v + NBOX_C / 2;
+        if (i64 < NBOX_C)
             return ((uintptr_t)TagRef << RELOC_TAG_OFFSET) + i64 + 2;
     }
     else if (jl_typetagis(v, jl_int32_tag << 4)) {
-        int32_t i32 = *(int32_t*)v + NBOX_C / 2;
-        if ((uint32_t)i32 < NBOX_C)
+        uint32_t i32 = (uint32_t)*(int32_t*)v + NBOX_C / 2;
+        if (i32 < NBOX_C)
             return ((uintptr_t)TagRef << RELOC_TAG_OFFSET) + i32 + 2 + NBOX_C;
     }
     else if (jl_typetagis(v, jl_uint8_tag << 4)) {
@@ -2912,7 +2912,7 @@ JL_DLLEXPORT jl_value_t *jl_as_global_root(jl_value_t *val, int insert)
         return jl_box_uint8(jl_unbox_uint8(val));
     if (jl_is_int32(val)) {
         int32_t n = jl_unbox_int32(val);
-        if ((uint32_t)(n+512) < 1024)
+        if ((uint32_t)n + 512 < 1024)
             return jl_box_int32(n);
     }
     else if (jl_is_int64(val)) {

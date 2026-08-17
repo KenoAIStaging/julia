@@ -286,8 +286,9 @@ JL_DLLEXPORT jl_value_t *jl_alloc_string(size_t len)
 {
     if (len == 0)
         return jl_an_empty_string;
-    size_t sz = sizeof(size_t) + len + 1; // add space for trailing \nul protector and size
-    if (sz < len) // overflow
+    size_t sz;
+    // Add space for the size field and trailing \nul protector.
+    if (__builtin_add_overflow(len, sizeof(size_t) + 1, &sz))
         jl_throw(jl_memory_exception);
     jl_task_t *ct = jl_current_task;
     jl_value_t *s;

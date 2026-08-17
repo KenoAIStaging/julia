@@ -873,18 +873,18 @@ static int jl_##name##bf16(unsigned runtime_nbits, void *pa, void *pb) JL_NOTSAF
 }
 
 
-// integer inputs, with precondition test
-// OP::Function macro(inputa, inputb)
+// integer inputs, with checked arithmetic
+// OVERFLOW_OP::Compiler overflow builtin(inputa, inputb, result)
 // name::unique string
 // nbits::number of bits
 // c_type::c_type corresponding to nbits
-#define checked_intrinsic_ctype(CHECK_OP, OP, name, nbits, c_type) \
+#define checked_intrinsic_ctype(OVERFLOW_OP, name, nbits, c_type) \
 static int jl_##name##nbits(unsigned runtime_nbits, void *pa, void *pb, void *pr) JL_NOTSAFEPOINT \
 { \
     c_type a = *(c_type*)pa; \
     c_type b = *(c_type*)pb; \
-    *(c_type*)pr = (c_type)OP(a, b); \
-    return CHECK_OP(c_type, a, b);    \
+    (void)runtime_nbits; \
+    return OVERFLOW_OP(a, b, (c_type*)pr); \
 }
 
 // float inputs
@@ -1171,11 +1171,11 @@ JL_DLLEXPORT jl_value_t *jl_##name(jl_value_t *a, jl_value_t *b) \
 { \
     return jl_iintrinsic_2(a, b, #name, u##signbitbyte, lambda_checked, name##_list, 0); \
 }
-#define checked_iintrinsic_fast(LLVMOP, CHECK_OP, OP, name, u) \
-checked_intrinsic_ctype(CHECK_OP, OP, name, 8, u##int##8_t) \
-checked_intrinsic_ctype(CHECK_OP, OP, name, 16, u##int##16_t) \
-checked_intrinsic_ctype(CHECK_OP, OP, name, 32, u##int##32_t) \
-checked_intrinsic_ctype(CHECK_OP, OP, name, 64, u##int##64_t) \
+#define checked_iintrinsic_fast(LLVMOP, OVERFLOW_OP, name, u) \
+checked_intrinsic_ctype(OVERFLOW_OP, name, 8, u##int##8_t) \
+checked_intrinsic_ctype(OVERFLOW_OP, name, 16, u##int##16_t) \
+checked_intrinsic_ctype(OVERFLOW_OP, name, 32, u##int##32_t) \
+checked_intrinsic_ctype(OVERFLOW_OP, name, 64, u##int##64_t) \
 static const select_intrinsic_checked_t name##_list = { \
     LLVMOP, \
     jl_##name##8, \
@@ -1709,38 +1709,10 @@ cvt_iintrinsic(fpext, fpext)
 
 
 // checked arithmetic
-/**
- * s_typemin = - s_typemax - 1
- * s_typemax = ((t)1 << (runtime_nbits - 1)) - 1
- * u_typemin = 0
- * u_typemax = ((t)1 << runtime_nbits) - 1
- **/
-#define sTYPEMIN(t) -sTYPEMAX(t) - 1
-#define sTYPEMAX(t)                                                \
-    ((t)(8 * sizeof(a) == runtime_nbits                            \
-         ? ((((((t)1) << (8 * sizeof(t) - 2)) - 1) << 1) + 1)      \
-         : (  (((t)1) << (runtime_nbits - 1)) - 1)))
-
-#define uTYPEMIN(t) ((t)0)
-#define uTYPEMAX(t)                                             \
-    ((t)(8 * sizeof(t) == runtime_nbits                         \
-         ? (~((t)0)) : (~(((t)~((t)0)) << runtime_nbits))))
-#define check_sadd_int(t, a, b)                                         \
-        /* this test checks for (b >= 0) ? (a + b > typemax) : (a + b < typemin) ==> overflow */ \
-        (b >= 0) ? (a > sTYPEMAX(t) - b) : (a < sTYPEMIN(t) - b)
-checked_iintrinsic_fast(APInt_add_sov, check_sadd_int, add, checked_sadd_int,  )
-#define check_uadd_int(t, a, b)                                       \
-    /* this test checks for (a + b) > typemax(a) ==> overflow */      \
-    a > uTYPEMAX(t) - b
-checked_iintrinsic_fast(APInt_add_uov, check_uadd_int, add, checked_uadd_int, u)
-#define check_ssub_int(t, a, b)                                         \
-    /* this test checks for (b >= 0) ? (a - b < typemin) : (a - b > typemax) ==> overflow */ \
-    (b >= 0) ? (a < sTYPEMIN(t) + b) : (a > sTYPEMAX(t) + b)
-checked_iintrinsic_fast(APInt_sub_sov, check_ssub_int, sub, checked_ssub_int,  )
-#define check_usub_int(t, a, b)                                   \
-    /* this test checks for (a - b) < typemin ==> overflow */     \
-    a < uTYPEMIN(t) + b
-checked_iintrinsic_fast(APInt_sub_uov, check_usub_int, sub, checked_usub_int, u)
+checked_iintrinsic_fast(APInt_add_sov, __builtin_add_overflow, checked_sadd_int,  )
+checked_iintrinsic_fast(APInt_add_uov, __builtin_add_overflow, checked_uadd_int, u)
+checked_iintrinsic_fast(APInt_sub_sov, __builtin_sub_overflow, checked_ssub_int,  )
+checked_iintrinsic_fast(APInt_sub_uov, __builtin_sub_overflow, checked_usub_int, u)
 checked_iintrinsic_slow(APInt_mul_sov, checked_smul_int,  )
 checked_iintrinsic_slow(APInt_mul_uov, checked_umul_int, u)
 

@@ -974,19 +974,20 @@ JL_DLLEXPORT void jl_method_set_source(jl_method_t *m, jl_code_info_t *src) JL_C
                     jl_value_t *aj = jl_exprarg(st, j);
                     if (!jl_is_slotnumber(aj) && !jl_is_argument(aj))
                         continue;
-                    int sn = (int)jl_slot_number(aj) - 2;
-                    if (sn < 0) // @nospecialize on self is valid but currently ignored
+                    intptr_t slot = jl_slot_number(aj);
+                    if (slot < 2) // @nospecialize on self is valid but currently ignored
                         continue;
-                    if (sn > (m->nargs - 2)) {
+                    if ((size_t)slot > m->nargs) {
                         jl_error("@nospecialize annotation applied to a non-argument");
                     }
+                    size_t sn = (size_t)slot - 2;
                     if (sn >= sizeof(m->nospecialize) * 8) {
                         jl_printf(JL_STDERR,
                                   "WARNING: @nospecialize annotation only supported on the first %d arguments.\n",
                                   (int)(sizeof(m->nospecialize) * 8));
                         continue;
                     }
-                    m->nospecialize |= (1 << sn);
+                    m->nospecialize |= (UINT32_C(1) << sn);
                 }
                 st = jl_nothing;
             }
@@ -997,19 +998,20 @@ JL_DLLEXPORT void jl_method_set_source(jl_method_t *m, jl_code_info_t *src) JL_C
                     jl_value_t *aj = jl_exprarg(st, j);
                     if (!jl_is_slotnumber(aj) && !jl_is_argument(aj))
                         continue;
-                    int sn = (int)jl_slot_number(aj) - 2;
-                    if (sn < 0) // @specialize on self is valid but currently ignored
+                    intptr_t slot = jl_slot_number(aj);
+                    if (slot < 2) // @specialize on self is valid but currently ignored
                         continue;
-                    if (sn > (m->nargs - 2)) {
+                    if ((size_t)slot > m->nargs) {
                         jl_error("@specialize annotation applied to a non-argument");
                     }
+                    size_t sn = (size_t)slot - 2;
                     if (sn >= sizeof(m->nospecialize) * 8) {
                         jl_printf(JL_STDERR,
                                   "WARNING: @specialize annotation only supported on the first %d arguments.\n",
                                   (int)(sizeof(m->nospecialize) * 8));
                         continue;
                     }
-                    m->nospecialize &= ~(1 << sn);
+                    m->nospecialize &= ~(UINT32_C(1) << sn);
                 }
                 st = jl_nothing;
             }

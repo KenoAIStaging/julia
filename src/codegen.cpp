@@ -14,6 +14,7 @@
 #include <fstream>
 #include <map>
 #include <array>
+#include <climits>
 #include <vector>
 #include <set>
 #include <unordered_set>
@@ -2253,6 +2254,13 @@ jl_aliasinfo_t jl_aliasinfo_t::fromTBAA(jl_codectx_t &ctx, MDNode *tbaa) {
     return jl_aliasinfo_t(ctx, Region::unknown, tbaa);
 }
 
+static size_t checked_one_based_index(intptr_t index, size_t length, const char *kind)
+{
+    if (index <= 0 || (size_t)index > length)
+        jl_errorf("invalid %s index", kind);
+    return (size_t)index - 1;
+}
+
 static Type *julia_type_to_llvm(jl_codectx_t &ctx, jl_value_t *jt, bool *isboxed = NULL) JL_CANSAFEPOINT;
 static jl_cgval_t emit_expr(jl_codectx_t &ctx, jl_value_t *expr, ssize_t ssaval = -1) JL_CANSAFEPOINT;
 static jl_cgval_t emit_checked_var(jl_codectx_t &ctx, Value *bp, jl_sym_t *name, jl_value_t *scope, bool isvol, MDNode *tbaa) JL_CANSAFEPOINT;
@@ -3326,8 +3334,8 @@ static jl_value_t *static_eval(jl_codectx_t &ctx, jl_value_t *ex) JL_CANSAFEPOIN
     if (jl_is_slotnumber(ex) || jl_is_argument(ex))
         return NULL;
     if (jl_is_ssavalue(ex)) {
-        ssize_t idx = ((jl_ssavalue_t*)ex)->id - 1;
-        assert(idx >= 0);
+        size_t idx = checked_one_based_index(((jl_ssavalue_t*)ex)->id,
+            ctx.ssavalue_assigned.size(), "SSAValue");
         if (ctx.ssavalue_assigned[idx]) {
             return ctx.SAvalues[idx].constant;
         }
@@ -3420,7 +3428,10 @@ static jl_value_t *static_eval(jl_codectx_t &ctx, jl_value_t *ex) JL_CANSAFEPOIN
 
 static bool slot_eq(jl_value_t *e, int sl)
 {
-    return (jl_is_slotnumber(e) || jl_is_argument(e)) && jl_slot_number(e)-1 == sl;
+    if (!jl_is_slotnumber(e) && !jl_is_argument(e))
+        return false;
+    intptr_t slot = jl_slot_number(e);
+    return slot > 0 && (size_t)slot - 1 == (size_t)sl;
 }
 
 // --- code gen for intrinsic functions ---
@@ -3485,7 +3496,8 @@ static void mark_volatile_vars(jl_array_t *stmts, SmallVectorImpl<jl_varinfo_t> 
             if (e->head == jl_assign_sym) {
                 jl_value_t *l = jl_exprarg(e, 0);
                 if (jl_is_slotnumber(l)) {
-                    assigned_in_block.set(jl_slot_number(l)-1);
+                    size_t slot = checked_one_based_index(jl_slot_number(l), slots.size(), "slot");
+                    assigned_in_block.set(slot);
                 }
             }
         }
@@ -3568,7 +3580,7 @@ static void simple_use_analysis(jl_codectx_t &ctx, jl_value_t *expr)
 {
     auto scan_slot_arg = [&](jl_value_t *expr) {
         if (jl_is_slotnumber(expr) || jl_is_argument(expr)) {
-            int i = jl_slot_number(expr) - 1;
+            size_t i = checked_one_based_index(jl_slot_number(expr), ctx.slots.size(), "slot");
             ctx.slots[i].used = true;
             return true;
         }
@@ -6190,7 +6202,7 @@ static jl_cgval_t emit_isdefined(jl_codectx_t &ctx, jl_value_t *sym, int allow_i
 {
     Value *isnull = NULL;
     if (jl_is_slotnumber(sym) || jl_is_argument(sym)) {
-        size_t sl = jl_slot_number(sym) - 1;
+        size_t sl = checked_one_based_index(jl_slot_number(sym), ctx.slots.size(), "slot");
         jl_varinfo_t &vi = ctx.slots[sl];
         if (!vi.usedUndef)
             return mark_julia_const(ctx, jl_true);
@@ -6333,7 +6345,7 @@ static jl_cgval_t emit_varinfo(jl_codectx_t &ctx, jl_varinfo_t &vi, jl_sym_t *va
 
 static jl_cgval_t emit_local(jl_codectx_t &ctx, jl_value_t *slotload) JL_CANSAFEPOINT
 {
-    size_t sl = jl_slot_number(slotload) - 1;
+    size_t sl = checked_one_based_index(jl_slot_number(slotload), ctx.slots.size(), "slot");
     jl_varinfo_t &vi = ctx.slots[sl];
     jl_sym_t *sym = slot_symbol(ctx, sl);
     if (sym == jl_unused_sym) {
@@ -6621,7 +6633,7 @@ static void emit_assignment(jl_codectx_t &ctx, jl_value_t *l, jl_value_t *r, ssi
     jl_cgval_t rval_info = emit_expr(ctx, r, ssaval);
 
     if (jl_is_slotnumber(l)) {
-        int sl = jl_slot_number(l) - 1;
+        size_t sl = checked_one_based_index(jl_slot_number(l), ctx.slots.size(), "slot");
         // it's a local variable
         jl_varinfo_t &vi = ctx.slots[sl];
         emit_varinfo_assign(ctx, vi, rval_info, l);
@@ -6776,7 +6788,7 @@ static void emit_stmtpos(jl_codectx_t &ctx, jl_value_t *expr, int ssaval_result)
     if (jl_is_ssavalue(expr) && ssaval_result == -1)
         return; // value not used, no point in attempting codegen for it
     if (jl_is_slotnumber(expr) && ssaval_result == -1) {
-        size_t sl = jl_slot_number(expr) - 1;
+        size_t sl = checked_one_based_index(jl_slot_number(expr), ctx.slots.size(), "slot");
         jl_varinfo_t &vi = ctx.slots[sl];
         if (vi.usedUndef)
             (void)emit_expr(ctx, expr);
@@ -6788,7 +6800,8 @@ static void emit_stmtpos(jl_codectx_t &ctx, jl_value_t *expr, int ssaval_result)
     if (jl_is_newvarnode(expr)) {
         jl_value_t *var = jl_fieldref(expr, 0);
         assert(jl_is_slotnumber(var));
-        jl_varinfo_t &vi = ctx.slots[jl_slot_number(var)-1];
+        size_t slot = checked_one_based_index(jl_slot_number(var), ctx.slots.size(), "slot");
+        jl_varinfo_t &vi = ctx.slots[slot];
         if (vi.usedUndef) {
             // create a new uninitialized variable
             Value *lv = vi.boxroot;
@@ -6822,7 +6835,8 @@ static void emit_stmtpos(jl_codectx_t &ctx, jl_value_t *expr, int ssaval_result)
             if (arg == jl_nothing)
                 continue;
             assert(jl_is_ssavalue(arg));
-            size_t enter_idx = ((jl_ssavalue_t*)arg)->id - 1;
+            size_t enter_idx = checked_one_based_index(((jl_ssavalue_t*)arg)->id,
+                jl_array_nrows(ctx.code), "SSAValue");
             jl_value_t *enter_stmt = jl_array_ptr_ref(ctx.code, enter_idx);
             if (enter_stmt == jl_nothing)
                 continue;
@@ -6974,8 +6988,8 @@ static jl_cgval_t emit_expr(jl_codectx_t &ctx, jl_value_t *expr, ssize_t ssaidx_
         return emit_local(ctx, expr);
     }
     if (jl_is_ssavalue(expr)) {
-        ssize_t idx = ((jl_ssavalue_t*)expr)->id - 1;
-        assert(idx >= 0);
+        size_t idx = checked_one_based_index(((jl_ssavalue_t*)expr)->id,
+            ctx.ssavalue_assigned.size(), "SSAValue");
         if (!ctx.ssavalue_assigned[idx]) {
             ctx.ssavalue_assigned[idx] = true; // (assignment, not comparison test)
             return jl_cgval_t(); // dead code branch
@@ -8919,6 +8933,8 @@ static jl_llvm_functions_t
     ctx.spvals_ptr = NULL;
     jl_array_t *stmts = ctx.code;
     size_t stmtslen = jl_array_dim0(stmts);
+    if (stmtslen > INT_MAX)
+        jl_error("invalid statement count");
 
     // step 1b. unpack debug information
     int coverage_mode = jl_options.code_coverage;
@@ -8955,7 +8971,8 @@ static jl_llvm_functions_t
     for (size_t i = 0; i < stmtslen; ++i) {
         jl_value_t *stmt = jl_array_ptr_ref(stmts, i);
         if (jl_is_gotoifnot(stmt)) {
-            int dest = jl_gotoifnot_label(stmt);
+            int dest = (int)checked_one_based_index(jl_gotoifnot_label(stmt),
+                stmtslen, "statement") + 1;
             branch_targets.insert(dest);
             // The next 1-indexed statement
             branch_targets.insert(i + 2);
@@ -8972,12 +8989,16 @@ static jl_llvm_functions_t
             branch_targets.insert(i + 1);
             if (i + 2 <= stmtslen)
                 branch_targets.insert(i + 2);
-            size_t catch_dest = jl_enternode_catch_dest(stmt);
-            if (catch_dest)
-                branch_targets.insert(catch_dest);
+            intptr_t catch_dest = jl_enternode_catch_dest(stmt);
+            if (catch_dest) {
+                int dest = (int)checked_one_based_index(catch_dest,
+                    stmtslen, "statement") + 1;
+                branch_targets.insert(dest);
+            }
         }
         else if (jl_is_gotonode(stmt)) {
-            int dest = jl_gotonode_label(stmt);
+            int dest = (int)checked_one_based_index(jl_gotonode_label(stmt),
+                stmtslen, "statement") + 1;
             branch_targets.insert(dest);
             if (i + 2 <= stmtslen)
                 branch_targets.insert(i + 2);
@@ -8993,7 +9014,18 @@ static jl_llvm_functions_t
     }
 
     // step 2. process var-info lists to see what vars need boxing
-    int n_ssavalues = jl_is_long(src->ssavaluetypes) ? jl_unbox_long(src->ssavaluetypes) : jl_array_nrows(src->ssavaluetypes);
+    size_t n_ssavalues;
+    if (jl_is_long(src->ssavaluetypes)) {
+        ssize_t count = jl_unbox_long(src->ssavaluetypes);
+        if (count < 0)
+            jl_error("invalid SSAValue count");
+        n_ssavalues = (size_t)count;
+    }
+    else {
+        n_ssavalues = jl_array_nrows(src->ssavaluetypes);
+    }
+    if (n_ssavalues < stmtslen)
+        jl_error("invalid SSAValue count");
     size_t vinfoslen = jl_array_dim0(src->slotflags);
     ctx.slots.resize(vinfoslen, jl_varinfo_t(ctx.builder.getContext()));
     assert(abi); // the specTypes field should always be assigned
@@ -9137,7 +9169,10 @@ static jl_llvm_functions_t
                         continue;
                     if (!jl_is_argument(stmt))
                         return -1;
-                    unsigned sl = jl_slot_number(stmt) - 1;
+                    intptr_t slot = jl_slot_number(stmt);
+                    if (slot <= 0)
+                        return -1;
+                    size_t sl = (size_t)slot - 1;
                     if (sl >= nreq)
                         return -1;
                     if (retarg == -1)
@@ -9491,7 +9526,7 @@ static jl_llvm_functions_t
 
             auto scan_ssavalue = [&](jl_value_t *val) {
                 if (jl_is_ssavalue(val)) {
-                    size_t ssa_idx = ((jl_ssavalue_t*)val)->id-1;
+                    size_t ssa_idx = (size_t)((jl_ssavalue_t*)val)->id - 1;
                     /*
                      * We technically allow out of bounds SSAValues in dead IR, so make
                      * sure to bounds check this here. It's still not *good* to leave

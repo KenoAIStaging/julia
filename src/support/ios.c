@@ -227,35 +227,47 @@ static char *_buf_realloc(ios_t *s, size_t sz)
 static size_t _write_grow(ios_t *s, const char *data, size_t n)
 {
     size_t amt;
+    size_t endpos;
     size_t newsize;
 
     if (n == 0)
         return 0;
+    assert(s->bpos >= 0 && s->bpos <= s->maxsize);
+    if (__builtin_add_overflow((size_t)s->bpos, n, &endpos) || endpos > INT64_MAX) {
+        errno = ENOMEM;
+        goto no_space;
+    }
 
-    if (s->bpos + n > s->size) {
-        if (s->bpos + n > s->maxsize) {
+    if (endpos > (size_t)s->size) {
+        if (endpos > (size_t)s->maxsize) {
             /* TODO: here you might want to add a mechanism for limiting
                the growth of the stream. */
-            newsize = (size_t)(s->maxsize ? s->maxsize * 2 : 8);
-            while (s->bpos + n > newsize)
-                newsize *= 2;
-            if (_buf_realloc(s, newsize) == NULL) {
-                /* no more space; write as much as we can */
-                amt = (size_t)(s->maxsize - s->bpos);
-                if (amt > 0) {
-                    memcpy(&s->buf[s->bpos], data, amt);
+            newsize = s->maxsize ? (size_t)s->maxsize : 8;
+            while (endpos > newsize) {
+                if (newsize > SIZE_MAX / 2) {
+                    newsize = endpos;
+                    break;
                 }
-                s->bpos += amt;
-                s->size = s->maxsize;
-                return amt;
+                newsize *= 2;
             }
+            if (_buf_realloc(s, newsize) == NULL)
+                goto no_space;
         }
-        s->size = s->bpos + n;
+        s->size = endpos;
     }
     memcpy(s->buf + s->bpos, data, n);
-    s->bpos += n;
+    s->bpos = endpos;
 
     return n;
+
+no_space:
+    /* no more space; write as much as we can */
+    amt = (size_t)(s->maxsize - s->bpos);
+    if (amt > 0)
+        memcpy(&s->buf[s->bpos], data, amt);
+    s->bpos += amt;
+    s->size = s->maxsize;
+    return amt;
 }
 
 

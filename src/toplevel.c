@@ -416,7 +416,10 @@ static void expr_attributes(jl_value_t *v, jl_array_t *body, int *has_ccall, int
         jl_value_t *called = NULL;
         jl_value_t *f = jl_exprarg(e, 0);
         if (jl_is_ssavalue(f)) {
-            f = jl_array_ptr_ref(body, ((jl_ssavalue_t*)f)->id - 1);
+            size_t index = (size_t)((jl_ssavalue_t*)f)->id - 1;
+            if (index >= jl_array_nrows(body))
+                return;
+            f = jl_array_ptr_ref(body, index);
         }
         if (jl_is_globalref(f)) {
             jl_module_t *mod = jl_globalref_mod(f);

@@ -693,17 +693,12 @@ JL_DLLEXPORT void jl_gmp_counted_free_with_size(void *p, size_t sz)
     reset_region_republish(ct, reset_ctx); // may longjmp
 }
 
-//_unchecked_calloc does not check for potential overflow of nm*sz
-STATIC_INLINE void *_unchecked_calloc(size_t nm, size_t sz) JL_CANSAFEPOINT {
-    size_t nmsz = nm*sz;
-    return jl_gc_counted_calloc(nmsz, 1);
-}
-
 JL_DLLEXPORT void *jl_calloc(size_t nm, size_t sz) JL_CANSAFEPOINT
 {
-    if (nm > SSIZE_MAX/sz)
+    size_t nmsz;
+    if (__builtin_mul_overflow(nm, sz, &nmsz) || nmsz > SSIZE_MAX)
         return NULL;
-    return _unchecked_calloc(nm, sz);
+    return jl_gc_counted_calloc(nmsz, 1);
 }
 
 JL_DLLEXPORT void jl_free(void *p)

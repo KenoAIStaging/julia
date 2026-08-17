@@ -527,9 +527,11 @@ STATIC_INLINE jl_value_t *jl_gc_big_alloc_inner(jl_ptls_t ptls, size_t sz) JL_CA
     assert(sz >= sizeof(jl_taggedvalue_t) && "sz must include tag");
     static_assert(offsetof(bigval_t, header) >= sizeof(void*), "Empty bigval header?");
     static_assert(sizeof(bigval_t) % JL_HEAP_ALIGNMENT == 0, "");
-    size_t allocsz = LLT_ALIGN(sz + offs, JL_CACHE_BYTE_ALIGNMENT);
-    if (allocsz < sz)  // overflow in adding offs, size was "negative"
+    size_t allocsz;
+    if (__builtin_add_overflow(sz, offs, &allocsz) ||
+        __builtin_add_overflow(allocsz, JL_CACHE_BYTE_ALIGNMENT - 1, &allocsz))
         jl_throw(jl_memory_exception);
+    allocsz &= ~(JL_CACHE_BYTE_ALIGNMENT - 1);
     bigval_t *v = (bigval_t*)malloc_cache_align(allocsz);
     if (v == NULL)
         jl_throw(jl_memory_exception);
@@ -896,8 +898,8 @@ jl_value_t *jl_gc_small_alloc_noinline(jl_ptls_t ptls, int offset, int osize) {
 inline jl_value_t *jl_gc_alloc_(jl_ptls_t ptls, size_t sz, void *ty)
 {
     jl_value_t *v;
-    const size_t allocsz = sz + sizeof(jl_taggedvalue_t);
     if (sz <= GC_MAX_SZCLASS) {
+        const size_t allocsz = sz + sizeof(jl_taggedvalue_t);
         int pool_id = jl_gc_szclass(allocsz);
         jl_gc_pool_t *p = &ptls->gc_tls.heap.norm_pools[pool_id];
         int osize = jl_gc_sizeclasses[pool_id];
@@ -906,7 +908,8 @@ inline jl_value_t *jl_gc_alloc_(jl_ptls_t ptls, size_t sz, void *ty)
         v = jl_gc_small_alloc_noinline(ptls, (char*)p - (char*)ptls, osize);
     }
     else {
-        if (allocsz < sz) // overflow in adding offs, size was "negative"
+        size_t allocsz;
+        if (__builtin_add_overflow(sz, sizeof(jl_taggedvalue_t), &allocsz))
             jl_throw(jl_memory_exception);
         v = jl_gc_big_alloc_noinline(ptls, allocsz);
     }
@@ -4205,9 +4208,10 @@ JL_DLLEXPORT void *jl_gc_managed_malloc(size_t sz)
 {
     jl_ptls_t ptls = jl_current_task->ptls;
     maybe_collect(ptls);
-    size_t allocsz = LLT_ALIGN(sz, JL_CACHE_BYTE_ALIGNMENT);
-    if (allocsz < sz)  // overflow in adding offs, size was "negative"
+    size_t allocsz;
+    if (__builtin_add_overflow(sz, JL_CACHE_BYTE_ALIGNMENT - 1, &allocsz))
         jl_throw(jl_memory_exception);
+    allocsz &= ~(JL_CACHE_BYTE_ALIGNMENT - 1);
 
     int last_errno = errno;
 #ifdef _OS_WINDOWS_
@@ -4262,8 +4266,9 @@ static void *gc_perm_alloc_large(size_t sz, int zero, unsigned align, unsigned o
     // `align` must be power of two
     assert(offset == 0 || offset < align);
     const size_t malloc_align = sizeof(void*) == 8 ? 16 : 4;
-    if (align > 1 && (offset != 0 || align > malloc_align))
-        sz += align - 1;
+    if (align > 1 && (offset != 0 || align > malloc_align) &&
+        __builtin_add_overflow(sz, align - 1, &sz))
+        jl_throw(jl_memory_exception);
     int last_errno = errno;
 #ifdef _OS_WINDOWS_
     DWORD last_error = GetLastError();
@@ -4339,7 +4344,9 @@ void *jl_gc_perm_alloc(size_t sz, int zero, unsigned align, unsigned offset)
 
 jl_value_t *jl_gc_permobj(jl_ptls_t _ptls, size_t sz, void *ty, unsigned align) JL_NOTSAFEPOINT
 {
-    const size_t allocsz = sz + sizeof(jl_taggedvalue_t);
+    size_t allocsz;
+    if (__builtin_add_overflow(sz, sizeof(jl_taggedvalue_t), &allocsz))
+        jl_throw(jl_memory_exception);
     if (align == 0) {
         align = ((sz == 0) ? sizeof(void*) : (allocsz <= sizeof(void*) * 2 ?
                                                  sizeof(void*) * 2 : 16));

@@ -755,8 +755,12 @@ static jl_cgval_t emit_llvmcall(jl_codectx_t &ctx, jl_value_t **args, size_t nar
     jl_value_t *rt = NULL, *at = NULL, *ir = NULL, *entry = NULL;
     jl_value_t *ir_arg = args[1];
     JL_GC_PUSH4(&ir, &rt, &at, &entry);
-    if (jl_is_ssavalue(ir_arg))
-        ir_arg = jl_array_ptr_ref((jl_array_t*)ctx.source->code, ((jl_ssavalue_t*)ir_arg)->id - 1);
+    if (jl_is_ssavalue(ir_arg)) {
+        jl_array_t *code = (jl_array_t*)ctx.source->code;
+        size_t index = checked_one_based_index(((jl_ssavalue_t*)ir_arg)->id,
+            jl_array_nrows(code), "SSAValue");
+        ir_arg = jl_array_ptr_ref(code, index);
+    }
     ir = static_eval(ctx, ir_arg);
     if (!ir) {
         emit_error(ctx, "error statically evaluating llvm IR argument");
@@ -764,7 +768,10 @@ static jl_cgval_t emit_llvmcall(jl_codectx_t &ctx, jl_value_t **args, size_t nar
         return jl_cgval_t();
     }
     if (jl_is_ssavalue(args[2]) && !jl_is_long(ctx.source->ssavaluetypes)) {
-        jl_value_t *rtt = jl_array_ptr_ref((jl_array_t*)ctx.source->ssavaluetypes, ((jl_ssavalue_t*)args[2])->id - 1);
+        jl_array_t *types = (jl_array_t*)ctx.source->ssavaluetypes;
+        size_t index = checked_one_based_index(((jl_ssavalue_t*)args[2])->id,
+            jl_array_nrows(types), "SSAValue");
+        jl_value_t *rtt = jl_array_ptr_ref(types, index);
         if (jl_is_some_Type(rtt))
             rt = jl_some_Type_T(rtt);
     }
@@ -777,7 +784,10 @@ static jl_cgval_t emit_llvmcall(jl_codectx_t &ctx, jl_value_t **args, size_t nar
         }
     }
     if (jl_is_ssavalue(args[3]) && !jl_is_long(ctx.source->ssavaluetypes)) {
-        jl_value_t *att = jl_array_ptr_ref((jl_array_t*)ctx.source->ssavaluetypes, ((jl_ssavalue_t*)args[3])->id - 1);
+        jl_array_t *types = (jl_array_t*)ctx.source->ssavaluetypes;
+        size_t index = checked_one_based_index(((jl_ssavalue_t*)args[3])->id,
+            jl_array_nrows(types), "SSAValue");
+        jl_value_t *att = jl_array_ptr_ref(types, index);
         if (jl_is_some_Type(att))
             at = jl_some_Type_T(att);
     }

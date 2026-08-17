@@ -303,7 +303,7 @@ static void get_start_count_args(fl_context_t *fl_ctx, value_t *args, uint32_t n
             *nb = tosize(fl_ctx, args[2], fname);
         else
             *nb = sz - *offs;
-        if (*offs >= sz || *offs + *nb > sz)
+        if (*offs >= sz || *nb > sz - *offs)
             bounds_error(fl_ctx, fname, args[0], args[1]);
     }
 }

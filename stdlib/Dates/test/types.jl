@@ -284,6 +284,14 @@ end
 
 end
 
+@static if Sys.iswindows()
+    # The bundled strptime must reject epoch values before signed accumulation overflows.
+    @test_throws ArgumentError Libc.strptime("%s", repeat("0", 19) * "9223372036854775808")
+    if Sys.WORD_SIZE == 32
+        @test_throws ArgumentError Libc.strptime("%s", "4294967296")
+    end
+end
+
 @testset "timer" begin
     @test hasmethod(Timer, (Period,))
     @test hasmethod(Timer, (Function, Period))

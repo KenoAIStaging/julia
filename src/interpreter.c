@@ -179,14 +179,59 @@ jl_value_t *jl_eval_globalref(jl_globalref_t *g, size_t world)
     return v;
 }
 
-static int jl_source_nslots(jl_code_info_t *src) JL_NOTSAFEPOINT
+static size_t jl_source_nslots(jl_code_info_t *src) JL_NOTSAFEPOINT
 {
     return jl_array_nrows(src->slotflags);
 }
 
-static int jl_source_nssavalues(jl_code_info_t *src) JL_NOTSAFEPOINT
+static int jl_source_nssavalues(jl_code_info_t *src, size_t *count) JL_NOTSAFEPOINT
 {
-    return jl_is_long(src->ssavaluetypes) ? jl_unbox_long(src->ssavaluetypes) : jl_array_nrows(src->ssavaluetypes);
+    if (jl_is_long(src->ssavaluetypes)) {
+        ssize_t signed_count = jl_unbox_long(src->ssavaluetypes);
+        if (signed_count < 0)
+            return 0;
+        *count = (size_t)signed_count;
+    }
+    else {
+        *count = jl_array_nrows(src->ssavaluetypes);
+    }
+    return 1;
+}
+
+static size_t jl_checked_source_nssavalues(jl_code_info_t *src)
+{
+    size_t count;
+    if (!jl_source_nssavalues(src, &count))
+        jl_error("invalid SSAValue count");
+    return count;
+}
+
+// Returns -1 for an invalid count, 0 for arithmetic overflow, and 1 on success.
+static int jl_interpreter_nroots(jl_code_info_t *src, size_t extra,
+                                 size_t *nroots) JL_NOTSAFEPOINT
+{
+    size_t nssa;
+    size_t frame_words;
+    size_t frame_bytes;
+    if (!jl_source_nssavalues(src, &nssa))
+        return -1;
+    if (nssa < jl_array_nrows(src->code))
+        return -1;
+    if (__builtin_add_overflow(jl_source_nslots(src), nssa, nroots) ||
+        __builtin_add_overflow(*nroots, extra, nroots) ||
+        *nroots > SIZE_MAX >> 2 ||
+        __builtin_add_overflow(*nroots, (size_t)3, &frame_words) ||
+        __builtin_mul_overflow(frame_words, sizeof(jl_value_t*), &frame_bytes) ||
+        __builtin_add_overflow(frame_bytes, sizeof(interpreter_state), &frame_bytes))
+        return 0;
+    return 1;
+}
+
+static size_t checked_one_based_index(intptr_t index, size_t length, const char *kind)
+{
+    if (index <= 0 || (size_t)index > length)
+        jl_errorf("invalid %s index", kind);
+    return (size_t)index - 1;
 }
 
 static void eval_stmt_value(jl_value_t *stmt, interpreter_state *s) JL_CANSAFEPOINT
@@ -215,11 +260,11 @@ static jl_value_t *eval_value(jl_value_t *e, interpreter_state *s)
 {
     jl_code_info_t *src = s->src;
     if (jl_is_ssavalue(e)) {
-        ssize_t id = ((jl_ssavalue_t*)e)->id - 1;
-        if (src == NULL || id >= jl_source_nssavalues(src) || id < 0 || s->locals == NULL)
+        if (src == NULL || s->locals == NULL)
             jl_error("access to invalid SSAValue");
-        else
-            return s->locals[jl_source_nslots(src) + id];
+        size_t id = checked_one_based_index(((jl_ssavalue_t*)e)->id,
+            jl_checked_source_nssavalues(src), "SSAValue");
+        return s->locals[jl_source_nslots(src) + id];
     }
     if (jl_is_slotnumber(e) || jl_is_argument(e)) {
         ssize_t n = jl_slot_number(e);
@@ -631,12 +676,12 @@ static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, size_t ip,
         size_t next_ip = ip + 1;
         assert(!jl_is_phinode(stmt) && !jl_is_phicnode(stmt) && "malformed IR");
         if (jl_is_gotonode(stmt)) {
-            next_ip = jl_gotonode_label(stmt) - 1;
+            next_ip = checked_one_based_index(jl_gotonode_label(stmt), ns, "statement");
         }
         else if (jl_is_gotoifnot(stmt)) {
             jl_value_t *cond = eval_value(jl_gotoifnot_cond(stmt), s);
             if (cond == jl_false) {
-                next_ip = jl_gotoifnot_label(stmt) - 1;
+                next_ip = checked_one_based_index(jl_gotoifnot_label(stmt), ns, "statement");
             }
             else if (cond != jl_true) {
                 jl_type_error("if", (jl_value_t*)jl_bool_type, cond);
@@ -651,7 +696,8 @@ static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, size_t ip,
                 val = eval_value(val, s);
             jl_value_t *phic = s->locals[jl_source_nslots(s->src) + ip];
             assert(jl_is_ssavalue(phic));
-            ssize_t id = ((jl_ssavalue_t*)phic)->id - 1;
+            size_t id = checked_one_based_index(((jl_ssavalue_t*)phic)->id,
+                jl_checked_source_nssavalues(s->src), "SSAValue");
             s->locals[jl_source_nslots(s->src) + id] = val;
         }
         else if (jl_is_enternode(stmt)) {
@@ -677,7 +723,8 @@ static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, size_t ip,
                     for (size_t i = 0; i < jl_array_nrows(values); ++i) {
                         jl_value_t *val = jl_array_ptr_ref(values, i);
                         assert(jl_is_ssavalue(val));
-                        size_t upsilon = ((jl_ssavalue_t*)val)->id - 1;
+                        size_t upsilon = checked_one_based_index(((jl_ssavalue_t*)val)->id,
+                            ns, "SSAValue");
                         assert(jl_is_upsilonnode(jl_array_ptr_ref(stmts, upsilon)));
                         s->locals[jl_source_nslots(s->src) + upsilon] = jl_box_ssavalue(catch_ip + 1);
                     }
@@ -730,9 +777,9 @@ static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, size_t ip,
                 jl_value_t *lhs = jl_exprarg(stmt, 0);
                 jl_value_t *rhs = eval_value(jl_exprarg(stmt, 1), s);
                 if (jl_is_slotnumber(lhs)) {
-                    ssize_t n = jl_slot_number(lhs);
-                    assert(n <= jl_source_nslots(s->src) && n > 0);
-                    s->locals[n - 1] = rhs;
+                    size_t slot = checked_one_based_index(jl_slot_number(lhs),
+                        jl_source_nslots(s->src), "slot");
+                    s->locals[slot] = rhs;
                 }
                 else {
                     // This is an unmodeled error. Our frontend only generates
@@ -749,7 +796,9 @@ static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, size_t ip,
                     if (arg == jl_nothing)
                         continue;
                     assert(jl_is_ssavalue(arg));
-                    jl_value_t *enter_stmt = jl_array_ptr_ref(stmts, ((jl_ssavalue_t*)arg)->id - 1);
+                    size_t enter = checked_one_based_index(((jl_ssavalue_t*)arg)->id,
+                        ns, "SSAValue");
+                    jl_value_t *enter_stmt = jl_array_ptr_ref(stmts, enter);
                     if (enter_stmt == jl_nothing)
                         continue;
                     hand_n_leave += 1;
@@ -832,9 +881,9 @@ static jl_value_t *eval_body(jl_array_t *stmts, interpreter_state *s, size_t ip,
         else if (jl_is_newvarnode(stmt)) {
             jl_value_t *var = jl_fieldref(stmt, 0);
             assert(jl_is_slotnumber(var));
-            ssize_t n = jl_slot_number(var);
-            assert(n <= jl_source_nslots(s->src) && n > 0);
-            s->locals[n - 1] = NULL;
+            size_t slot = checked_one_based_index(jl_slot_number(var),
+                jl_source_nslots(s->src), "slot");
+            s->locals[slot] = NULL;
         }
         else if (toplevel && jl_is_linenode(stmt)) {
             jl_atomic_store_relaxed(&jl_lineno, jl_linenode_line(stmt));
@@ -933,7 +982,12 @@ jl_value_t *NOINLINE jl_fptr_interpret_call(jl_value_t *f, jl_value_t **args, ui
     }
     jl_array_t *stmts = src->code;
     assert(jl_typetagis(stmts, jl_array_any_type));
-    unsigned nroots = jl_source_nslots(src) + jl_source_nssavalues(src) + 2;
+    size_t nroots;
+    int roots_status = jl_interpreter_nroots(src, 2, &nroots);
+    if (roots_status < 0)
+        jl_error("invalid SSAValue count");
+    if (roots_status == 0)
+        jl_throw(jl_memory_exception);
     jl_value_t **locals = NULL;
     JL_GC_PUSHFRAME(s, locals, nroots);
     locals[0] = (jl_value_t*)src;
@@ -993,7 +1047,12 @@ jl_value_t *jl_interpret_opaque_closure(jl_opaque_closure_t *oc, jl_value_t **ar
         code = jl_uncompress_ir(source, ci, src);
     }
     interpreter_state *s;
-    unsigned nroots = jl_source_nslots(code) + jl_source_nssavalues(code) + 2;
+    size_t nroots;
+    int roots_status = jl_interpreter_nroots(code, 2, &nroots);
+    if (roots_status < 0)
+        jl_error("invalid SSAValue count");
+    if (roots_status == 0)
+        jl_throw(jl_memory_exception);
     jl_task_t *ct = jl_current_task;
     size_t last_age = ct->world_age;
     ct->world_age = oc->world;
@@ -1034,7 +1093,12 @@ jl_value_t *jl_interpret_opaque_closure(jl_opaque_closure_t *oc, jl_value_t **ar
 jl_value_t *NOINLINE jl_interpret_toplevel_thunk(jl_module_t *m, jl_code_info_t *src)
 {
     interpreter_state *s;
-    unsigned nroots = jl_source_nslots(src) + jl_source_nssavalues(src);
+    size_t nroots;
+    int roots_status = jl_interpreter_nroots(src, 0, &nroots);
+    if (roots_status < 0)
+        jl_error("invalid SSAValue count");
+    if (roots_status == 0)
+        jl_throw(jl_memory_exception);
     JL_GC_PUSHFRAME(s, s->locals, nroots);
     jl_array_t *stmts = src->code;
     assert(jl_typetagis(stmts, jl_array_any_type));
