@@ -373,6 +373,9 @@ extern JL_DLLEXPORT _Atomic(uint64_t) jl_cumulative_recompile_time;
 // Global *atomic* integer controlling *process-wide* task timing.
 extern JL_DLLEXPORT _Atomic(uint8_t) jl_task_metrics_enabled;
 
+// Set once jl_atexit_hook can safely access restored runtime state.
+extern JL_DLLEXPORT _Atomic(int) jl_atexit_hook_ready;
+
 #define jl_return_address() ((uintptr_t)__builtin_return_address(0))
 
 STATIC_INLINE uint32_t jl_int32hash_fast(uint32_t a)

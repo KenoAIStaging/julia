@@ -1328,6 +1328,11 @@ static void *signal_listener(void *arg) JL_NOTSAFEPOINT
             doexit = 0;
         }
 #endif
+        // jl_atexit_hook requires the system image and core runtime state that
+        // _finish_jl_init_ publishes before running module initializers.
+        if (doexit && !jl_atomic_load_acquire(&jl_atexit_hook_ready))
+            jl_raise(sig);
+
         if (doexit) {
             // The exit can get stuck if it happens at an unfortunate spot in thread 0
             // (unavoidable due to its async nature).

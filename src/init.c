@@ -621,6 +621,9 @@ static NOINLINE void _finish_jl_init_(jl_image_buf_t sysimage, jl_ptls_t ptls, j
     uv_barrier_wait(&thread_init_done);
 
     jl_gc_enable(1);
+    // Module initializers may register atexit hooks, so make signal-driven
+    // teardown available before running them.
+    jl_atomic_store_release(&jl_atexit_hook_ready, 1);
 
     if ((sysimage.kind != JL_IMAGE_KIND_NONE) &&
             (!jl_generating_output() || jl_options.incremental) && jl_module_init_order) {
@@ -640,6 +643,8 @@ static NOINLINE void _finish_jl_init_(jl_image_buf_t sysimage, jl_ptls_t ptls, j
         jl_install_sigint_handler();
 }
 
+
+JL_DLLEXPORT _Atomic(int) jl_atexit_hook_ready = 0;
 
 JL_DLLEXPORT int jl_default_debug_info_kind;
 JL_DLLEXPORT jl_cgparams_t jl_default_cgparams = {
