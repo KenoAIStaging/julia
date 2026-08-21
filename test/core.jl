@@ -9396,6 +9396,7 @@ let A = Issue61347.A, S2 = Issue61347.S2
     @test supertype(lazy) isa Type # forcing accessor
     @test isdefined(lazy, :super)
     @test getfield(lazy, :super) === supertype(lazy)
+end
 
 @testset "detached TypeVarRef values through apply_type and dispatch keys" begin
     r = TypeVarRef(1)
@@ -9424,13 +9425,14 @@ let A = Issue61347.A, S2 = Issue61347.S2
     @test UnionAll(:T, Union{}, Any, Int) === Int
     @test UnionAll(:T, Union{}, Int, TypeVarRef(1)) === Int
 
-    # `typejoin` cannot compare a detached fragment structurally against an
-    # unrelated type; identity and subtyping still apply
+    # a detached fragment has the semantics of a free typevar in `typejoin`:
+    # it merges by egality only, and any other fragment operand is a caller
+    # bug, surfaced as an error rather than silently widened
     b = Array.inner
-    @test typejoin(Vector, b) === Any
-    @test typejoin(b, Vector) === Any
     @test typejoin(b, b) === b
-    @test typejoin(Vector.inner, Vector) === Vector
+    @test_throws ArgumentError typejoin(Vector, b)
+    @test_throws ArgumentError typejoin(b, Vector)
+    @test_throws ArgumentError typejoin(Vector.inner, Vector)
 
     # For fragments, `Core.Typeof` and the runtime argument-slot key serve
     # different masters and deliberately diverge: `Typeof`'s result must be a
@@ -9477,4 +9479,24 @@ let P = ShiftFragPH{Float64, Vector{Float64}, Int64}
     frag = getfield(tpl, :super)
     @test frag === ShiftFragVP{Core.TypeVarRef(3)}
     @test getfield(frag, :super) === ShiftFragVRep{Core.TypeVarRef(3)}
+end
+
+# review of the de Bruijn refactor: a deferred (lazily computed) supertype must
+# present the same field-access semantics to compiled and interpreted code
+module DeferredSuper62272
+struct T{A} <: AbstractArray{T{Tuple{A}}, 1} end
+end
+let root = Base.unwrap_unionall(DeferredSuper62272.T)
+    d1 = supertype(root).parameters[1]
+    lazy = supertype(d1).parameters[1]
+    @noinline compiled_isdef(x::DataType) = isdefined(x, :super)
+    # the slot can be filled at any moment by unrelated activity, so bracket
+    # the interpreted read with compiled reads and require monotone agreement
+    c1 = compiled_isdef(Base.inferencebarrier(lazy))
+    itp = Core.eval(@__MODULE__, :(isdefined($lazy, :super)))
+    c2 = compiled_isdef(Base.inferencebarrier(lazy))
+    @test c1 <= itp <= c2
+    @test supertype(lazy) isa Type # forcing accessor
+    @test isdefined(lazy, :super)
+    @test getfield(lazy, :super) === supertype(lazy)
 end

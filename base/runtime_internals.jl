@@ -1548,22 +1548,40 @@ end
 Determine whether `t` is a Type for which one or more of its parameters is `Union{}`.
 """
 function has_bottom_parameter(@nospecialize(t::Core.AnyType))
+    return _has_bottom_parameter(t, nothing)
+end
+# `env` is the chain of enclosing binders, innermost first, as
+# `ub => outer_env` links (invariant `Pair`s: one concrete link type at any depth).
+# A binder's bound is accounted per occurrence (resolving the reference through
+# the chain), not once at the binder: a `Union` arm is bottom-tainted only if
+# the occurrence sits in that arm, preserving the per-arm `&` semantics below.
+function _has_bottom_parameter(@nospecialize(t), env::Union{Nothing, Pair{Any, Any}})
     t === Bottom && return true
     ty = typeof(t)
     if ty === DataType
         for p in getfield(t, :parameters)
-            has_bottom_parameter(p) && return true
+            _has_bottom_parameter(p, env) && return true
         end
     elseif ty === TypeEq || ty === Core.TypeEgal
-        return has_bottom_parameter(type_parameter(t))
+        return _has_bottom_parameter(type_parameter(t), env)
     elseif ty === UnionAll
-        # occurrences of the binder are inert references; account for their
-        # bound once, at the binder, when any exist (bit 0 of `flags` is the memoized occurs bit)
         u = t::UnionAll
-        return (getfield(u, :flags) % Bool && has_bottom_parameter(getfield(u, :ub))) ||
-            has_bottom_parameter(getfield(u, :inner))
+        return _has_bottom_parameter(getfield(u, :inner), Pair{Any, Any}(getfield(u, :ub), env))
     elseif ty === Union
-        return has_bottom_parameter(getfield(t, :a)) & has_bottom_parameter(getfield(t, :b))
+        return _has_bottom_parameter(getfield(t, :a), env) & _has_bottom_parameter(getfield(t, :b), env)
+    elseif ty === Core.TypeVarRef
+        d = getfield(t, :depth)
+        while d !== 1
+            env === nothing && return false # dangling fragment: binder unknown
+            env = (env::Pair{Any, Any}).second
+            d -= 1
+        end
+        env === nothing && return false
+        env = env::Pair{Any, Any}
+        # the binder's bound lives outside its own scope
+        return _has_bottom_parameter(env.first, env.second)
+    elseif ty === TypeVar
+        return _has_bottom_parameter(getfield(t, :ub), env)
     end
     return false
 end
