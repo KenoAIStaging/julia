@@ -574,8 +574,11 @@ static int frame_has_existential_ref(jl_value_t *x, jl_varbinding_t *frame, size
         return (vm->T && frame_has_existential_ref(vm->T, frame, nested)) ||
                (vm->N && frame_has_existential_ref(vm->N, frame, nested));
     }
-    else if (jl_is_some_Type(x)) {
-        return frame_has_existential_ref(jl_some_Type_T(x), frame, nested);
+    else if (jl_is_typeeq(x)) {
+        return frame_has_existential_ref(jl_typeeq_T(x), frame, nested);
+    }
+    else if (jl_is_typeegal(x)) {
+        return 0; // opaque payload: its references are inert identity tokens
     }
     else if (jl_is_datatype(x)) {
         if (!((jl_datatype_t*)x)->hasescapingrefs)
@@ -616,8 +619,11 @@ static int tvarref_occurs_inside(jl_value_t *v, size_t d, int inside, int want_i
             return vm->N && tvarref_occurs_inside(vm->N, d, 1, want_inv);
         }
     }
-    else if (jl_is_some_Type(v)) {
-        return tvarref_occurs_inside(jl_some_Type_T(v), d, 1, want_inv);
+    else if (jl_is_typeeq(v)) {
+        return tvarref_occurs_inside(jl_typeeq_T(v), d, 1, want_inv);
+    }
+    else if (jl_is_typeegal(v)) {
+        return 0; // opaque payload: its references are inert identity tokens
     }
     else if (jl_is_datatype(v)) {
         size_t i;
@@ -1601,6 +1607,10 @@ static int var_lt(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, jl_param_pos_t par
             return 1;
         if (innervar)
             return subtype_left_var(b->ub, a, e, param);
+        // a free variable is an opaque token: it matches only itself, and a
+        // vararg-length offset shifts it off itself (`b` never equals `b + k`)
+        if (e->Loffset != 0)
+            return a == (jl_value_t*)jl_any_type;
         return singleton_typevar_subtype(b, a);
     }
     record_var_occurrence(bb, e, param);
@@ -1619,6 +1629,13 @@ static int var_lt(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, jl_param_pos_t par
     if (e->Loffset != 0 && !jl_is_typevar(a) &&
         a != jl_bottom_type && a != (jl_value_t *)jl_any_type)
         return 0;
+    if (e->Loffset != 0 && jl_is_typevar(a)) {
+        // a free variable is an opaque token: no later resolution can absorb
+        // a vararg-length offset against it (nothing equals `a + k`)
+        int innervar_a = 0;
+        if (lookup_binding(e, (jl_tvar_t*)a, &innervar_a) == NULL && !innervar_a)
+            return 0;
+    }
     if (!bb->existential) {  // check ∀b . b<:a
         // The expanded bound `bb->ub` lives in the forall-side context;
         // its covariant typevar occurrences must not combine with the
@@ -1686,6 +1703,9 @@ static int var_gt(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, jl_param_pos_t par
             return 1;
         if (innervar)
             return subtype_left_var(a, b->lb, e, param);
+        // see var_lt: a free variable at a shifted vararg offset matches nothing
+        if (e->Loffset != 0)
+            return a == jl_bottom_type;
         return subtype_singleton_typevar(a, b);
     }
     record_var_occurrence(bb, e, param);
@@ -1702,6 +1722,12 @@ static int var_gt(jl_tvar_t *b, jl_value_t *a, jl_stenv_t *e, jl_param_pos_t par
     if (e->Loffset != 0 && !jl_is_typevar(a) &&
         a != jl_bottom_type && a != (jl_value_t *)jl_any_type)
         return 0;
+    if (e->Loffset != 0 && jl_is_typevar(a)) {
+        // see var_lt: a free variable can never absorb a vararg-length offset
+        int innervar_a = 0;
+        if (lookup_binding(e, (jl_tvar_t*)a, &innervar_a) == NULL && !innervar_a)
+            return 0;
+    }
     if (!bb->existential) {  // check ∀b . b>:a
         // Symmetric to var_lt: scope forall-side occurrences from the expanded
         // lower bound away from the enclosing tuple body.
@@ -2971,8 +2997,10 @@ static int count_ref_occurs(jl_value_t *t, size_t idx) JL_NOTSAFEPOINT
             return count_ref_occurs(vm->T, idx) + (vm->N ? count_ref_occurs(vm->N, idx) : 0);
         return 0;
     }
-    if (jl_is_some_Type(t))
-        return count_ref_occurs(jl_some_Type_T(t), idx);
+    if (jl_is_typeeq(t))
+        return count_ref_occurs(jl_typeeq_T(t), idx);
+    if (jl_is_typeegal(t))
+        return 0; // opaque payload: its references are inert identity tokens
     if (jl_is_datatype(t)) {
         int c = 0;
         for (size_t i = 0; i < jl_nparams(t); i++)
@@ -3418,8 +3446,10 @@ static int typeeq_vars_bound_in_env(jl_value_t *t, jl_stenv_t *e, typeeq_varctx_
         return (vm->T && typeeq_vars_bound_in_env(vm->T, e, wenv, frame, nintro)) ||
                (vm->N && typeeq_vars_bound_in_env(vm->N, e, wenv, frame, nintro));
     }
-    if (jl_is_some_Type(t))
-        return typeeq_vars_bound_in_env(jl_some_Type_T(t), e, wenv, frame, nintro);
+    if (jl_is_typeeq(t))
+        return typeeq_vars_bound_in_env(jl_typeeq_T(t), e, wenv, frame, nintro);
+    if (jl_is_typeegal(t))
+        return 0; // opaque payload: its references are inert identity tokens
     if (jl_is_datatype(t)) {
         if (!((jl_datatype_t*)t)->hasfreetypevars && !((jl_datatype_t*)t)->hasescapingrefs)
             return 0;
@@ -4946,13 +4976,18 @@ JL_DLLEXPORT int jl_isa(jl_value_t *x, jl_value_t *t)
     if (jl_is_type(x)) {
         if (t == (jl_value_t*)jl_type_type)
             return 1;
-        if (!jl_has_free_typevars(x)) {
+        // the egality kind pins its instance by identity, which is meaningful
+        // for every type value (payloads are opaque, so open values are
+        // ordinary members); likewise the remaining `Type` patterns below are
+        // decided by `==`/subtyping, which handle free typevars, so no
+        // freeness guard is needed
+        if (jl_is_typeegal(t))
+            return jl_egal(x, jl_typeegal_T(t));
+        {
             if (jl_is_concrete_type(t))
                 return 0;
             if (jl_is_typeeq(t))
                 return jl_types_equal(x, jl_typeeq_T(t));
-            if (jl_is_typeegal(t))
-                return jl_egal(x, jl_typeegal_T(t));
             jl_value_t *t2 = jl_unwrap_unionall(t);
             if (jl_is_typeeq(t2)) {
                 jl_value_t *tp = jl_typeeq_T(t2);

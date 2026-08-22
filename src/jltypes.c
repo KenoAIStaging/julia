@@ -156,8 +156,13 @@ static int tvarref_occurs_(jl_value_t *t, size_t idx) JL_NOTSAFEPOINT
                 return 1;
             t = ((jl_uniontype_t*)t)->b;
         }
-        else if (jl_is_some_Type(t)) {
-            t = jl_some_Type_T(t);
+        else if (jl_is_typeeq(t)) {
+            t = jl_typeeq_T(t);
+        }
+        else if (jl_is_typeegal(t)) {
+            // `TypeEgal` payloads are opaque identity tokens: no enclosing
+            // binder reaches into them, so nothing inside is free or escaping
+            return 0;
         }
         else if (jl_is_typeapp(t)) {
             jl_typeapp_t *ta = (jl_typeapp_t*)t;
@@ -182,6 +187,122 @@ static int tvarref_occurs_(jl_value_t *t, size_t idx) JL_NOTSAFEPOINT
 JL_DLLEXPORT int jl_tvarref_occurs(jl_value_t *t, size_t idx) JL_NOTSAFEPOINT
 {
     return tvarref_occurs_(t, idx);
+}
+
+// does `v` occur inside any `TypeEgal` payload in `t`? A transparent
+// structural walk: the memoized freeness flags are payload-opaque, so they
+// cannot prune it (payload-carrying subtrees advertise as closed).
+static int typeegal_captures_var(jl_value_t *t, jl_tvar_t *v) JL_NOTSAFEPOINT
+{
+    while (1) {
+        if (jl_is_typeegal(t)) {
+            jl_value_t *T = jl_typeeq_T(t);
+            // direct occurrences are found by the flag-assisted walk (the
+            // payload's own spine has transparent flags); occurrences inside
+            // nested payloads need the structural recursion
+            return jl_has_typevar(T, v) || typeegal_captures_var(T, v);
+        }
+        if (jl_is_unionall(t)) {
+            jl_unionall_t *u = (jl_unionall_t*)t;
+            if (typeegal_captures_var(u->lb, v) || typeegal_captures_var(u->ub, v))
+                return 1;
+            t = u->body;
+        }
+        else if (jl_is_uniontype(t) || jl_is_intersecttype(t)) {
+            if (typeegal_captures_var(((jl_uniontype_t*)t)->a, v))
+                return 1;
+            t = ((jl_uniontype_t*)t)->b;
+        }
+        else if (jl_is_typeeq(t)) {
+            t = jl_typeeq_T(t);
+        }
+        else if (jl_is_typeapp(t)) {
+            jl_typeapp_t *ta = (jl_typeapp_t*)t;
+            if (typeegal_captures_var(ta->head, v))
+                return 1;
+            t = ta->param;
+        }
+        else if (jl_is_vararg(t)) {
+            jl_vararg_t *vm = (jl_vararg_t*)t;
+            if (!vm->T)
+                return 0;
+            if (vm->N && typeegal_captures_var(vm->N, v))
+                return 1;
+            t = vm->T;
+        }
+        else if (jl_is_datatype(t)) {
+            size_t j, l = jl_nparams(t);
+            for (j = 0; j < l; j++) {
+                if (typeegal_captures_var(jl_tparam(t, j), v))
+                    return 1;
+            }
+            return 0;
+        }
+        else {
+            return 0;
+        }
+    }
+}
+
+JL_DLLEXPORT int jl_typeegal_captures_var(jl_value_t *t, jl_tvar_t *v) JL_NOTSAFEPOINT
+{
+    return typeegal_captures_var(t, v);
+}
+
+// does any `TypeEgal` payload inside `t` contain a reference that a binder
+// `depth` levels above `t` would bind? Payload references are inert identity
+// tokens, so binding across a payload is not representable and is rejected
+// by the validating `UnionAll` constructor.
+static int typeegal_captures_(jl_value_t *t, size_t depth) JL_NOTSAFEPOINT
+{
+    while (1) {
+        if (jl_is_typeegal(t)) {
+            // `tvarref_occurs_` skips nested payloads, so only this payload's
+            // own (frame-adjusted) references are examined
+            return tvarref_occurs_(jl_typeeq_T(t), depth);
+        }
+        if (jl_is_unionall(t)) {
+            jl_unionall_t *u = (jl_unionall_t*)t;
+            // the binder's bounds live outside its own scope
+            if (typeegal_captures_(u->lb, depth) || typeegal_captures_(u->ub, depth))
+                return 1;
+            t = u->body;
+            depth++;
+        }
+        else if (jl_is_uniontype(t) || jl_is_intersecttype(t)) {
+            if (typeegal_captures_(((jl_uniontype_t*)t)->a, depth))
+                return 1;
+            t = ((jl_uniontype_t*)t)->b;
+        }
+        else if (jl_is_typeeq(t)) {
+            t = jl_typeeq_T(t);
+        }
+        else if (jl_is_typeapp(t)) {
+            jl_typeapp_t *ta = (jl_typeapp_t*)t;
+            if (typeegal_captures_(ta->head, depth))
+                return 1;
+            t = ta->param;
+        }
+        else if (jl_is_vararg(t)) {
+            jl_vararg_t *vm = (jl_vararg_t*)t;
+            if (!vm->T)
+                return 0;
+            if (vm->N && typeegal_captures_(vm->N, depth))
+                return 1;
+            t = vm->T;
+        }
+        else if (jl_is_datatype(t)) {
+            size_t i, l = jl_nparams(t);
+            for (i = 0; i < l; i++) {
+                if (typeegal_captures_(jl_tparam(t, i), depth))
+                    return 1;
+            }
+            return 0;
+        }
+        else {
+            return 0;
+        }
+    }
 }
 
 // does `t` contain a TypeVarRef pointing above `depth` enclosing binders?
@@ -218,8 +339,13 @@ static int has_refs_above(jl_value_t *t, size_t depth) JL_NOTSAFEPOINT
                 return 1;
             t = ((jl_uniontype_t*)t)->b;
         }
-        else if (jl_is_some_Type(t)) {
-            t = jl_some_Type_T(t);
+        else if (jl_is_typeeq(t)) {
+            t = jl_typeeq_T(t);
+        }
+        else if (jl_is_typeegal(t)) {
+            // `TypeEgal` payloads are opaque identity tokens: no enclosing
+            // binder reaches into them, so nothing inside is free or escaping
+            return 0;
         }
         else if (jl_is_typeapp(t)) {
             jl_typeapp_t *ta = (jl_typeapp_t*)t;
@@ -299,8 +425,13 @@ static int layout_uses_free_typevars(jl_value_t *v, jl_typeenv_t *env) JL_CANSAF
                 return 1;
            v = ((jl_uniontype_t*)v)->b;
         }
-        else if (jl_is_some_Type(v)) {
-            v = jl_some_Type_T(v);
+        else if (jl_is_typeeq(v)) {
+            v = jl_typeeq_T(v);
+        }
+        else if (jl_is_typeegal(v)) {
+            // `TypeEgal` payloads are opaque identity tokens: no enclosing
+            // binder reaches into them, so nothing inside is free or escaping
+            return 0;
         }
         else if (jl_is_vararg(v)) {
             jl_vararg_t *vm = (jl_vararg_t*)v;
@@ -349,8 +480,13 @@ static int has_free_typevars(jl_value_t *v) JL_NOTSAFEPOINT
                 return 1;
            v = ((jl_uniontype_t*)v)->b;
         }
-        else if (jl_is_some_Type(v)) {
-            v = jl_some_Type_T(v);
+        else if (jl_is_typeeq(v)) {
+            v = jl_typeeq_T(v);
+        }
+        else if (jl_is_typeegal(v)) {
+            // `TypeEgal` payloads are opaque identity tokens: no enclosing
+            // binder reaches into them, so nothing inside is free or escaping
+            return 0;
         }
         else if (jl_is_vararg(v)) {
             jl_vararg_t *vm = (jl_vararg_t*)v;
@@ -420,8 +556,13 @@ static void find_free_typevars(jl_value_t *v, jl_typeenv_t *env, jl_array_t *out
             find_free_typevars(((jl_uniontype_t*)v)->a, env, out);
             v = ((jl_uniontype_t*)v)->b;
         }
-        else if (jl_is_some_Type(v)) {
-            v = jl_some_Type_T(v);
+        else if (jl_is_typeeq(v)) {
+            v = jl_typeeq_T(v);
+        }
+        else if (jl_is_typeegal(v)) {
+            // `TypeEgal` payloads are opaque identity tokens: no enclosing
+            // binder reaches into them, so nothing inside is free or escaping
+            return;
         }
         else if (jl_is_vararg(v)) {
             jl_vararg_t *vm = (jl_vararg_t *)v;
@@ -1272,6 +1413,12 @@ JL_DLLEXPORT jl_value_t *jl_type_unionall(jl_tvar_t *v, jl_value_t *body)
     // normalize `T where T<:S` => S
     if (body == (jl_value_t*)v)
         return v->ub;
+    // a binder may not cross a `TypeEgal` payload (checked before the
+    // vacuous-binder fast path below, which is payload-blind and would
+    // otherwise silently ignore the variable)
+    if (typeegal_captures_var(body, v))
+        jl_errorf("cannot bind type variable `%s` across a `TypeEgal` payload",
+                  jl_symbol_name(v->name));
     // where var doesn't occur in body just return body
     if (jl_is_typeeq(body) && v->ub != (jl_value_t*)jl_any_type) {
         if (!jl_has_typevar(body, v))
@@ -1328,6 +1475,12 @@ JL_DLLEXPORT jl_value_t *jl_translate_sparams_to_refs(jl_value_t *t, jl_svec_t *
         env = &envs[k];
         k++;
     }
+    // the new binders may not cross a `TypeEgal` payload
+    for (jl_typeenv_t *e2 = env; e2 != NULL; e2 = e2->prev) {
+        if (typeegal_captures_var(t, e2->var))
+            jl_errorf("cannot bind type variable `%s` across a `TypeEgal` payload",
+                      jl_symbol_name(e2->var->name));
+    }
     t = inst_type_w_(t, env, NULL, 0, 0, NULL);
     JL_GC_POP();
     return t;
@@ -1369,6 +1522,11 @@ JL_DLLEXPORT jl_value_t *jl_new_unionall_type(jl_sym_t *name, jl_value_t *lb, jl
         jl_type_error_rt("UnionAll", "upper bound", (jl_value_t*)jl_type_type, ub);
     if (!jl_is_type(body) && !jl_is_typevar(body) && !jl_is_tvarref(body) && !jl_is_typeapp(body))
         jl_type_error("UnionAll", (jl_value_t*)jl_type_type, body);
+    // a binder may not cross a `TypeEgal` payload (checked before the
+    // vacuous-binder drop below: occurrence is payload-opaque, so a variable
+    // referenced only inside a payload would otherwise be dropped silently)
+    if (typeegal_captures_(body, 1))
+        jl_errorf("cannot bind a type variable across a `TypeEgal` payload");
     // normalize `T where T<:S` => S, matching the translating constructor
     if (jl_is_tvarref(body) && jl_tvarref_depth(body) == 1)
         return ub;
@@ -1884,7 +2042,7 @@ static jl_value_t *apply_type_(jl_value_t *tc, jl_value_t **params, size_t n, jl
     if (tc == (jl_value_t*)jl_typeegal_type) {
         if (n != 1)
             jl_errorf("wrong number of parameters for type `TypeEgal`: expected 1, got %zu", n);
-        if (!jl_is_type(params[0]) || jl_has_free_typevars(params[0]))
+        if (!jl_is_type(params[0]))
             jl_type_error_rt("TypeEgal", "parameter", (jl_value_t*)jl_type_type, params[0]);
         return jl_wrap_TypeEgal(params[0]);
     }
@@ -2235,12 +2393,8 @@ static jl_value_t *shift_refs_(jl_value_t *t, ssize_t inc, size_t depth) JL_CANS
         return t;
     }
     if (jl_is_typeegal(t)) {
-        jl_value_t *T = shift_refs_(jl_typeegal_T(t), inc, depth);
-        if (T != jl_typeegal_T(t)) {
-            JL_GC_PUSH1(&T);
-            t = jl_wrap_TypeEgal(T);
-            JL_GC_POP();
-        }
+        // `TypeEgal` payloads are opaque identity tokens: re-framing their
+        // references would change which object the kind pins
         return t;
     }
     if (jl_is_typeapp(t)) {
@@ -3662,21 +3816,11 @@ jl_tupletype_t *jl_inst_arg_tuple_type(jl_value_t *arg1, jl_value_t **args, size
         for (i = 0; i < nargs; i++) {
             jl_value_t *ai = (i == 0 ? arg1 : args[i - 1]);
             if (leaf && jl_is_type(ai)) {
-                if (jl_has_free_typevars(ai)) {
-                    // if `ai` has free type vars this will not be a valid
-                    // (concrete) type.
-                    // TODO: it would be really nice to only dispatch and cache
-                    // those as `jl_typeof(ai)`, but that will require some
-                    // redesign of the caching logic.
-                    // free typevars are disallowed inside `TypeEgal`; fall back to the
-                    // equality key `Type{ai}`, which still binds static parameters (#61242)
-                    ai = (jl_value_t*)jl_wrap_Type(ai);
-                }
-                else {
-                    // key the dispatch cache on the type value by egality, so `==`-equal
-                    // but non-egal type objects get distinct entries (#61323)
-                    ai = jl_wrap_TypeEgal(ai);
-                }
+                // key the dispatch cache on the type value by egality, so `==`-equal
+                // but non-egal type objects get distinct entries (#61323); the
+                // payload is opaque, so this is valid for any type value,
+                // including ones carrying free typevars or dangling references
+                ai = jl_wrap_TypeEgal(ai);
             }
             else {
                 ai = jl_typeof(ai);
@@ -3982,17 +4126,21 @@ static jl_value_t *inst_type_w_(jl_value_t *t, jl_typeenv_t *env, jl_typestack_t
         return t;
     }
     if (jl_is_typeegal(t)) {
+        // `TypeEgal{T}` pins `T` by object identity: instantiation never
+        // descends into the payload (its variables and references are inert
+        // identity tokens). Binding an enclosing variable across the payload
+        // is therefore prohibited, and surfaced here for the nominal
+        // constructors (the raw constructor checks references itself).
         jl_typeeq_t *te = (jl_typeeq_t*)t;
-        jl_value_t *T = inst_type_w_(te->T, env, stack, check, nothrow ? 1 : 0, dcache);
-        JL_GC_PUSH1(&T);
-        if (T == NULL) {
-            assert(nothrow);
-            t = NULL;
+        for (jl_typeenv_t *e = env; e != NULL; e = e->prev) {
+            if (e->var != NULL &&
+                (jl_has_typevar(te->T, e->var) || typeegal_captures_var(te->T, e->var))) {
+                if (nothrow)
+                    return NULL;
+                jl_errorf("cannot bind type variable `%s` across a `TypeEgal` payload",
+                          jl_symbol_name(e->var->name));
+            }
         }
-        else if (T != te->T) {
-            t = jl_wrap_TypeEgal(T);
-        }
-        JL_GC_POP();
         return t;
     }
     if (jl_is_vararg(t)) {
@@ -4131,9 +4279,12 @@ jl_typeeq_t *jl_wrap_Type(jl_value_t *t)
 
 jl_value_t *jl_wrap_TypeEgal(jl_value_t *t)
 {
-    // `TypeEgal` pins a type value by egality; non-type parameters and free
-    // typevars are not valid.
-    if (!jl_is_type(t) || jl_has_free_typevars(t))
+    // `TypeEgal` pins a type value by egality; only non-type parameters are
+    // invalid. Free typevars and dangling references inside the payload are
+    // inert identity tokens — the payload is opaque to all binder machinery —
+    // and the corresponding prohibition is on *binding across* the payload
+    // (enforced by the `UnionAll` constructors and instantiation).
+    if (!jl_is_type(t))
         jl_type_error_rt("TypeEgal", "parameter", (jl_value_t*)jl_type_type, t);
     // `typeof(Union{})` already denotes exactly the single-instance set `{Union{}}`
     // (the bottom object is unique), so normalize to it

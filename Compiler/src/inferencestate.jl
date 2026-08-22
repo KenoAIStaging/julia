@@ -1181,7 +1181,10 @@ function is_free_typevar_in_spec(v::TypeVar, @nospecialize(specTypes))
     for tv in find_free_typevars(specTypes)
         tv === v && return true
     end
-    return false
+    # `find_free_typevars` (like all binder machinery) treats `TypeEgal`
+    # payloads as opaque, but a sparam bound from a typevar embedded in a
+    # call argument's type value lives inside such a payload
+    return ccall(:jl_typeegal_captures_var, Cint, (Any, Any), specTypes, v) != 0
 end
 
 function sptypes_from_meth_instance(mi::MethodInstance)

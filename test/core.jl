@@ -1133,7 +1133,12 @@ let f = g -> x -> g(x)
     @test @inferred(f(Rational)) isa Function
     @test fieldtype(typeof(f(Rational)), 1) === Core.TypeEgal{Rational}
     @test f(Rational{Core.TypeVar(:T)}) isa Function
-    @test fieldtype(typeof(f(Rational{Core.TypeVar(:T)})), 1) === DataType
+    # `TypeEgal` payloads are opaque identity tokens, so open type values get
+    # the egality kind capture type too (and it is a closed field type)
+    let ft = fieldtype(typeof(f(Rational{Core.TypeVar(:T)})), 1)
+        @test ft isa Core.TypeEgal
+        @test !Core.has_free_typevars(ft)
+    end
 end
 let T = Core.TypeVar(:T), g = Base.Generator(Rational{T}, 1:1)
     @test g.f === Rational{T}
@@ -1141,8 +1146,10 @@ let T = Core.TypeVar(:T), g = Base.Generator(Rational{T}, 1:1)
 end
 let f() = (T = Rational{Core.TypeVar(:T)}; () -> T)
     @test f() isa Function
-    @test Base.infer_return_type(f()) == DataType
-    @test fieldtype(typeof(f()), 1) === DataType
+    # the capture is typed by the (opaque-payload) egality kind, so both the
+    # field type and the inferred read are exact
+    @test Base.infer_return_type(f()) isa Core.TypeEgal
+    @test fieldtype(typeof(f()), 1) isa Core.TypeEgal
     t = f()()
     @test t isa DataType
     @test t.name.wrapper == Rational
@@ -9434,16 +9441,46 @@ end
     @test_throws ArgumentError typejoin(b, Vector)
     @test_throws ArgumentError typejoin(Vector.inner, Vector)
 
-    # For fragments, `Core.Typeof` and the runtime argument-slot key serve
-    # different masters and deliberately diverge: `Typeof`'s result must be a
-    # complete type usable as a type parameter (e.g. closure capture fields),
-    # while the dispatch key pins the value by egality so that an exact-key
-    # method is dispatchable and static parameters bind (#61242)
+    # For fragments too, `Core.Typeof` is the uniform egality-pinned key:
+    # the payload is an opaque identity token (nothing binds into or resolves
+    # through it), so an exact-key method is dispatchable and static
+    # parameters bind (#61242)
     x = Vector.inner
     te = Core.apply_type(Core.TypeEgal, x)
-    @test Core.Typeof(x) === typeof(x)
+    @test Core.Typeof(x) === te
     @eval fdisp62272(::$te) = :egal_key
     @test fdisp62272(x) === :egal_key
+end
+
+# `TypeEgal` payloads are opaque identity tokens: open type values (free
+# typevars, fragments) wrap uniformly, and the old prohibition on free
+# typevars inside the payload is replaced by a prohibition on binding a
+# variable across the payload
+let V = TypeVar(:V)
+    x = Core.apply_type(Vector, V)
+    te = Core.apply_type(Core.TypeEgal, x)
+    @test Core.Typeof(x) === te
+    @test isa(x, te)
+    @test !isa(Vector{Int}, te)
+    @test isa(x, Type)
+    # dispatch binds static parameters from inside the payload: the whole
+    # object, or an embedded free typevar (which is then the exact value)
+    @eval fte62272(::Type{T}) where {T} = T
+    @test fte62272(x) === x
+    @eval gte62272(::Type{Vector{E}}) where {E} = E
+    @test gte62272(x) === V
+    # free typevars merge by egality only: an existential matches one at its
+    # own position, but never across a vararg-length offset
+    N, T = TypeVar(:N), TypeVar(:T)
+    nt = Core.apply_type(NTuple, N, Core.apply_type(VecElement, T))
+    @test isa(nt, Type{Tuple{Vararg{E, M}}} where {E, M})
+    @test !isa(nt, Type{Base.All32{E, M}} where {E, M})
+    @test !isa(nt, Type{Tuple{E, Vararg{E, M}}} where {E, M})
+    @test_throws MethodError nt(1)
+    # binders cannot cross a `TypeEgal` payload, through either constructor
+    @test_throws ErrorException UnionAll(V, te)
+    @test_throws ErrorException UnionAll(:V, Union{}, Any,
+        Core.apply_type(Core.TypeEgal, Core.apply_type(Vector, TypeVarRef(1))))
 end
 
 # a `jl_shift_dangling_refs` over a typename's own primary body must re-frame

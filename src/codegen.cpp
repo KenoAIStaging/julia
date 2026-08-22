@@ -2488,8 +2488,9 @@ static inline jl_cgval_t mark_julia_const(jl_codectx_t &ctx, jl_value_t *jv) JL_
     jl_value_t *typ;
     if (jl_is_type(jv) && jv != jl_bottom_type) {
         // match `Compiler.widenconst`: a known type value has the egality kind
-        typ = jl_has_free_or_dangling_typevars(jv) ? (jl_value_t*)jl_wrap_Type(jv)
-                                       : jl_wrap_TypeEgal(jv);
+        // (`TypeEgal` payloads are opaque identity tokens, so this is valid
+        // for open values too)
+        typ = jl_wrap_TypeEgal(jv);
         jl_temporary_root(ctx, typ);
     }
     else {

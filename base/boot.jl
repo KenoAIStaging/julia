@@ -307,9 +307,8 @@ ccall(:jl_toplevel_eval_in, Any, (Any, Any),
       Core, quote
       (f::typeof(Typeof))(x) = begin
           $(_expr(:meta,:nospecialize,:x))
-          # the total-purity override lets inference fold through the
-          # dangling-reference ccall (a pure predicate); without it a constant
-          # type argument stops folding to a constant `TypeEgal`
+          # the total-purity override lets a constant type argument fold to
+          # a constant `TypeEgal`
           $(_expr(:meta, _expr(:purity,
               #=:consistent=#true, #=:effect_free=#true, #=:nothrow=#true,
               #=:terminates_globally=#true, #=:terminates_locally=#false,
@@ -317,21 +316,13 @@ ccall(:jl_toplevel_eval_in, Any, (Any, Any),
               #=:noub=#true, #=:noub_if_noinbounds=#false,
               #=:consistent_overlay=#false, #=:nortcall=#true)))
           if isa(x,Type)
-              if has_free_typevars(x)
-                  Type{x}
-              elseif has_dangling_tvarrefs(x)
-                  # a `TypeEgal` of a detached subterm carries the subterm's
-                  # dangling references, so a type parameterized by it (e.g. a
-                  # closure capturing `x`, whose field type this becomes) would
-                  # be an incomplete fragment itself; fall back to the kind.
-                  # N.B. this deliberately diverges from the runtime dispatch
-                  # keys (`jl_inst_arg_tuple_type`), which do pin such values
-                  # by egality: that key binds static parameters (#61242) but
-                  # never parameterizes another type
-                  typeof(x)
-              else
-                  TypeEgal{x}
-              end
+              # `TypeEgal` payloads are opaque identity tokens: free typevars
+              # and dangling references inside `x` are inert, so the egality
+              # kind is valid (and closed) for every type value, and types
+              # parameterized by it (e.g. closure capture fields) stay
+              # complete. The prohibition is on binding a variable across the
+              # payload, enforced by the `UnionAll` constructors.
+              TypeEgal{x}
           else
               typeof(x)
           end
@@ -418,7 +409,7 @@ cconvert(::Type{T}, x) where {T} = convert(T, x)
 unsafe_convert(::Type{T}, x::T) where {T} = x
 
 # will be inserted by the frontend for closures
-_typeof_captured_variable(@nospecialize t) = (@_total_meta; t isa Type && has_free_typevars(t) ? typeof(t) : Typeof(t))
+_typeof_captured_variable(@nospecialize t) = (@_total_meta; Typeof(t))
 
 # dispatch token indicating a kwarg (keyword sorter) call
 function kwcall end

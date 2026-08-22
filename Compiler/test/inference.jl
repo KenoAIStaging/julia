@@ -6472,13 +6472,15 @@ let v = Base.unwrap_unionall(Vector)
     @test_throws MethodError applysparam62001(v)
     @test isempty(Base.return_types(applysparam62001, (Type{v},)))
 end
-# Identityless TypeVar values as type parameters widen to the top kind forms.
+# Identityless TypeVar values as type parameters widen to the top kind forms
+# in inference; at runtime a free typevar is a first-class value that an
+# existential can bind at its own position (it merges by egality).
 applytypevar62001(tv::TypeVar) = Vector{tv}
 applytypevar62001b(tv::TypeVar) = isa(Vector{tv}, Type{Vector{_A}} where _A)
 applytypevar62001c(tv::TypeVar) = Vararg{tv}
 let x = TypeVar(:x)
     @test applytypevar62001(x).parameters[1] === x
-    @test applytypevar62001b(x) === false
+    @test applytypevar62001b(x) === true
     @test applytypevar62001c(x) isa Core.TypeofVararg
     @test only(Base.return_types(applytypevar62001, (TypeVar,))) == Type
     @test only(Base.return_types(applytypevar62001c, (TypeVar,))) == Core.TypeofVararg
