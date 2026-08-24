@@ -2856,7 +2856,11 @@ JL_DLLEXPORT jl_value_t *jl_resolve_typegroup(jl_module_t *module, jl_svec_t *ty
             tn->n_uninitialized = (int32_t)(jl_svec_len(fieldnames) - min_initialized);
 
             // Set up initial values
-            datatypes[i]->super = jl_any_type;
+            // Keep the supertype unset until step 3. An earlier member may
+            // instantiate this type while resolving its own supertype; the
+            // partial-type machinery must see the incomplete declaration and
+            // reinstantiate it after every group member has its final super.
+            datatypes[i]->super = NULL;
             datatypes[i]->parameters = jl_emptysvec;
             datatypes[i]->types = NULL;
 
@@ -2946,6 +2950,9 @@ JL_DLLEXPORT jl_value_t *jl_resolve_typegroup(jl_module_t *module, jl_svec_t *ty
                 jl_check_valid_supertype(resolved_super, type_name);
                 jl_gc_write(datatypes[i], datatypes[i]->super, jl_datatype_t, (jl_datatype_t*)resolved_super);
                 JL_GC_POP();
+            }
+            else {
+                datatypes[i]->super = jl_any_type;
             }
         }
 

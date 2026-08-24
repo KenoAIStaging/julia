@@ -3888,6 +3888,23 @@ function abstract_eval_foreigncall(interp::AbstractInterpreter, e::Expr, sstate:
     end
     mi = frame_instance(sv)
     t = sp_type_rewrap(e.args[2], mi, true)
+    foreigncall_name = e.args[1]
+    if isexpr(foreigncall_name, :tuple, 1)
+        foreigncall_name = foreigncall_name.args[1]
+    end
+    if foreigncall_name isa QuoteNode
+        foreigncall_name = foreigncall_name.value
+    end
+    argtypes = e.args[3]
+    cconv = e.args[5]
+    if foreigncall_name === :jl_datatype_super &&
+       length(e.args) == FOREIGNCALL_ARG_START &&
+       e.args[2] === Any &&
+       argtypes isa SimpleVector && length(argtypes) == 1 && argtypes[1] === Any &&
+       e.args[4] == 0 && cconv isa QuoteNode && cconv.value === :ccall
+        arg = abstract_eval_value(interp, e.args[FOREIGNCALL_ARG_START], sstate, sv)
+        t = datatype_super_tfunc(arg)
+    end
     let fptr = e.args[1]
         if !isexpr(fptr, :tuple)
             if !hasintersect(widenconst(abstract_eval_value(interp, fptr, sstate, sv)), Ptr)
@@ -3903,7 +3920,6 @@ function abstract_eval_foreigncall(interp::AbstractInterpreter, e::Expr, sstate:
     effects = foreigncall_effects(e) do @nospecialize x
         abstract_eval_value(interp, x, sstate, sv)
     end
-    cconv = e.args[5]
     if isa(cconv, QuoteNode) && (v = cconv.value;
         isa(v, Union{Tuple{Symbol, UInt16, Bool}, Tuple{Symbol, UInt16, Bool, Bool},
                      Tuple{Symbol, UInt16, Bool, Bool, Bool}}))

@@ -65,9 +65,7 @@ function find_tfunc(@nospecialize f)
     end
 end
 
-const DATATYPE_TYPES_FIELDINDEX = fieldindex(DataType, :types)
 const DATATYPE_NAME_FIELDINDEX = fieldindex(DataType, :name)
-const DATATYPE_SUPER_FIELDINDEX = fieldindex(DataType, :super)
 
 ##########
 # tfuncs #
@@ -585,14 +583,14 @@ add_tfunc(Core.bitsizeof, 1, 1, bitsizeof_tfunc, 1)
     if isa(x, DataType) && !isabstracttype(x)
         if x.name === Tuple.name
             isvatuple(x) && return Int
-            return Const(length(x.types))
+            return Const(length(x.parameters))
         elseif x.name === _NAMEDTUPLE_NAME
             length(x.parameters) == 2 || return Int
             names = x.parameters[1]
             isa(names, Tuple{Vararg{Symbol}}) || return nfields_tfunc(𝕃, rewrap_unionall(x.parameters[2], xt))
             return Const(length(names))
         else
-            return Const(isdefined(x, :types) ? length(x.types) : length(x.name.names))
+            return Const(length(x.name.names))
         end
     end
     if isa(x, Union)
@@ -1157,11 +1155,6 @@ end
 function _getfield_tfunc_const(@nospecialize(sv), name::Const)
     nv = _getfield_fieldindex(typeof(sv), name)
     nv === nothing && return Bottom
-    # `types` and `super` are write-once: non-const (filled lazily), but once
-    # a defined value is observed it can never change, so folding it is sound
-    if isa(sv, DataType) && (nv == DATATYPE_TYPES_FIELDINDEX || nv == DATATYPE_SUPER_FIELDINDEX) && isdefined(sv, nv)
-        return Const(getfield(sv, nv))
-    end
     if !isa(sv, Module) && isconst(typeof(sv), nv)
         if isdefined(sv, nv)
             return Const(getfield(sv, nv))
@@ -1256,17 +1249,6 @@ end
             s = typeof(sv)
         else
             sv = type_parameter(s)
-            if isa(sv, DataType) && isa(name, Const) &&
-               _getfield_fieldindex(DataType, name) == DATATYPE_SUPER_FIELDINDEX &&
-               # read without forcing: on a deferred instantiation whose slot
-               # is still unset the modeled `getfield` throws, so no precision
-               # is lost by falling through (see issue #61347)
-               isdefined(sv, :super) &&
-               (svsuper = getfield(sv, :super); !has_free_typevars(svsuper))
-                # only `DataType` reps reach `.super` without throwing, and the
-                # `.super`s of `==`-equal `DataType`s are `==`-equal (if not egal)
-                return Type{svsuper}
-            end
             if isTypeDataType(sv) && isa(name, Const)
                 nv = _getfield_fieldindex(DataType, name)::Int
                 if nv == DATATYPE_NAME_FIELDINDEX
@@ -3655,6 +3637,24 @@ add_tfunc(Core.task_result_type, 1, 1, task_result_type_tfunc, 0)
 # both during abstract interpret and optimization
 
 const FOREIGNCALL_ARG_START = 6
+
+@nospecs function datatype_super_tfunc(x)
+    if isa(x, Const)
+        v = x.val
+        isa(v, DataType) || return Bottom
+        return Const(datatype_super(v))
+    end
+    t = unwrap_unionall(widenconst(x))
+    if isType(t)
+        v = type_parameter(t)
+        if isa(v, DataType) && !has_free_typevars(v)
+            # This models the semantic accessor, not the identity of its
+            # hidden cache slot, so image restoration cannot invalidate it.
+            return Type{datatype_super(v)}
+        end
+    end
+    return DataType
+end
 
 function foreigncall_effects(@nospecialize(abstract_eval), ::Expr)
     # `:foreigncall` can potentially perform all sorts of operations, including calling

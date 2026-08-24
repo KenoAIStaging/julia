@@ -707,13 +707,14 @@ function serialize_typename(s::AbstractSerializer, t::Core.TypeName)
     serialize(s, t.name)
     serialize(s, t.names)
     primary = unwrap_unionall(t.wrapper)
-    serialize(s, primary.super)
+    serialize(s, supertype(primary))
     serialize(s, primary.parameters)
-    serialize(s, primary.types)
+    primary_types = Base.datatype_fieldtypes(primary)
+    serialize(s, primary_types)
     serialize(s, Base.issingletontype(primary))
     serialize(s, t.flags & 0x1 == 0x1) # .abstract
     serialize(s, t.flags & 0x2 == 0x2) # .mutable
-    serialize(s, Int32(length(primary.types) - t.n_uninitialized))
+    serialize(s, Int32(length(primary_types) - t.n_uninitialized))
     serialize(s, t.max_methods)
     ms = Base.matches_to_methods(Base._methods_by_ftype(Tuple{t.wrapper, Vararg}, -1, Base.get_world_counter()), t, nothing).ms
     if t.singletonname !== t.name || !isempty(ms)
@@ -741,7 +742,7 @@ function should_send_whole_type(s, t::DataType)
     mod = tn.module
     mod === __deserialized_types__ && return true
     isanonfunction = mod === Main && # only Main
-        t.super === Function && # only Functions
+        supertype(t) === Function && # only Functions
         unsafe_load(unsafe_convert(Ptr{UInt8}, tn.name)) == UInt8('#') && # hidden type
         (!isdefined(mod, name) || t != typeof(getglobal(mod, name))) # XXX: 95% accurate test for this being an inner function
         # TODO: more accurate test? (tn.name !== "#" name)
@@ -1146,7 +1147,7 @@ function handle_deserialize(s::AbstractSerializer, b::Int32)
         return deserialize_dict(s, t)
     end
     t = desertag(b)::DataType
-    if ismutabletype(t) && length(t.types) > 0  # manual specialization of fieldcount
+    if ismutabletype(t) && length(Base.datatype_fieldtypes(t)) > 0  # manual specialization of fieldcount
         slot = s.counter; s.counter += 1
         push!(s.pending_refs, slot)
     end
@@ -1844,7 +1845,7 @@ end
 
 # default DataType deserializer
 function deserialize(s::AbstractSerializer, t::DataType)
-    nf = length(t.types)
+    nf = length(Base.datatype_fieldtypes(t))
     if isprimitivetype(t)
         return read(s.io, t)
     elseif ismutabletype(t)

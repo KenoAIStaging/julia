@@ -744,16 +744,16 @@ int obviously_disjoint(jl_value_t *a, jl_value_t *b, int specificity) JL_NOTSAFE
         if (ad->name != bd->name) {
             jl_datatype_t *temp = ad;
             while (temp != jl_any_type && temp->name != bd->name) {
-                // raw read: this heuristic must not reach a safepoint, so a
+                // non-forcing read: this heuristic must not reach a safepoint, so a
                 // deferred (unset) supertype conservatively proves nothing
-                temp = temp->super;
+                temp = jl_datatype_super_ifdefined(temp);
                 if (temp == NULL)
                     return 0;
             }
             if (temp == jl_any_type) {
                 temp = bd;
                 while (temp != jl_any_type && temp->name != ad->name) {
-                    temp = temp->super;
+                    temp = jl_datatype_super_ifdefined(temp);
                     if (temp == NULL)
                         return 0;
                 }
@@ -3648,10 +3648,10 @@ static int obvious_subtype(jl_value_t *x, jl_value_t *y, jl_value_t *y0, int *su
             if (((jl_datatype_t*)x)->name != ((jl_datatype_t*)y)->name) {
                 jl_datatype_t *temp = (jl_datatype_t*)x;
                 while (temp->name != ((jl_datatype_t*)y)->name) {
-                    // raw read: this heuristic must not reach a safepoint, so
+                    // non-forcing read: this heuristic must not reach a safepoint, so
                     // a deferred (unset) supertype stays undecided and the
                     // full algorithm resolves it
-                    temp = temp->super;
+                    temp = jl_datatype_super_ifdefined(temp);
                     if (temp == NULL)
                         return 0;
                     if (temp == jl_any_type) {

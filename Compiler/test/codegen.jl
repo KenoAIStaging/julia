@@ -649,7 +649,7 @@ struct A43303{T}
 end
 @test A43303.body.layout != C_NULL
 @test isbitstype(A43303{Int})
-@test A43303.body.types[1].layout != C_NULL
+@test Base.datatype_fieldtypes(A43303.body)[1].layout != C_NULL
 
 # issue #41157
 f41157(a, b) = a[1] = b[1]

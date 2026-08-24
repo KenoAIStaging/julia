@@ -850,7 +850,7 @@ int jl_typemap_intersection_visitor(jl_typemap_t *map, int offs,
                     // just consider the type and its direct super types
                     jl_datatype_t *super = (jl_datatype_t*)jl_unwrap_unionall(((jl_typename_t*)name)->wrapper);
                     if (super->name == jl_typeofbottom_type->name)
-                        super = super->super; // this was handled above
+                        super = jl_datatype_super_ifdefined(super); // this was handled above
                     while (1) {
                         tname = jl_atomic_load_relaxed(&cache->tname); // reload after callback
                         jl_typemap_t *ml = mtcache_hash_lookup(tname, (jl_value_t*)super->name);

@@ -156,8 +156,8 @@ function (ss::SummarySize)(obj::DataType)
     haskey(ss.seen, key) ? (return 0) : (ss.seen[key] = true)
     size::Int = ss.count ? 1 : sizeof(DataType)
     size += ss(obj.parameters)::Int
-    if isdefined(obj, :types)
-        size += ss(obj.types)::Int
+    if datatype_fieldtypes_isdefined(obj)
+        size += ss(datatype_fieldtypes(obj))::Int
     end
     return size
 end

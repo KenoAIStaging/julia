@@ -1679,7 +1679,7 @@ err20033(x::Float64...) = prod(x)
 
 # nfields tfunc on `DataType`
 let f = ()->Val{nfields(DataType[Int][1])}
-    @test f() == Val{length(DataType.types)}
+    @test f() == Val{fieldcount(DataType)}
 end
 
 # inference on invalid getfield call
@@ -2386,6 +2386,12 @@ g23024(TT::Tuple{DataType}) = f23024(TT[1], v23024)
 # `supertype(::UnionAll)` is applicable too; the egal-pinned type stays precise
 @test Base.return_types(supertype, (Type{typeof(Union{})},)) == Any[Any, Type{Core.AnyType}]
 @test Base.return_types(supertype, (Core.TypeEgal{typeof(Union{})},)) == Any[Core.TypeEgal{Core.AnyType}]
+
+# Compiler modeling of Base's semantic supertype accessor must not change the
+# ABI of a foreign call that merely names the same runtime function.
+datatype_super_raw_abi() = ccall(:jl_datatype_super, Ptr{Cvoid}, (Any,), Int)
+@test Base.infer_return_type(datatype_super_raw_abi, ()) === Ptr{Cvoid}
+@test datatype_super_raw_abi() isa Ptr{Cvoid}
 
 # issue #23685
 struct Node23685{T}

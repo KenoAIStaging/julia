@@ -462,6 +462,24 @@ using Test
         end
         @test TG_SelfSuperA{Int} <: AbstractVector{TG_SelfSuperA{Int}}
         @test fieldtype(TG_SelfSuperB{Int}, :a) == TG_SelfSuperA{Int}
+
+        # Supertype recursion can also pass transitively through another
+        # member of the group while its parameters grow at every step.
+        abstract type TG_GrowA{T} end
+        abstract type TG_GrowB{T} end
+        typegroup
+            struct TG_GrowS{T} <: TG_GrowA{TG_GrowR{TG_GrowA{T}}} end
+            struct TG_GrowR{T} <: TG_GrowB{TG_GrowS{TG_GrowB{T}}} end
+        end
+        x = TG_GrowS{Int}
+        for _ in 1:3
+            x = supertype(x).parameters[1]
+        end
+        t = x.parameters[1]
+        expected = TG_GrowB{TG_GrowS{TG_GrowB{t}}}
+        @test supertype(x) === expected
+        @test x <: TG_GrowB
+        @test typeintersect(x, expected) === x
     end
 
     @testset "red/black list with AbstractArray{T,0} supertype" begin

@@ -87,17 +87,28 @@ function supertype(T::DataType)
     @_foldable_meta
     # force the computation of a deferred supertype (an instantiation of a
     # self-referential definition materializes its supertype graph lazily,
-    # one level per demand, see issue #61347); idempotent, so still foldable.
-    # The subsequent plain field read keeps `getfield`'s inference precision.
-    ccall(:jl_datatype_compute_super, Ptr{Cvoid}, (Any,), T)
-    return getfield(T, :super)
+    # one level per demand, see issue #61347). The backing field is hidden so
+    # that inference cannot assume the lazily populated cache is constant.
+    return ccall(:jl_datatype_super, Any, (Any,), T)::DataType
 end
 function getproperty(T::DataType, s::Symbol)
     @inline
-    # fill the deferred supertype cache on access, so raw `.super` reads keep
-    # working for instantiations of self-referential definitions (#61347)
+    # Keep the historical property spellings while hiding the mutable caches
+    # from `getfield` and inference.
     s === :super && return supertype(T)
+    s === :types && return ccall(:jl_get_fieldtypes, Any, (Any,), T)::Core.SimpleVector
     return getfield(T, s)
+end
+function getproperty(T::DataType, s::Symbol, order::Symbol)
+    @inline
+    if s === :super
+        supertype(T)
+        return getfield(T, 2, order)::DataType
+    elseif s === :types
+        ccall(:jl_get_fieldtypes, Any, (Any,), T)
+        return getfield(T, 4, order)::Core.SimpleVector
+    end
+    return getfield(T, s, order)
 end
 supertype(T::UnionAll) = (@_foldable_meta; UnionAll(T.var, supertype(T.body)))
 

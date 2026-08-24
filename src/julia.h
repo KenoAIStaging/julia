@@ -1566,7 +1566,20 @@ STATIC_INLINE void jl_array_uint32_set(void *a, size_t i, uint32_t x) JL_NOTSAFE
 
 // struct type info
 JL_DLLEXPORT jl_svec_t *jl_compute_fieldtypes(jl_datatype_t *st JL_PROPAGATES_ROOT, void *stack, int cacheable) JL_CANSAFEPOINT;
-#define jl_get_fieldtypes(st) ((st)->types ? (st)->types : jl_compute_fieldtypes((st), NULL, 0))
+STATIC_INLINE jl_datatype_t *jl_datatype_super_ifdefined(jl_datatype_t *st) JL_NOTSAFEPOINT
+{
+    return jl_atomic_load_acquire((_Atomic(jl_datatype_t*)*)&st->super);
+}
+STATIC_INLINE jl_svec_t *jl_datatype_fieldtypes_ifdefined(jl_datatype_t *st) JL_NOTSAFEPOINT
+{
+    return jl_atomic_load_acquire((_Atomic(jl_svec_t*)*)&st->types);
+}
+STATIC_INLINE jl_svec_t *jl_get_fieldtypes_impl(jl_datatype_t *st JL_PROPAGATES_ROOT) JL_CANSAFEPOINT
+{
+    jl_svec_t *types = jl_datatype_fieldtypes_ifdefined(st);
+    return types ? types : jl_compute_fieldtypes(st, NULL, 0);
+}
+#define jl_get_fieldtypes(st) jl_get_fieldtypes_impl(st)
 STATIC_INLINE jl_svec_t *jl_field_names(jl_datatype_t *st) JL_NOTSAFEPOINT
 {
     return st->name->names;
@@ -1577,8 +1590,9 @@ STATIC_INLINE jl_value_t *jl_field_type(jl_datatype_t *st JL_PROPAGATES_ROOT, si
 }
 STATIC_INLINE jl_value_t *jl_field_type_concrete(jl_datatype_t *st JL_PROPAGATES_ROOT, size_t i) JL_NOTSAFEPOINT
 {
-    assert(st->types);
-    return jl_svecref(st->types, i);
+    jl_svec_t *types = jl_datatype_fieldtypes_ifdefined(st);
+    assert(types);
+    return jl_svecref(types, i);
 }
 
 STATIC_INLINE int jl_is_layout_opaque(const jl_datatype_layout_t *l) JL_NOTSAFEPOINT

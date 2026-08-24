@@ -83,6 +83,15 @@ module AbstractIrrationalExamples
     )
 end
 
+module LazyDataTypeMetadata
+abstract type A{T} end
+struct S{T} <: A{S{A{T}}} end
+struct F{T,U}
+    x::T
+    y::U
+end
+end
+
 macro big_expr(n, x)
     x = esc(x)
     for _ in 1:n
@@ -96,6 +105,42 @@ end
 @test Threads.threadid() == 1
 @test threadpool() in (:interactive, :default) # thread 1 could be in the interactive pool
 @test 1 <= threadpoolsize(:default) <= Threads.maxthreadid()
+
+@testset "concurrent lazy DataType metadata" begin
+    A = LazyDataTypeMetadata.A
+    S = LazyDataTypeMetadata.S
+    # Keep the particular cache objects opaque to inference: otherwise
+    # compiling the spawned closure can run the semantic supertype tfunc and
+    # fill `lazy_super` before this test reaches its precondition.
+    seed = Base.inferencebarrier(S{A{A{A{A{Int}}}}})::DataType
+    lazy_super = Base.inferencebarrier(
+        getfield(supertype(seed), :parameters)[1])::DataType
+    lazy_types = Base.inferencebarrier(LazyDataTypeMetadata.F{Int}.body)::DataType
+    @test !isdefined(lazy_super, 2)
+    @test !Base.datatype_fieldtypes_isdefined(lazy_types)
+
+    T = lazy_super.parameters[1]
+    expected_super = A{S{A{T}}}
+    nworkers = max(8, Threads.nthreads() * 4)
+    ready = Channel{Nothing}(nworkers)
+    start = Base.Event()
+    tasks = map(1:nworkers) do _
+        Threads.@spawn begin
+            put!(ready, nothing)
+            wait(start)
+            (supertype(lazy_super), Base.datatype_fieldtypes(lazy_types))
+        end
+    end
+    foreach(_ -> take!(ready), 1:nworkers)
+    notify(start)
+    results = fetch.(tasks)
+
+    @test all(result -> result[1] === expected_super, results)
+    fieldtypes_result = results[1][2]
+    @test all(result -> result[2] === fieldtypes_result, results)
+    @test fieldtypes_result[1] === Int
+    @test fieldtypes_result[2] === lazy_types.parameters[2]
+end
 
 # basic lock check
 if threadpoolsize(:default) > 1

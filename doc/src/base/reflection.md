@@ -24,12 +24,11 @@ julia> fieldnames(Point)
 (:x, :y)
 ```
 
-The type of each field in a `Point` object is stored in the `types` field of the `Point` variable
-itself:
+The types of the fields in a `Point` object can be queried with [`fieldtypes`](@ref):
 
 ```jldoctest struct_point
-julia> Point.types
-svec(Int64, Any)
+julia> fieldtypes(Point)
+(Int64, Any)
 ```
 
 While `x` is annotated as an `Int`, `y` was unannotated in the type definition, therefore `y`
@@ -42,8 +41,10 @@ julia> typeof(Point)
 DataType
 ```
 
-Note that `fieldnames(DataType)` gives the names for each field of `DataType` itself, and one
-of these fields is the `types` field observed in the example above.
+The runtime representation of `DataType` contains additional internal caches that are not
+exposed as named fields. Use reflection functions such as [`fieldnames`](@ref),
+[`fieldtypes`](@ref), and [`supertype`](@ref) rather than inspecting that representation
+directly.
 
 ## Subtypes
 

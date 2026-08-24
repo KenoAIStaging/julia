@@ -603,6 +603,8 @@ end
 # concrete datatype predicates
 
 datatype_fieldtypes(x::DataType) = ccall(:jl_get_fieldtypes, Core.SimpleVector, (Any,), x)
+datatype_fieldtypes_isdefined(x::DataType) =
+    ccall(:jl_datatype_fieldtypes_isdefined, Cint, (Any,), x) != 0
 
 struct DataTypeLayout
     size::UInt32
@@ -1370,10 +1372,12 @@ function datatype_fieldcount(t::DataType)
     end
     if t.name === Tuple.name
         isvatuple(t) && return nothing
-        return length(t.types)
+        # Fixed-length tuple parameters are exactly its field types. Counting
+        # them avoids materializing the hidden field-type cache.
+        return length(t.parameters)
     end
-    # Equivalent to length(t.types), but `t.types` is lazy and we do not want
-    # to be forced to compute it.
+    # Equivalent to the length of the field-type cache, but the cache is lazy
+    # and we do not want to force its computation.
     return length(t.name.names)
 end
 
@@ -1652,6 +1656,7 @@ See also [`hasproperty`](@ref), [`hasfield`](@ref).
 """
 propertynames(x) = fieldnames(typeof(x))
 propertynames(m::Module) = names(m)
+propertynames(::DataType) = (:name, :super, :parameters, :types, :instance, :layout, :hash, :flags)
 propertynames(x, private::Bool) = propertynames(x) # ignore private flag by default
 propertynames(x::Array) = () # hide the fields from tab completion to discourage calling `x.size` instead of `size(x)`, even though they are equivalent
 

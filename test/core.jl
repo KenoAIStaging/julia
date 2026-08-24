@@ -24,8 +24,7 @@ for (T, c) in (
         (Core.TypeMapEntry, [:sig, :simplesig, :guardsigs, :func, :isleafsig, :issimplesig, :va]),
         (Core.TypeMapLevel, []),
         (Core.TypeName, [:name, :module, :names, :wrapper, :hash, :n_uninitialized, :flags]),
-        # `super` is filled lazily for instantiations of self-referential
-        # definitions (issue #61347), so it is deliberately non-const (and atomic)
+        # The two unnamed fields are the hidden `super` and `types` caches.
         (DataType, [:name, :parameters, :instance, :hash]),
         (TypeVar, [:name, :ub, :lb]),
         (Core.Memory, [:length, :ptr]),
@@ -47,7 +46,7 @@ for (T, c) in (
         (Core.TypeMapEntry, [:next, :min_world, :max_world]),
         (Core.TypeMapLevel, [:arg1, :targ, :name1, :tname, :list, :any]),
         (Core.TypeName, [:cache, :linearcache, :Typeofwrapper, :max_args, :cache_entry_count]),
-        (DataType, [:super, :types, :layout]),
+        (DataType, [:var"", :layout]),
         (Core.Memory, []),
         (Core.GenericMemoryRef, []),
         (Task, [:_state, :preempt_request, :running_time_ns, :finished_at, :first_enqueued_at, :last_started_running_at, :waiting_on, :bound_cancel_token]),
@@ -55,11 +54,25 @@ for (T, c) in (
     )
     @test Set((fieldname(T, i) for i in 1:fieldcount(T) if Base.isfieldatomic(T, i))) == Set(c)
 end
+@test [i for i in 1:fieldcount(DataType) if Base.isfieldatomic(DataType, i)] == [2, 4, 6]
 
 @test_throws(ErrorException("setfield!: const field .name of type DataType cannot be changed"),
     setfield!(Int, :name, Int.name))
 @test_throws(ErrorException("setfield!: const field .name of type DataType cannot be changed"),
     (Base.Experimental.@force_compile; setfield!(Int, :name, Int.name)))
+
+# Lazy DataType metadata is exposed through accessors, not backing fields.
+@test fieldindex(DataType, :super, false) == 0
+@test fieldindex(DataType, :types, false) == 0
+@test :super in propertynames(Int)
+@test :types in propertynames(Int)
+@test Int.super === supertype(Int)
+@test Int.types === Base.datatype_fieldtypes(Int)
+@test getproperty(Int, :super, :acquire) === supertype(Int)
+@test getproperty(Int, :types, :acquire) === Base.datatype_fieldtypes(Int)
+@test_throws FieldError getfield(Int, :super)
+@test_throws FieldError getfield(Int, :types)
+@test_throws FieldError setfield!(Int, :super, Any, :release)
 
 @test_throws(ErrorException("invalid field attribute const for immutable struct"),
     @eval struct ABCDconst
@@ -2910,8 +2923,8 @@ t_a7652 = A7652
 f7652() = fieldtype(t_a7652, :a) <: Int
 @test f7652() == (fieldtype(A7652, :a) <: Int) == true
 
-g7652() = fieldtype(DataType, :types)
-@test g7652() == fieldtype(DataType, :types) == Core.SimpleVector
+g7652() = fieldtype(DataType, :parameters)
+@test g7652() == fieldtype(DataType, :parameters) == Core.SimpleVector
 @test fieldtype(t_a7652, 1) == Int
 
 h7652() = setfield!(a7652, 1, 2)
@@ -8218,7 +8231,7 @@ primitive type P36104 16 end
 f_bad_invoke(x::Int) = invoke(x, (Any,), x)
 @test_throws TypeError f_bad_invoke(1)
 
-# Fixup for #37044, make sure mutation of `types` field of `DataType` is respected.
+# Fixup for #37044, make sure lazy field-type computation is respected.
 struct A37044{T1,T2}
     x::T1
     y::T2
@@ -8228,10 +8241,7 @@ struct Ref37044
 end
 function f37044(r)
     t = r.x
-    if !isdefined(t, :types)
-        Base.datatype_fieldtypes(t)
-    end
-    return t.types
+    return Base.datatype_fieldtypes(t)
 end
 r37044 = Ref37044(A37044{Int}.body)
 @test f37044(r37044)[1] === Int
@@ -9357,8 +9367,8 @@ end
 
 # issue #61347 (supertype half): every level of a structurally increasing
 # recursive supertype graph must be correct independently of instantiation
-# order, and deferred (lazily computed) supertypes must present the same
-# field-access semantics to compiled and interpreted code. (The field-type
+# order, and deferred (lazily computed) supertypes must remain behind their
+# accessor in compiled and interpreted code. (The field-type
 # analogue `struct S1{T}; x::S1{A{T}}; end` still hangs on instantiation;
 # a concrete type must publish with its layout, so its fix needs more.)
 module Issue61347
@@ -9377,17 +9387,31 @@ let A = Issue61347.A, S2 = Issue61347.S2
     @test walked === S2{A{A{Int}}}
     @test supertype(walked) === supertype(deep)
     @test S2{A{A{A{Int}}}} <: A
-    # compiled and interpreted field access agree on the deferred slot. The
-    # slot can be filled at any moment by unrelated activity, so bracket the
-    # interpreted read with compiled reads and require monotone agreement
-    # (an unfilled slot can only become filled, never the reverse)
+    # Filling the hidden cache must remain invisible to ordinary field access,
+    # including within optimized code.
     lazy = getfield(supertype(S2{A{A{A{A{Int}}}}}), :parameters)[1]
-    @noinline compiled_isdef(x::DataType) = isdefined(x, :super)
-    c1 = compiled_isdef(Base.inferencebarrier(lazy))
-    itp = Core.eval(@__MODULE__, :(isdefined($lazy, :super)))
-    c2 = compiled_isdef(Base.inferencebarrier(lazy))
-    @test c1 <= itp <= c2
-    @test supertype(lazy) isa Type # forcing accessor
-    @test isdefined(lazy, :super)
-    @test getfield(lazy, :super) === supertype(lazy)
+    expected = A{S2{A{A{A{A{A{A{Int}}}}}}}}
+    @noinline compiled_probe(x::DataType) =
+        (isdefined(x, :super), supertype(x), isdefined(x, :super))
+    @test compiled_probe(Base.inferencebarrier(lazy)) === (false, expected, false)
+    @test lazy.super === expected
+    @test (@atomic :acquire lazy.super) === expected
+end
+
+# Recursive parameter bounds must fail finitely when lazy supertype
+# instantiation re-enters the same type family with equal or growing arguments.
+abstract type BoundB61347{X<:Number} <: Number end
+struct BoundS61347{T} <: BoundB61347{BoundS61347{T}} end
+@test_throws ErrorException("circular type parameter constraint in definition of BoundS61347") supertype(BoundS61347{Int})
+
+abstract type GrowingBoundB61347{X<:Number} <: Number end
+struct GrowingBoundS61347{T} <: GrowingBoundB61347{GrowingBoundS61347{Tuple{T}}} end
+let err = try
+        supertype(GrowingBoundS61347{Int})
+        nothing
+    catch err
+        err
+    end
+    @test err isa Union{TypeError, ErrorException}
+    @test !(err isa StackOverflowError)
 end

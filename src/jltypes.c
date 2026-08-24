@@ -2451,43 +2451,73 @@ static int typename_on_stack(jl_typestack_t *stack, jl_typename_t *tn) JL_NOTSAF
 // recognize self-referential definitions, whose supertype/field-type graph may
 // have no finite materialization when the recursive applications are
 // structurally increasing (issue #61347), and is completed lazily instead.
-static int typename_occurs_in(jl_value_t *t, jl_typename_t *tn) JL_NOTSAFEPOINT
+static int datatype_on_stack(jl_typestack_t *stack, jl_datatype_t *dt) JL_NOTSAFEPOINT
+{
+    while (stack != NULL) {
+        if (stack->tt == dt)
+            return 1;
+        stack = stack->prev;
+    }
+    return 0;
+}
+
+static int typename_occurs_in_(jl_value_t *t, jl_typename_t *tn, jl_typestack_t *visited) JL_NOTSAFEPOINT
 {
     if (t == NULL)
         return 0;
     if (jl_is_svec(t)) {
         size_t i, l = jl_svec_len(t);
         for (i = 0; i < l; i++) {
-            if (typename_occurs_in(jl_svecref(t, i), tn))
+            if (typename_occurs_in_(jl_svecref(t, i), tn, visited))
                 return 1;
         }
         return 0;
     }
     if (jl_is_datatype(t)) {
-        if (((jl_datatype_t*)t)->name == tn)
+        jl_datatype_t *dt = (jl_datatype_t*)t;
+        if (dt->name == tn)
             return 1;
-        return typename_occurs_in((jl_value_t*)((jl_datatype_t*)t)->parameters, tn);
+        if (datatype_on_stack(visited, dt))
+            return 0;
+        jl_typestack_t top = { dt, visited };
+        if (typename_occurs_in_((jl_value_t*)dt->parameters, tn, &top))
+            return 1;
+        // Recursive supertype graphs can pass through another member of a
+        // typegroup, so follow that typename's declaration as well as the
+        // parameters visible at this application.
+        if (dt->name->wrapper == NULL)
+            return 0;
+        jl_datatype_t *primarydt = (jl_datatype_t*)jl_unwrap_unionall(dt->name->wrapper);
+        jl_datatype_t *super = jl_datatype_super_ifdefined(primarydt);
+        return super != NULL && typename_occurs_in_((jl_value_t*)super, tn, &top);
     }
     if (jl_is_unionall(t)) {
         jl_unionall_t *u = (jl_unionall_t*)t;
-        return typename_occurs_in(u->var->lb, tn) || typename_occurs_in(u->var->ub, tn) ||
-               typename_occurs_in(u->body, tn);
+        return typename_occurs_in_(u->var->lb, tn, visited) ||
+               typename_occurs_in_(u->var->ub, tn, visited) ||
+               typename_occurs_in_(u->body, tn, visited);
     }
     if (jl_is_uniontype(t)) {
-        return typename_occurs_in(((jl_uniontype_t*)t)->a, tn) ||
-               typename_occurs_in(((jl_uniontype_t*)t)->b, tn);
+        return typename_occurs_in_(((jl_uniontype_t*)t)->a, tn, visited) ||
+               typename_occurs_in_(((jl_uniontype_t*)t)->b, tn, visited);
     }
     if (jl_is_vararg(t)) {
         jl_vararg_t *vm = (jl_vararg_t*)t;
-        return typename_occurs_in(vm->T, tn) || typename_occurs_in(vm->N, tn);
+        return typename_occurs_in_(vm->T, tn, visited) ||
+               typename_occurs_in_(vm->N, tn, visited);
     }
     if (jl_is_typeeq(t))
-        return typename_occurs_in(jl_typeeq_T(t), tn);
+        return typename_occurs_in_(jl_typeeq_T(t), tn, visited);
     if (jl_is_typeegal(t))
-        return typename_occurs_in(jl_typeegal_T(t), tn);
+        return typename_occurs_in_(jl_typeegal_T(t), tn, visited);
     // n.b. free TypeVar bounds are not walked: materialized typevar bound
     // graphs may be cyclic
     return 0;
+}
+
+static int typename_occurs_in(jl_value_t *t, jl_typename_t *tn) JL_NOTSAFEPOINT
+{
+    return typename_occurs_in_(t, tn, NULL);
 }
 
 static jl_value_t *inst_datatype_inner(jl_datatype_t *dt, jl_svec_t *p, jl_value_t **iparams, size_t ntp,
@@ -2820,6 +2850,14 @@ static jl_value_t *inst_datatype_inner(jl_datatype_t *dt, jl_svec_t *p, jl_value
     if (primarydt->layout && !defer)
         jl_compute_field_offsets(ndt);
 
+    // `dt` can itself be a partially applied lazy instantiation. Snapshot its
+    // caches once so concurrent first forcing cannot race with this walk or
+    // make the decisions below internally inconsistent.
+    jl_datatype_t *dt_super = jl_datatype_super_ifdefined(dt);
+    jl_datatype_t *primary_super = primarydt == dt ? dt_super : jl_datatype_super_ifdefined(primarydt);
+    jl_svec_t *dt_types = jl_datatype_fieldtypes_ifdefined(dt);
+    jl_svec_t *primary_types = primarydt == dt ? dt_types : jl_datatype_fieldtypes_ifdefined(primarydt);
+
     // A definition whose supertype declaration recursively applies the type
     // being defined at structurally increasing parameters (issue #61347, e.g.
     // `struct S{T} <: A{S{Tuple{T}}} end`) has an infinite supertype graph:
@@ -2832,17 +2870,17 @@ static jl_value_t *inst_datatype_inner(jl_datatype_t *dt, jl_svec_t *p, jl_value
     // so ordinary recursive types are unaffected. Field types stay eager: a
     // concrete type must publish with its layout, and only the supertype
     // declaration can force an infinite graph through abstract levels.
-    int defer_super = check && !istuple && !isnamedtuple && dt->super != NULL &&
+    int defer_super = check && !istuple && !isnamedtuple && dt_super != NULL &&
         typename_on_stack(top.prev, tn) &&
-        typename_occurs_in((jl_value_t*)primarydt->super, tn);
+        typename_occurs_in((jl_value_t*)primary_super, tn);
     if (istuple || isnamedtuple) {
         ndt->super = jl_any_type;
     }
     else if (defer_super) {
         // deferred (see above)
     }
-    else if (dt->super) {
-        jl_value_t *super = inst_type_w_((jl_value_t*)dt->super, env, stack, check, nothrow, dcache);
+    else if (dt_super) {
+        jl_value_t *super = inst_type_w_((jl_value_t*)dt_super, env, stack, check, nothrow, dcache);
         if (nothrow && super == NULL) {
             if (cacheable && !defer)
                 JL_UNLOCK(&typecache_lock);
@@ -2851,10 +2889,10 @@ static jl_value_t *inst_datatype_inner(jl_datatype_t *dt, jl_svec_t *p, jl_value
         }
         jl_gc_write(ndt, ndt->super, jl_datatype_t, (jl_datatype_t *)super);
     }
-    jl_svec_t *ftypes = dt->types;
+    jl_svec_t *ftypes = dt_types;
     if (ftypes == NULL)
-        ftypes = primarydt->types;
-    if (ftypes == NULL || dt->super == NULL) {
+        ftypes = primary_types;
+    if (ftypes == NULL || dt_super == NULL) {
         // in the process of creating this type definition:
         // need to instantiate the super and types fields later
         if (tn->partial == NULL) {
@@ -2870,7 +2908,7 @@ static jl_value_t *inst_datatype_inner(jl_datatype_t *dt, jl_svec_t *p, jl_value
         }
         else if (cacheable) {
             // recursively instantiate the types of the fields
-            if (dt->types == NULL)
+            if (dt_types == NULL)
                 jl_gc_write(ndt, ndt->types, jl_svec_t, compute_fieldtypes_(ndt, stack, cacheable && !defer, dcache));
             else
                 jl_gc_write(ndt, ndt->types, jl_svec_t, inst_ftypes(ftypes, env, stack, cacheable && !defer, dcache));
@@ -3392,7 +3430,8 @@ static jl_svec_t *compute_fieldtypes_(jl_datatype_t *st JL_PROPAGATES_ROOT, void
     assert(n > 0 && "expected empty case to be handled during construction");
     //if (n == 0)
     //    return ((st->types = jl_emptysvec));
-    if (wt->types == NULL)
+    jl_svec_t *wtypes = jl_datatype_fieldtypes_ifdefined(wt);
+    if (wtypes == NULL)
         jl_errorf("cannot determine field types of incomplete type %s",
                   jl_symbol_name(st->name->name));
     jl_typeenv_t *env = (jl_typeenv_t*)alloca(n * sizeof(jl_typeenv_t));
@@ -3404,8 +3443,12 @@ static jl_svec_t *compute_fieldtypes_(jl_datatype_t *st JL_PROPAGATES_ROOT, void
     jl_typestack_t top;
     top.tt = st;
     top.prev = (jl_typestack_t*)stack;
-    jl_gc_write(st, st->types, jl_svec_t, inst_ftypes(wt->types, &env[n - 1], &top, cacheable, dcache));
-    return st->types;
+    jl_svec_t *types = inst_ftypes(wtypes, &env[n - 1], &top, cacheable, dcache);
+    jl_svec_t *old = NULL;
+    jl_gc_wb(st, types);
+    if (!jl_atomic_cmpswap((_Atomic(jl_svec_t*)*)&st->types, &old, types))
+        types = old;
+    return types;
 }
 
 JL_DLLEXPORT jl_svec_t *jl_compute_fieldtypes(jl_datatype_t *st JL_PROPAGATES_ROOT, void *stack, int cacheable)
@@ -3413,15 +3456,21 @@ JL_DLLEXPORT jl_svec_t *jl_compute_fieldtypes(jl_datatype_t *st JL_PROPAGATES_RO
     return compute_fieldtypes_(st, stack, cacheable, NULL);
 }
 
+JL_DLLEXPORT int jl_datatype_fieldtypes_isdefined(jl_datatype_t *st)
+{
+    return jl_datatype_fieldtypes_ifdefined(st) != NULL;
+}
+
 
 // Complete the deferred supertype of an instantiation of a self-referential
 // definition (issue #61347): eager instantiation of a structurally increasing
 // supertype graph would not terminate, so it is materialized lazily, one
 // level per demand. Returns NULL if the type's definition is still in
-// progress. Consumers that do not funnel through here (raw `getfield`,
-// direct C reads) see either the published value or an undefined field: the
-// Julia-side metadata declares `super` maybe-undefined, non-const and atomic,
-// so an unfilled slot reads as `UndefRefError`, never as garbage.
+// progress. The Julia-visible property funnels through this accessor; its
+// mutable backing slot is deliberately unnamed so inference cannot observe
+// or fold the intermediate state.
+static __thread jl_typestack_t *datatype_super_stack;
+
 JL_DLLEXPORT jl_datatype_t *jl_datatype_compute_super(jl_datatype_t *ndt JL_PROPAGATES_ROOT)
 {
     // one-time lazy initialization; the acquire pairs with the releasing
@@ -3433,8 +3482,11 @@ JL_DLLEXPORT jl_datatype_t *jl_datatype_compute_super(jl_datatype_t *ndt JL_PROP
     if (ndt->name->wrapper == NULL)
         return NULL; // too early in bootstrap
     jl_datatype_t *primarydt = (jl_datatype_t*)jl_unwrap_unionall(ndt->name->wrapper);
-    if (primarydt == ndt || primarydt->super == NULL)
+    jl_datatype_t *primarysuper = jl_datatype_super_ifdefined(primarydt);
+    if (primarydt == ndt || primarysuper == NULL)
         return NULL; // definition in progress
+    if (typename_on_stack(datatype_super_stack, ndt->name))
+        return NULL; // circular parameter-bound validation
     size_t nparams = jl_svec_len(ndt->parameters), pi;
     jl_typeenv_t *penv = (jl_typeenv_t*)alloca(nparams * sizeof(jl_typeenv_t));
     for (pi = 0; pi < nparams; pi++) {
@@ -3443,14 +3495,24 @@ JL_DLLEXPORT jl_datatype_t *jl_datatype_compute_super(jl_datatype_t *ndt JL_PROP
         penv[pi].prev = pi == 0 ? NULL : &penv[pi - 1];
     }
     jl_typestack_t stop = { ndt, NULL };
-    jl_value_t *s = inst_type_w_((jl_value_t*)primarydt->super,
-                                 nparams == 0 ? NULL : &penv[nparams - 1],
-                                 &stop, 1, 0, NULL);
+    jl_typestack_t computing = { ndt, datatype_super_stack };
+    jl_value_t *s = NULL;
+    datatype_super_stack = &computing;
+    JL_TRY {
+        s = inst_type_w_((jl_value_t*)primarysuper,
+                         nparams == 0 ? NULL : &penv[nparams - 1],
+                         &stop, 1, 0, NULL);
+    }
+    JL_CATCH {
+        datatype_super_stack = computing.prev;
+        jl_rethrow();
+    }
+    datatype_super_stack = computing.prev;
     // concurrent first queries compute equal values; the compare-and-swap
     // keeps a single winner
     super = NULL;
+    jl_gc_wb(ndt, s);
     if (jl_atomic_cmpswap(superp, &super, (jl_datatype_t*)s)) {
-        jl_gc_wb(ndt, s);
         super = (jl_datatype_t*)s;
     }
     return super;
@@ -3604,16 +3666,14 @@ void jl_init_types(void) JL_GC_DISABLED
     jl_datatype_type->name->wrapper = (jl_value_t*)jl_datatype_type;
     jl_datatype_type->super = jl_anytype_type;
     jl_datatype_type->parameters = jl_emptysvec;
-    // only `name` is guaranteed initialized: `super` of a deferred
-    // self-referential instantiation stays NULL until
-    // `jl_datatype_compute_super` fills it (reads then see an undefined
-    // field, matching the interpreter), and `types`/`layout` are lazy too
+    // only `name` is guaranteed initialized: the hidden `super` and `types`
+    // caches and the visible `layout` field are populated lazily
     jl_datatype_type->name->n_uninitialized = 8 - 1;
     jl_datatype_type->name->names = jl_perm_symsvec(8,
             "name",
-            "super",
+            "",
             "parameters",
-            "types",
+            "",
             "instance",
             "layout",
             "hash",
