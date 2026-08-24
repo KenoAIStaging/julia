@@ -1847,6 +1847,9 @@ struct UnionIsdefinedA; x; end
 struct UnionIsdefinedB; x; end
 let isdefined_tfunc(@nospecialize xs...) =
         Compiler.isdefined_tfunc(Compiler.fallback_lattice, xs...)
+    # Opaque runtime fields are unreachable through ordinary field operations.
+    @test isdefined_tfunc(Const(Int), Const(:super)) === Union{}
+    @test !Compiler.isdefined_nothrow(Compiler.fallback_lattice, Const(Int), Const(:super))
     @test isdefined_tfunc(typeof(NamedTuple()), Const(0)) === Const(false)
     @test isdefined_tfunc(typeof(NamedTuple()), Const(1)) === Const(false)
     @test isdefined_tfunc(typeof((a=1,b=2)), Const(:a)) === Const(true)
@@ -2454,6 +2457,30 @@ mutable struct ARef{T}
 end
 let getfield_tfunc(@nospecialize xs...) =
         Compiler.getfield_tfunc(Compiler.fallback_lattice, xs...)
+
+    # Opaque runtime fields are excluded from ordinary field-access inference.
+    @test getfield_tfunc(Const(Int), Const(:super)) === Union{}
+    @test getfield_tfunc(DataType, Const(:types)) === Union{}
+    @test getfield_tfunc(Type{Int}, Const(1)) === Any
+    @test getfield_tfunc(Type{Int}, Const(2)) === Any
+    @test getfield_tfunc(Type{Int}, Const(:body)) === Any
+    @test getfield_tfunc(Type{Int}, Const(:super)) === Union{}
+    @test getfield_tfunc(Type{Int}, Const(:name)) == Const(Int.name)
+    @test Compiler.setfield!_tfunc(Compiler.fallback_lattice,
+                                   Type{Int}, Const(8), UInt16) === UInt16
+    @test Compiler.modifyfield!_tfunc(Compiler.fallback_lattice,
+                                      Type{Int}, Const(:flags), Any, UInt16) !== Union{}
+    @test Compiler.replacefield!_tfunc(Compiler.fallback_lattice,
+                                       Type{Int}, Const(8), UInt16, UInt16) !== Union{}
+    @test !Compiler.getfield_nothrow(Compiler.fallback_lattice, Const(Int), Const(:super), true)
+    @test Compiler.form_partially_defined_struct(Compiler.fallback_lattice, DataType, Const(:super)) === nothing
+
+    opaque_type = Core._structtype(@__MODULE__, gensym(:OpaqueConstSize), Core.svec(),
+                                   Core.svec(:payload), Core.svec(1, :opaque), false, 1)
+    Core._setsuper!(opaque_type, Any)
+    Core._typebody!(opaque_type, Core.svec(Any))
+    opaque_value = ccall(:jl_new_struct, Any, (Any, Any), opaque_type, Ref(nothing))
+    @test !Compiler.is_inlineable_constant(opaque_value)
 
     # inference of `T.mutable`
     @test getfield_tfunc(Const(Int.name), Const(:flags)) == Const(0x4)

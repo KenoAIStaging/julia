@@ -1186,6 +1186,8 @@ static inline size_t get_checked_fieldindex(const char *name, jl_datatype_t *st,
         jl_value_t *t = jl_type_union(ts, 2);
         jl_type_error(name, t, arg);
     }
+    if (jl_field_isopaque(st, idx))
+        jl_opaque_field_error(name, st, idx);
     if (mutabl && jl_field_isconst(st, idx)) {
         jl_errorf("%s: const field .%s of type %s cannot be changed", name,
                 jl_symbol_name((jl_sym_t*)jl_svecref(jl_field_names(st), idx)), jl_symbol_name(st->name->name));
@@ -1488,6 +1490,8 @@ JL_CALLABLE(jl_f_isdefined)
             return jl_false;
         }
     }
+    if (jl_field_isopaque(vt, idx))
+        jl_opaque_field_error("isdefined", vt, idx);
     int isatomic = jl_field_isatomic(vt, idx);
     if (!isatomic && order != jl_memory_order_notatomic && order != jl_memory_order_unspecified)
         jl_atomic_error("isdefined: non-atomic field cannot be accessed atomically");
@@ -2619,6 +2623,10 @@ int equiv_type(jl_value_t *ta, jl_value_t *tb) JL_CANSAFEPOINT
            ? dtb->name->constfields == NULL
            : (dtb->name->constfields != NULL &&
               memcmp(dta->name->constfields, dtb->name->constfields, (jl_svec_len(dta->name->names) + 31) / 32 * sizeof(uint32_t)) == 0)) &&
+          (dta->name->opaque_fields == NULL
+           ? dtb->name->opaque_fields == NULL
+           : (dtb->name->opaque_fields != NULL &&
+              memcmp(dta->name->opaque_fields, dtb->name->opaque_fields, (jl_svec_len(dta->name->names) + 31) / 32 * sizeof(uint32_t)) == 0)) &&
           jl_egal((jl_value_t*)jl_field_names(dta), (jl_value_t*)jl_field_names(dtb)) &&
           jl_nparams(dta) == jl_nparams(dtb)))
         return 0;

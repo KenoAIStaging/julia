@@ -172,6 +172,13 @@ JL_DLLEXPORT void JL_NORETURN JL_NO_SAFEPOINT_ANALYSIS jl_has_no_field_error(jl_
     jl_throw(jl_new_struct(jl_fielderror_type, t, var));
 }
 
+JL_DLLEXPORT void JL_NORETURN jl_opaque_field_error(const char *fname, jl_datatype_t *t, size_t i)
+{
+    jl_sym_t *field = (jl_sym_t*)jl_svecref(jl_field_names(t), i);
+    jl_errorf("%s: field .%s of type %s is opaque", fname,
+              jl_symbol_name(field), jl_symbol_name(t->name->name));
+}
+
 JL_DLLEXPORT void JL_NORETURN JL_NO_SAFEPOINT_ANALYSIS jl_argument_error(char *str) // == jl_exceptionf(jl_argumenterror_type, "%s", str)
 {
     jl_value_t *msg = jl_pchar_to_string((char*)str, strlen(str));

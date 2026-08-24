@@ -514,7 +514,10 @@ JL_DLLEXPORT jl_value_t *jl_get_field(jl_value_t *o, const char *fld)
     jl_task_t *ct = jl_current_task;
     JL_TRY {
         jl_value_t *s = (jl_value_t*)jl_symbol(fld);
-        int i = jl_field_index((jl_datatype_t*)jl_typeof(o), (jl_sym_t*)s, 1);
+        jl_datatype_t *st = (jl_datatype_t*)jl_typeof(o);
+        int i = jl_field_index(st, (jl_sym_t*)s, 1);
+        if (jl_field_isopaque(st, i))
+            jl_opaque_field_error("jl_get_field", st, i);
         v = jl_get_nth_field(o, i);
         jl_exception_clear();
     }

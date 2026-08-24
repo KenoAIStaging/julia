@@ -424,6 +424,7 @@ function lift_leaves(compact::IncrementalCompact, field::Int,
             elseif isexpr(def, :new)
                 typ = unwrap_unionall(widenconst(types(compact)[leaf]))
                 (isa(typ, DataType) && !isabstracttype(typ)) || return nothing
+                Base.isfieldopaque(typ, field) && return nothing
                 if ismutabletype(typ)
                     isconst(typ, field) || return nothing
                 end
@@ -1508,6 +1509,7 @@ function sroa_pass!(ir::IRCode, inlining::Union{Nothing,InliningState}=nothing)
             continue
         end
 
+        _typename_has_opaque_fields(struct_typ_name) && continue
         struct_typ_name.atomicfields == C_NULL || continue # TODO: handle more
         if !((field_ordering === :unspecified) ||
              (field_ordering isa Const && field_ordering.val === :not_atomic))
@@ -1844,6 +1846,7 @@ function sroa_mutables!(ir::IRCode, defuses::IdDict{Int,Tuple{SPCSet,SSADefUse}}
         typ = unwrap_unionall(widenconst(ir.stmts[defidx][:type]))
         ismutabletype(typ) || continue
         typ = typ::DataType
+        _datatype_has_opaque_fields(typ) && continue
         # Check if there are any uses we did not account for. If so, the variable
         # escapes and we cannot eliminate the allocation. This works, because we're guaranteed
         # not to include any intermediaries that have dead uses. As a result, missing uses will only ever

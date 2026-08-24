@@ -3173,6 +3173,28 @@ static void emit_atomic_error(jl_codectx_t &ctx, const Twine &msg)
     emit_error(ctx, prepare_call(jlatomicerror_func), msg);
 }
 
+static void emit_opaque_field_error(jl_codectx_t &ctx, const char *op,
+                                    jl_datatype_t *stt, size_t idx)
+{
+    std::string msg(op);
+    msg += ": field .";
+    msg += jl_symbol_name((jl_sym_t*)jl_svecref(jl_field_names(stt), idx));
+    msg += " of type ";
+    msg += jl_symbol_name(stt->name->name);
+    msg += " is opaque";
+    emit_error(ctx, msg);
+}
+
+static bool datatype_has_opaque_fields(jl_datatype_t *stt)
+{
+    size_t nfields = jl_datatype_nfields(stt);
+    for (size_t i = 0; i < nfields; i++) {
+        if (jl_field_isopaque(stt, i))
+            return true;
+    }
+    return false;
+}
+
 static jl_cgval_t emit_getfield_knownidx(jl_codectx_t &ctx, const jl_cgval_t &strct,
                                          unsigned idx, jl_datatype_t *jt,
                                          enum jl_memory_order order, Value **nullcheck=nullptr) JL_CANSAFEPOINT;
@@ -3209,6 +3231,10 @@ static bool emit_getfield_unknownidx(jl_codectx_t &ctx,
         enum jl_memory_order order) JL_CANSAFEPOINT
 {
     ++EmittedGetfieldUnknowns;
+    // The generic runtime path performs the selector-dependent opaque-field
+    // check. Do not turn a dynamic selector into an unchecked direct load.
+    if (datatype_has_opaque_fields(stt))
+        return false;
     size_t nfields = jl_datatype_nfields(stt);
     bool maybe_null = field_may_be_null(strct, stt);
     auto idx0 = [&]() JL_CANSAFEPOINT {

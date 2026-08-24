@@ -52,6 +52,7 @@ function count_const_size(@nospecialize(x), count_self::Bool = true)
         # cannot assess how much data we might end up rooting. However, if
         # the struct is mutable only for identity, the query still works.
         for i = 1:nfields(x)
+            Base.isfieldopaque(typeof(x), i) && return MAX_INLINE_CONST_SIZE + 1
             if !isconst(typeof(x), i)
                 return MAX_INLINE_CONST_SIZE + 1
             end
@@ -63,6 +64,7 @@ function count_const_size(@nospecialize(x), count_self::Bool = true)
     sz > MAX_INLINE_CONST_SIZE && return MAX_INLINE_CONST_SIZE + 1
     dtfd = DataTypeFieldDesc(dt)
     for i = 1:Int(datatype_nfields(dt))
+        Base.isfieldopaque(dt, i) && return MAX_INLINE_CONST_SIZE + 1
         isdefined(x, i) || continue
         f = getfield(x, i)
         if !dtfd[i].isptr && datatype_pointerfree(typeof(f))

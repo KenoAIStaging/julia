@@ -397,6 +397,42 @@ end
 end
 add_tfunc(===, 2, 2, egal_tfunc, 1)
 
+function _field_isopaque(t::DataType, idx::Int)
+    return Base.isfieldopaque(t, idx)
+end
+
+function _datatype_has_opaque_fields(t::DataType)
+    return Base.datatype_has_opaque_fields(t)
+end
+
+function _typename_has_opaque_fields(tn::Core.TypeName)
+    wrapper = unwrap_unionall(tn.wrapper)
+    return isa(wrapper, DataType) && _datatype_has_opaque_fields(wrapper)
+end
+
+@nospecs function _may_select_opaque_field(x, name)
+    x isa MustAlias && (x = widenmustalias(x))
+    xt = x isa Const ? typeof(x.val) :
+         isconstType(x) ? typeof(type_parameter(x)) : widenconst(x)
+    return _may_select_opaque_field_type(unwrap_unionall(xt), name)
+end
+
+@nospecs function _may_select_opaque_field_type(t, name)
+    if isa(t, Union)
+        return _may_select_opaque_field_type(unwrap_unionall(t.a), name) ||
+               _may_select_opaque_field_type(unwrap_unionall(t.b), name)
+    elseif isa(t, DataType) && !isabstracttype(t)
+        t === Module && return false
+        if isa(name, Const)
+            idx = _getfield_fieldindex(t, name)
+            return isa(idx, Int) && _field_isopaque(t, idx)
+        end
+        return _datatype_has_opaque_fields(t)
+    end
+    # An imprecise object type can include an instance with opaque fields.
+    return true
+end
+
 function isdefined_nothrow(𝕃::AbstractLattice, argtypes::Vector{Any})
     if length(argtypes) ≠ 2
         # TODO prove nothrow when ordering is specified
@@ -409,10 +445,11 @@ end
     isvarargtype(x) && return false
     isvarargtype(name) && return false
     if hasintersect(widenconst(x), Module)
-        return name ⊑ Symbol
+        name ⊑ Symbol || return false
     else
-        return name ⊑ Symbol || name ⊑ Int
+        name ⊑ Symbol || name ⊑ Int || return false
     end
+    return !_may_select_opaque_field(x, name)
 end
 
 @nospecs function isdefined_tfunc(𝕃::AbstractLattice, arg1, sym, order)
@@ -437,6 +474,7 @@ end
             else
                 return Bottom
             end
+            _field_isopaque(a1, idx) && return Bottom
             if 1 ≤ idx ≤ datatype_min_ninitialized(a1)
                 return Const(true)
             elseif a1.name === _NAMEDTUPLE_NAME
@@ -1085,6 +1123,7 @@ end
         @assert !boundscheck
         ismod && return false
         name ⊑ Int || name ⊑ Symbol || return false
+        _datatype_has_opaque_fields(sty) && return false
         sty.name.n_uninitialized == 0 && return true
         nflds === nothing && return false
         for i = (datatype_min_ninitialized(sty)+1):nflds
@@ -1108,12 +1147,14 @@ end
         # we can assume we don't throw
         if !boundscheck && s.name.n_uninitialized == 0
             name ⊑ Int || name ⊑ Symbol || return false
+            _datatype_has_opaque_fields(s) && return false
             return true
         end
         # Else we need to know what the field is
         isa(name, Const) || return false
         field = try_compute_fieldidx(s, name.val)
         field === nothing && return false
+        _field_isopaque(s, field) && return false
         isfieldatomic(s, field) && return false # TODO: currently we're only testing for ordering === :not_atomic
         field <= datatype_min_ninitialized(s) && return true
         # `try_compute_fieldidx` already check for field index bound.
@@ -1153,9 +1194,11 @@ function _getfield_fieldindex(s::DataType, name::Const)
 end
 
 function _getfield_tfunc_const(@nospecialize(sv), name::Const)
-    nv = _getfield_fieldindex(typeof(sv), name)
+    sty = typeof(sv)
+    nv = _getfield_fieldindex(sty, name)
     nv === nothing && return Bottom
-    if !isa(sv, Module) && isconst(typeof(sv), nv)
+    _field_isopaque(sty, nv) && return Bottom
+    if !isa(sv, Module) && isconst(sty, nv)
         if isdefined(sv, nv)
             return Const(getfield(sv, nv))
         end
@@ -1193,6 +1236,7 @@ end
                 if nv < 1
                     return Bottom
                 elseif nv ≤ length(s00.fields)
+                    _field_isopaque(sty, nv) && return Bottom
                     setfield && isconst(sty, nv) && return Bottom
                     return unwrapva(s00.fields[nv])
                 end
@@ -1248,15 +1292,25 @@ end
             end
             s = typeof(sv)
         else
+            # An equality-only `Type{T}` can contain non-egal representations
+            # with a different runtime layout. For example, a `UnionAll` can be
+            # `== Int` without being `=== Int`, so its numeric fields cannot be
+            # modeled using the `DataType` layout.
             sv = type_parameter(s)
-            if isTypeDataType(sv) && isa(name, Const)
-                nv = _getfield_fieldindex(DataType, name)::Int
-                if nv == DATATYPE_NAME_FIELDINDEX
-                    # N.B. This only works for fields that do not depend on type
-                    # parameters (which we do not know here).
-                    return Const(sv.name)
+            if isTypeDataType(sv) && isa(name, Const) && isa(name.val, Symbol)
+                nv = _getfield_fieldindex(DataType, name)
+                if isa(nv, Int) && 1 ≤ nv ≤ fieldcount(DataType)
+                    # Alternative representations do not expose DataType field
+                    # names, so any successful access uses the DataType layout.
+                    if nv == DATATYPE_NAME_FIELDINDEX
+                        return Const(sv.name)
+                    end
+                    s = DataType
+                else
+                    return Any
                 end
-                s = DataType
+            else
+                return Any
             end
         end
     end
@@ -1303,11 +1357,13 @@ end
             return Bottom
         end
         if nf == 1
+            _field_isopaque(s, 1) && return Bottom
             fld = 1
         else
             # union together types of all fields
             t = Bottom
             for i in 1:nf
+                _field_isopaque(s, i) && continue
                 _ft = unwrapva(ftypes[i])
                 valid_as_lattice(_ft, true) || continue
                 setfield && isconst(s, i) && continue
@@ -1324,6 +1380,8 @@ end
         R = unwrapva(ftypes[nf])
     else
         if fld < 1 || fld > nf
+            return Bottom
+        elseif _field_isopaque(s, fld)
             return Bottom
         elseif setfield && isconst(s, fld)
             return Bottom
@@ -1382,6 +1440,7 @@ end
         field = try_compute_fieldidx(s, name.val)
         field === nothing && return false
         # `try_compute_fieldidx` already check for field index bound.
+        _field_isopaque(s, field) && return false
         isconst(s, field) && return false
         isfieldatomic(s, field) && return false # TODO: currently we're only testing for ordering === :not_atomic
         v_expected = fieldtype(s0, field)
@@ -1402,7 +1461,10 @@ end
     exact = isconcretetype(o′)
     egal = isa(o, Const) || exact
     T = _fieldtype_tfunc(𝕃, o′, f, exact, egal)
-    T === Bottom && return Bottom
+    # A non-Bottom setfield result proves that some runtime representation can
+    # reach this field. Its exact field type may still be unknown, notably for
+    # equality-only `Type{T}` values with representation-dependent layouts.
+    T === Bottom && (T = Any)
     PT = Const(Pair)
     return instanceof_tfunc(apply_type_tfunc(𝕃, Any[PT, T, T]), true)[1]
 end
@@ -1415,7 +1477,7 @@ end
     exact = isconcretetype(o′)
     egal = isa(o, Const) || exact
     T = _fieldtype_tfunc(𝕃, o′, f, exact, egal)
-    T === Bottom && return Bottom
+    T === Bottom && (T = Any)
     PT = Const(ccall(:jl_apply_cmpswap_type, Any, (Any,), T) where T)
     return instanceof_tfunc(apply_type_tfunc(𝕃, Any[PT, T]), true)[1]
 end
@@ -2810,7 +2872,8 @@ function is_relocatable_ptr_field(ty, fld)
     # that have relocations in staticdata.c, so they can change between processes.
     if hasintersect(widenconst(ty), Core.TypeName) &&
         (Const(:constfields) ⊑ fld || Const(fieldindex(Core.TypeName, :constfields)) ⊑ fld ||
-        Const(:atomicfields) ⊑ fld || Const(fieldindex(Core.TypeName, :atomicfields)) ⊑ fld)
+        Const(:atomicfields) ⊑ fld || Const(fieldindex(Core.TypeName, :atomicfields)) ⊑ fld ||
+        Const(:opaque_fields) ⊑ fld || Const(fieldindex(Core.TypeName, :opaque_fields)) ⊑ fld)
         return true
     elseif hasintersect(widenconst(ty), DataType) &&
         (Const(:layout) ⊑ fld || Const(fieldindex(DataType, :layout)) ⊑ fld)

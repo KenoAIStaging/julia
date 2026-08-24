@@ -2446,6 +2446,7 @@ function form_partially_defined_struct(𝕃ᵢ::AbstractLattice, @nospecialize(o
     objt <: Tuple && return nothing
     fldidx = try_compute_fieldidx(objt, name.val)
     fldidx === nothing && return nothing
+    Base.isfieldopaque(objt, fldidx) && return nothing
     if isa(obj, PartialStruct)
         _getundefs(obj)[fldidx] === false && return nothing
         newundefs = copy(_getundefs(obj))

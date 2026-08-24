@@ -1036,6 +1036,9 @@ typedef struct {
 void jl_reinstantiate_inner_types(jl_datatype_t *t, jl_deferred_typecache_t *dcache) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_datatype_t *jl_datatype_compute_super(jl_datatype_t *ndt JL_PROPAGATES_ROOT) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_datatype_super(jl_datatype_t *dt) JL_CANSAFEPOINT;
+JL_DLLEXPORT jl_value_t *jl_datatype_super_ordered(jl_datatype_t *dt, jl_sym_t *order) JL_CANSAFEPOINT;
+JL_DLLEXPORT int jl_datatype_super_isdefined(jl_datatype_t *st) JL_NOTSAFEPOINT;
+JL_DLLEXPORT jl_value_t *jl_datatype_fieldtypes_ordered(jl_datatype_t *dt, jl_sym_t *order) JL_CANSAFEPOINT;
 JL_DLLEXPORT int jl_datatype_fieldtypes_isdefined(jl_datatype_t *st) JL_NOTSAFEPOINT;
 jl_value_t *jl_apply_type_deferred(jl_value_t *tc, jl_value_t **params, size_t n, jl_deferred_typecache_t *dcache) JL_CANSAFEPOINT;
 int equiv_type(jl_value_t *ta, jl_value_t *tb) JL_CANSAFEPOINT;
@@ -2096,6 +2099,7 @@ JL_DLLEXPORT int jl_isabspath(const char *in) JL_NOTSAFEPOINT;
     XX(nospecialize_sym) \
     XX(nospecializeinfer_sym) \
     XX(not_atomic_sym) \
+    XX(opaque_sym) \
     XX(opaque_closure_method_sym) \
     XX(optlevel_sym) \
     XX(polly_sym) \

@@ -34,7 +34,7 @@ function deepcopy(@nospecialize x)
     return deepcopy_internal(x, IdDict())::typeof(x)
 end
 
-deepcopy_internal(x::Union{Symbol,Core.MethodInstance,Method,GlobalRef,DataType,Union,UnionAll,Task,Regex,
+deepcopy_internal(x::Union{Symbol,Core.MethodInstance,Core.MethodCache,Core.TypeName,Method,GlobalRef,DataType,Union,UnionAll,Task,Regex,
                            Core.CancellationTokenSource},
                   stackdict::IdDict) = x
 deepcopy_internal(x::Tuple, stackdict::IdDict) =

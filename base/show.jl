@@ -524,13 +524,16 @@ function _show_default(io::IO, @nospecialize(x))
     print(io, '(')
     nf = nfields(x)
     nb = sizeof(x)::Int
+    has_opaque = datatype_has_opaque_fields(t)
     if nf != 0 || nb == 0
         if !show_circular(io, x)
             recur_io = IOContext(io, Pair{Symbol,Any}(:SHOWN_SET, x),
                                  Pair{Symbol,Any}(:typeinfo, Any))
             for i in 1:nf
                 f = fieldname(t, i)
-                if !isdefined(x, f)
+                if has_opaque && isfieldopaque(t, i)
+                    print(io, opaque_field_str)
+                elseif !isdefined(x, f)
                     print(io, undef_ref_str)
                 else
                     show(recur_io, getfield(x, i))
@@ -2996,6 +2999,7 @@ function dump(io::IOContext, @nospecialize(x), n::Int, indent)
         print(io, T)
     end
     nf = nfields(x)
+    has_opaque = isa(T, DataType) && datatype_has_opaque_fields(T)
     if nf > 0
         if n > 0 && !show_circular(io, x)
             recur_io = IOContext(io, Pair{Symbol,Any}(:SHOWN_SET, x))
@@ -3003,7 +3007,9 @@ function dump(io::IOContext, @nospecialize(x), n::Int, indent)
                 println(io)
                 fname = string(fieldname(T, field))
                 print(io, indent, "  ", fname, ": ")
-                if isdefined(x,field)
+                if has_opaque && isfieldopaque(T, field)
+                    print(io, opaque_field_str)
+                elseif isdefined(x,field)
                     dump(recur_io, getfield(x, field), n - 1, string(indent, "  "))
                 else
                     print(io, undef_ref_str)
@@ -3201,6 +3207,7 @@ function alignment(io::IO, x::Pair)
 end
 
 const undef_ref_str = "#undef"
+const opaque_field_str = "#opaque"
 
 show(io::IO, ::UndefInitializer) = print(io, "UndefInitializer()")
 

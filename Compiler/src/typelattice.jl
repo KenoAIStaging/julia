@@ -474,6 +474,7 @@ end
             end
             nf = nfields(a.val)
             for i in 1:nf
+                Base.isfieldopaque(widea, i) && continue
                 if !isdefined(a.val, i)
                     _getundefs(b)[i] === false && return false # conflicting defined-ness information
                     continue # since ∀ T Union{} ⊑ T

@@ -62,6 +62,7 @@ public
     isambiguous,
     isexpr,
     isfieldatomic,
+    isfieldopaque,
     isidentifier,
     issingletontype,
     identify_package,

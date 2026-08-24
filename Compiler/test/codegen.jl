@@ -1153,3 +1153,75 @@ end
     ir = get_llvm(f_srettest, Tuple{Float32}, true, true, true)
     @test occursin(r"sret\([^)]+\) align \d+", ir)
 end
+
+# Opaque fields must throw consistently in optimized known- and dynamic-selector paths.
+@noinline opaque_getfield_symbol(x::DataType, field::Symbol) = getfield(x, field)
+@noinline opaque_getfield_index(x::DataType, field::Int) = getfield(x, field)
+@noinline opaque_getfield_nobounds(x::DataType, field::Int) = getfield(x, field, false)
+@noinline opaque_isdefined_known(x::DataType) = isdefined(x, :super)
+@noinline opaque_isdefined_symbol(x::DataType, field::Symbol) = isdefined(x, field)
+@noinline opaque_isdefined_index(x::DataType, field::Int) = isdefined(x, field)
+@noinline opaque_setfield_known(x::DataType, value) = setfield!(x, :super, value)
+@noinline opaque_setfield_symbol(x::DataType, field::Symbol, value) = setfield!(x, field, value)
+@noinline opaque_setfield_index(x::DataType, field::Int, value) = setfield!(x, field, value)
+@noinline opaque_typeeq_call(f, x) = f(Base.inferencebarrier(x)::Type{Int})
+@noinline opaque_typeeq_getfield_first(x) = getfield(x, 1, false)
+@noinline opaque_typeeq_getfield_second(x) = getfield(x, 2, false)
+@noinline opaque_typeeq_getfield_body(x) = getfield(x, :body)
+@noinline opaque_typeeq_isdefined_second(x) = isdefined(x, 2)
+@noinline opaque_typeeq_isdefined_super(x) = isdefined(x, :super)
+@noinline opaque_typeeq_vector_call(f, xs::Vector{Type}) =
+    f(Base.inferencebarrier(xs[1])::Type{Int})
+@noinline opaque_typeeq_modify_flags(x) =
+    modifyfield!(x, :flags, (old, _) -> old, UInt16(0))
+@noinline function opaque_typeeq_replace_flags(x)
+    flags = getfield(x, :flags)
+    return replacefield!(x, :flags, flags, flags)
+end
+
+@test_throws(ErrorException("getfield: field .super of type DataType is opaque"),
+    opaque_getfield_symbol(Int, :super))
+@test_throws(ErrorException("getfield: field .types of type DataType is opaque"),
+    opaque_getfield_index(Int, 4))
+@test_throws(ErrorException("getfield: field .super of type DataType is opaque"),
+    opaque_getfield_nobounds(Int, 2))
+
+@test_throws(ErrorException("isdefined: field .super of type DataType is opaque"),
+    opaque_isdefined_known(Int))
+@test_throws(ErrorException("isdefined: field .super of type DataType is opaque"),
+    opaque_isdefined_symbol(Int, :super))
+@test_throws(ErrorException("isdefined: field .types of type DataType is opaque"),
+    opaque_isdefined_index(Int, 4))
+
+@test_throws(ErrorException("setfield!: field .super of type DataType is opaque"),
+    opaque_setfield_known(Int, Any))
+@test_throws(ErrorException("setfield!: field .super of type DataType is opaque"),
+    opaque_setfield_symbol(Int, :super, Any))
+@test_throws(ErrorException("setfield!: field .types of type DataType is opaque"),
+    opaque_setfield_index(Int, 4, Core.svec()))
+
+# A `Type{T}` value is only pinned by `==`, and may have a different runtime
+# representation and field layout from `T` itself (#61323).
+let S = (Union{T, U} where {T<:Int, U<:Int})
+    @test S == Int && S !== Int
+    @test opaque_typeeq_call(opaque_typeeq_getfield_first, S) === getfield(S, 1, false)
+    @test opaque_typeeq_call(opaque_typeeq_getfield_second, S) === getfield(S, 2, false)
+    @test opaque_typeeq_call(opaque_typeeq_getfield_body, S) === getfield(S, :body)
+    @test opaque_typeeq_call(opaque_typeeq_isdefined_second, S) === true
+    @test opaque_typeeq_call(opaque_typeeq_isdefined_super, S) === false
+    @test_throws(ErrorException("getfield: field .super of type DataType is opaque"),
+        opaque_typeeq_call(opaque_typeeq_getfield_second, Int))
+    @test_throws(ErrorException("isdefined: field .super of type DataType is opaque"),
+        opaque_typeeq_call(opaque_typeeq_isdefined_second, Int))
+    @test_throws(ErrorException("isdefined: field .super of type DataType is opaque"),
+        opaque_typeeq_call(opaque_typeeq_isdefined_super, Int))
+
+    # The canonical DataType representation still has visible writable fields;
+    # equality-only Type modeling must not turn successful updates into unreachable code.
+    flags = getfield(Int, :flags)
+    modified = opaque_typeeq_vector_call(opaque_typeeq_modify_flags, Type[Int])
+    @test modified === (flags => flags)
+    replaced = opaque_typeeq_vector_call(opaque_typeeq_replace_flags, Type[Int])
+    @test replaced.old === flags && replaced.success
+    @test getfield(Int, :flags) === flags
+end

@@ -116,7 +116,7 @@ end
     lazy_super = Base.inferencebarrier(
         getfield(supertype(seed), :parameters)[1])::DataType
     lazy_types = Base.inferencebarrier(LazyDataTypeMetadata.F{Int}.body)::DataType
-    @test !isdefined(lazy_super, 2)
+    @test !Base.datatype_super_isdefined(lazy_super)
     @test !Base.datatype_fieldtypes_isdefined(lazy_types)
 
     T = lazy_super.parameters[1]

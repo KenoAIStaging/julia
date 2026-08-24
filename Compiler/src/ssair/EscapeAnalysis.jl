@@ -1242,6 +1242,7 @@ function analyze_fields(ir::IRCode, @nospecialize(typ), @nospecialize(fld))
     if fidx === nothing
         return Unindexable(), 0
     end
+    Base.isfieldopaque(typ, fidx) && return Unindexable(), 0
     return IndexableFields(nflds), fidx
 end
 
@@ -1259,6 +1260,7 @@ function reanalyze_fields(AliasInfo::IndexableFields, ir::IRCode, @nospecialize(
     if fidx === nothing
         return merge_to_unindexable(AliasInfo), 0
     end
+    Base.isfieldopaque(typ, fidx) && return merge_to_unindexable(AliasInfo), 0
     AliasInfo = copy(AliasInfo)
     infos = AliasInfo.infos
     ninfos = length(infos)

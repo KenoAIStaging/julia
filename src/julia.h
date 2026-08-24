@@ -649,6 +649,7 @@ typedef struct {
     uint8_t max_methods; // override for inference's max_methods setting (0 = no additional limit or relaxation)
     uint8_t constprop_heustic; // override for inference's constprop heuristic
     uint8_t concrete_only; // Bool: inference refuses to commit (records no backedge) at non-concrete call sites
+    const uint32_t *opaque_fields; // fields inaccessible through ordinary field operations
 } jl_typename_t;
 
 typedef struct {
@@ -1746,6 +1747,16 @@ static inline int jl_field_isconst(jl_datatype_t *st, int i) JL_NOTSAFEPOINT
     return 0;
 }
 
+static inline int jl_field_isopaque(jl_datatype_t *st, int i) JL_NOTSAFEPOINT
+{
+    const uint32_t *opaque_fields = st->name->opaque_fields;
+    if (opaque_fields != NULL) {
+        if (opaque_fields[i / 32] & (1 << (i % 32)))
+            return 1;
+    }
+    return 0;
+}
+
 
 // basic predicates -----------------------------------------------------------
 #define jl_is_nothing(v)     (((jl_value_t*)(v)) == ((jl_value_t*)jl_nothing))
@@ -2194,6 +2205,8 @@ JL_DLLEXPORT jl_value_t *jl_get_nth_field_checked(jl_value_t *v, size_t i) JL_CA
 JL_DLLEXPORT void        jl_set_nth_field(jl_value_t *v, size_t i, jl_value_t *rhs);
 JL_DLLEXPORT int         jl_field_isdefined(jl_value_t *v, size_t i) JL_NOTSAFEPOINT;
 JL_DLLEXPORT int         jl_field_isdefined_checked(jl_value_t *v, size_t i) JL_CANSAFEPOINT;
+JL_DLLEXPORT int         jl_is_field_opaque(jl_datatype_t *t, size_t i) JL_NOTSAFEPOINT;
+JL_DLLEXPORT int         jl_datatype_has_opaque_fields(jl_datatype_t *t) JL_NOTSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_get_field(jl_value_t *o, const char *fld) JL_CANSAFEPOINT;
 JL_DLLEXPORT jl_value_t *jl_value_ptr(jl_value_t *a);
 int jl_uniontype_size(jl_value_t *ty, size_t *sz) JL_CANSAFEPOINT;
@@ -2353,6 +2366,7 @@ JL_DLLEXPORT void JL_NORETURN jl_type_error_global(const char *fname,
                                                jl_value_t *got JL_MAYBE_UNROOTED);
 JL_DLLEXPORT void JL_NORETURN jl_undefined_var_error(jl_sym_t *var, jl_value_t *scope JL_MAYBE_UNROOTED);
 JL_DLLEXPORT void JL_NORETURN jl_has_no_field_error(jl_datatype_t *t, jl_sym_t *var);
+JL_DLLEXPORT void JL_NORETURN jl_opaque_field_error(const char *fname, jl_datatype_t *t, size_t i);
 JL_DLLEXPORT void JL_NORETURN jl_argument_error(char *str);
 JL_DLLEXPORT void JL_NORETURN jl_atomic_error(char *str);
 JL_DLLEXPORT void JL_NORETURN jl_bounds_error(jl_value_t *v JL_MAYBE_UNROOTED,

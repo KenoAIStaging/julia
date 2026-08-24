@@ -211,6 +211,25 @@ create_serialization_stream() do s # immutable struct with 4 fields
     @test invokelatest(deserialize, s) === utval
 end
 
+create_serialization_stream() do s # runtime field attributes
+    name = gensym(:SerializedFieldAttrs)
+    T = Core._structtype(Serialization.__deserialized_types__, name, Core.svec(),
+                         Core.svec(:atomic, :constant, :opaque),
+                         Core.svec(1, :atomic, 2, :const, 3, :opaque), true, 3)
+    Core._setsuper!(T, Any)
+    Core._typebody!(T, Core.svec(Any, Any, Any))
+    serialize(s, T)
+
+    seekstart(s)
+    T2 = deserialize(s)::DataType
+    @test T2 !== T
+    @test Base.isfieldatomic(T2, :atomic)
+    @test Base.isconst(T2, :constant)
+    @test Base.isfieldopaque(T2, :opaque)
+    value = ccall(:jl_new_struct, Any, (Any, Any, Any, Any), T2, nothing, nothing, "secret")
+    @test_throws ErrorException("getfield: field .opaque of type $(nameof(T2)) is opaque") getfield(value, :opaque)
+end
+
 create_serialization_stream() do s # union types
     serialize(s, Union{Int,Float64})
     serialize(s, Union{Int,Missing})

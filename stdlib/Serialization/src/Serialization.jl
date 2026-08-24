@@ -89,7 +89,7 @@ const TAGS = Any[
 const NTAGS = length(TAGS)
 @assert NTAGS == 255
 
-const ser_version = 31 # do not make changes without bumping the version #!
+const ser_version = 32 # do not make changes without bumping the version #!
 
 format_version(::AbstractSerializer) = ser_version
 format_version(s::Serializer) = s.version
@@ -711,6 +711,21 @@ function serialize_typename(s::AbstractSerializer, t::Core.TypeName)
     serialize(s, primary.parameters)
     primary_types = Base.datatype_fieldtypes(primary)
     serialize(s, primary_types)
+    if format_version(s) >= 32
+        attrs = Any[]
+        for i in 1:fieldcount(primary)
+            if Base.isfieldatomic(primary, i)
+                push!(attrs, Int32(i), :atomic)
+            end
+            if ismutabletype(primary) && Base.isconst(primary, i)
+                push!(attrs, Int32(i), :const)
+            end
+            if Base.isfieldopaque(primary, i)
+                push!(attrs, Int32(i), :opaque)
+            end
+        end
+        serialize(s, Core.svec(attrs...))
+    end
     serialize(s, Base.issingletontype(primary))
     serialize(s, t.flags & 0x1 == 0x1) # .abstract
     serialize(s, t.flags & 0x2 == 0x2) # .mutable
@@ -1691,7 +1706,17 @@ function deserialize_typename(s::AbstractSerializer, number)
     super = deserialize(s)::Type
     parameters = deserialize(s)::SimpleVector
     types = deserialize(s)::SimpleVector
-    attrs = Core.svec()
+    attrs = if format_version(s) >= 32
+        serialized_attrs = deserialize(s)::SimpleVector
+        iseven(length(serialized_attrs)) || error("invalid serialized field attributes")
+        converted_attrs = Any[]
+        for i in 1:2:length(serialized_attrs)
+            push!(converted_attrs, Int(serialized_attrs[i]::Int32), serialized_attrs[i + 1]::Symbol)
+        end
+        Core.svec(converted_attrs...)
+    else
+        Core.svec()
+    end
     has_instance = deserialize(s)::Bool
     abstr = deserialize(s)::Bool
     mutabl = deserialize(s)::Bool

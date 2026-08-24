@@ -4194,6 +4194,20 @@ static bool emit_f_opfield(jl_codectx_t &ctx, jl_cgval_t *ret, jl_value_t *f,
                 idx = i - 1;
         }
         if (idx != -1) {
+            if (!uty->name->mutabl) {
+                std::string msg(fname);
+                msg += ": immutable struct of type ";
+                msg += jl_symbol_name(uty->name->name);
+                msg += " cannot be changed";
+                *ret = jl_cgval_t();
+                emit_error(ctx, msg);
+                return true;
+            }
+            if (jl_field_isopaque(uty, idx)) {
+                *ret = jl_cgval_t();
+                emit_opaque_field_error(ctx, fname, uty, idx);
+                return true;
+            }
             jl_value_t *ft = jl_field_type(uty, idx);
             if (!jl_has_free_typevars(ft)) {
                 if (op != StoreKind::Modify) {
@@ -4218,13 +4232,6 @@ static bool emit_f_opfield(jl_codectx_t &ctx, jl_cgval_t *ret, jl_value_t *f,
                     msg += isatomic ? ": atomic field cannot be accessed non-atomically"
                                     : ": non-atomic field cannot be accessed atomically";
                     emit_atomic_error(ctx, msg.c_str());
-                }
-                else if (!uty->name->mutabl) {
-                    std::string msg(fname);
-                    msg += ": immutable struct of type ";
-                    msg += jl_symbol_name(uty->name->name);
-                    msg += " cannot be changed";
-                    emit_error(ctx, msg);
                 }
                 else if (jl_field_isconst(uty, idx)) {
                     std::string msg(fname);
@@ -4995,6 +5002,11 @@ static bool emit_builtin_call(jl_codectx_t &ctx, jl_cgval_t *ret, jl_value_t *f,
             if (jl_is_datatype(utt) && jl_struct_try_layout(utt)) {
                 ssize_t idx = jl_field_index(utt, name, 0);
                 if (idx != -1 && !jl_has_free_typevars(jl_field_type(utt, idx))) {
+                    if (jl_field_isopaque(utt, idx)) {
+                        *ret = jl_cgval_t();
+                        emit_opaque_field_error(ctx, "getfield", utt, idx);
+                        return true;
+                    }
                     *ret = emit_getfield_knownidx(ctx, obj, idx, utt, order);
                     return true;
                 }
@@ -5031,6 +5043,11 @@ static bool emit_builtin_call(jl_codectx_t &ctx, jl_cgval_t *ret, jl_value_t *f,
                     if (fld.constant && (idx = jl_unbox_long(fld.constant) - 1) < nfields) {
                         if (!jl_has_free_typevars(jl_field_type(utt, idx))) {
                             // known index
+                            if (jl_field_isopaque(utt, idx)) {
+                                *ret = jl_cgval_t();
+                                emit_opaque_field_error(ctx, "getfield", utt, idx);
+                                return true;
+                            }
                             *ret = emit_getfield_knownidx(ctx, obj, idx, utt, order);
                             return true;
                         }
@@ -5086,6 +5103,8 @@ static bool emit_builtin_call(jl_codectx_t &ctx, jl_cgval_t *ret, jl_value_t *f,
         }
         else if (fld.typ == (jl_value_t*)jl_symbol_type) { // Known type but unknown symbol
             if (jl_is_datatype(utt) && (utt != jl_module_type) && jl_struct_try_layout(utt)) {
+                if (datatype_has_opaque_fields(utt))
+                    return false;
                 if ((jl_datatype_nfields(utt) == 1 && !jl_is_namedtuple_type(utt) && !jl_is_tuple_type(utt))) {
                     jl_svec_t *fn = jl_field_names(utt);
                     assert(jl_svec_len(fn) == 1);
@@ -5386,6 +5405,11 @@ isdefined_unknown_idx:
                 return true;
             }
             *ret = mark_julia_const(ctx, jl_false);
+            return true;
+        }
+        if (jl_field_isopaque(stt, fieldidx)) {
+            *ret = jl_cgval_t();
+            emit_opaque_field_error(ctx, "isdefined", stt, fieldidx);
             return true;
         }
         bool isatomic = jl_field_isatomic(stt, fieldidx);

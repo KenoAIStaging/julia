@@ -27,16 +27,13 @@
 
 #mutable struct DataType <: AnyType
 #    name::TypeName
-#    super::Type
-#    parameters::Tuple
-#    names::Tuple
-#    types::Tuple
-#    ctor
+#    super::Type # opaque
+#    parameters::SimpleVector
+#    types::SimpleVector # opaque
 #    instance
-#    size::Int32
-#    abstract::Bool
-#    mutable::Bool
-#    pointerfree::Bool
+#    layout::Ptr{Cvoid}
+#    hash::Int32
+#    flags::UInt16
 #end
 
 #struct Union <: AnyType

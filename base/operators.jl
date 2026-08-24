@@ -87,13 +87,13 @@ function supertype(T::DataType)
     @_foldable_meta
     # force the computation of a deferred supertype (an instantiation of a
     # self-referential definition materializes its supertype graph lazily,
-    # one level per demand, see issue #61347). The backing field is hidden so
+    # one level per demand, see issue #61347). The backing field is opaque so
     # that inference cannot assume the lazily populated cache is constant.
     return ccall(:jl_datatype_super, Any, (Any,), T)::DataType
 end
 function getproperty(T::DataType, s::Symbol)
     @inline
-    # Keep the historical property spellings while hiding the mutable caches
+    # Keep the historical property spellings while the mutable caches remain opaque
     # from `getfield` and inference.
     s === :super && return supertype(T)
     s === :types && return ccall(:jl_get_fieldtypes, Any, (Any,), T)::Core.SimpleVector
@@ -102,11 +102,9 @@ end
 function getproperty(T::DataType, s::Symbol, order::Symbol)
     @inline
     if s === :super
-        supertype(T)
-        return getfield(T, 2, order)::DataType
+        return ccall(:jl_datatype_super_ordered, Any, (Any, Any), T, order)::DataType
     elseif s === :types
-        ccall(:jl_get_fieldtypes, Any, (Any,), T)
-        return getfield(T, 4, order)::Core.SimpleVector
+        return ccall(:jl_datatype_fieldtypes_ordered, Any, (Any, Any), T, order)::Core.SimpleVector
     end
     return getfield(T, s, order)
 end

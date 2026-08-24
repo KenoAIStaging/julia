@@ -89,6 +89,7 @@ JL_DLLEXPORT jl_typename_t *jl_new_typename_in(jl_sym_t *name, jl_module_t *modu
     tn->partial = NULL;
     tn->atomicfields = NULL;
     tn->constfields = NULL;
+    tn->opaque_fields = NULL;
     tn->max_methods = 0;
     jl_atomic_store_relaxed(&tn->max_args, 0);
     jl_atomic_store_relaxed(&tn->cache_entry_count, 0);
@@ -885,15 +886,17 @@ void jl_compute_field_offsets(jl_datatype_t *st)
     return;
 }
 
-// Process field attributes (atomic, const) from fattrs svec
-// Sets *atomicfields_out and *constfields_out
+// Process field attributes (atomic, const, opaque) from fattrs svec
+// Sets *atomicfields_out, *constfields_out, and *opaque_fields_out
 // If validate is true, performs type checking and bounds validation (may throw)
 // All validation that can throw is done before any allocation, so no cleanup is needed
 static void jl_process_field_attrs(jl_svec_t *fattrs, jl_svec_t *fnames, int mutabl, int validate,
-                                   uint32_t **atomicfields_out, uint32_t **constfields_out)
+                                   uint32_t **atomicfields_out, uint32_t **constfields_out,
+                                   uint32_t **opaque_fields_out)
 {
     uint32_t *atomicfields = NULL;
     uint32_t *constfields = NULL;
+    uint32_t *opaque_fields = NULL;
     size_t nfields = jl_svec_len(fnames);
 
     if (validate) {
@@ -909,7 +912,7 @@ static void jl_process_field_attrs(jl_svec_t *fattrs, jl_svec_t *fnames, int mut
                 if (!mutabl)
                     jl_errorf("invalid field attribute %s for immutable struct", jl_symbol_name((jl_sym_t*)attr));
             }
-            else {
+            else if ((jl_sym_t*)attr != jl_opaque_sym) {
                 jl_errorf("invalid field attribute %s", jl_symbol_name((jl_sym_t*)attr));
             }
         }
@@ -935,10 +938,19 @@ static void jl_process_field_attrs(jl_svec_t *fattrs, jl_svec_t *fnames, int mut
             }
             constfields[fldn / 32] |= 1 << (fldn % 32);
         }
+        else if (attr == jl_opaque_sym) {
+            if (opaque_fields == NULL) {
+                size_t nb = (nfields + 31) / 32 * sizeof(uint32_t);
+                opaque_fields = (uint32_t*)malloc_s(nb);
+                memset(opaque_fields, 0, nb);
+            }
+            opaque_fields[fldn / 32] |= 1 << (fldn % 32);
+        }
     }
 
     *atomicfields_out = atomicfields;
     *constfields_out = constfields;
+    *opaque_fields_out = opaque_fields;
 }
 
 // Create UnionAll wrapper chain for parametric types
@@ -993,9 +1005,11 @@ JL_DLLEXPORT jl_datatype_t *jl_new_datatype(
 
     uint32_t *atomicfields = NULL;
     uint32_t *constfields = NULL;
-    jl_process_field_attrs(fattrs, fnames, mutabl, 1, &atomicfields, &constfields);
+    uint32_t *opaque_fields = NULL;
+    jl_process_field_attrs(fattrs, fnames, mutabl, 1, &atomicfields, &constfields, &opaque_fields);
     tn->atomicfields = atomicfields;
     tn->constfields = constfields;
+    tn->opaque_fields = opaque_fields;
 
     if (t->name->wrapper == NULL) {
         jl_value_t *wrapper = (jl_value_t*)t;
@@ -1915,6 +1929,9 @@ JL_DLLEXPORT jl_value_t *jl_get_nth_field_noalloc(jl_value_t *v JL_PROPAGATES_RO
 
 JL_DLLEXPORT jl_value_t *jl_get_nth_field_checked(jl_value_t *v, size_t i)
 {
+    jl_datatype_t *st = (jl_datatype_t*)jl_typeof(v);
+    if (i < jl_datatype_nfields(st) && jl_field_isopaque(st, i))
+        jl_opaque_field_error("getfield", st, i);
     jl_value_t *r = jl_get_nth_field(v, i);
     if (__unlikely(r == NULL))
         jl_throw(jl_undefref_exception);
@@ -2381,7 +2398,20 @@ JL_DLLEXPORT int jl_field_isdefined_checked(jl_value_t *v, size_t i)
     }
     if (i >= jl_nfields(v))
         return 0;
+    jl_datatype_t *st = (jl_datatype_t*)jl_typeof(v);
+    if (jl_field_isopaque(st, i))
+        jl_opaque_field_error("isdefined", st, i);
     return !!jl_field_isdefined(v, i);
+}
+
+JL_DLLEXPORT int jl_is_field_opaque(jl_datatype_t *t, size_t i) JL_NOTSAFEPOINT
+{
+    return i < jl_svec_len(t->name->names) && jl_field_isopaque(t, i);
+}
+
+JL_DLLEXPORT int jl_datatype_has_opaque_fields(jl_datatype_t *t) JL_NOTSAFEPOINT
+{
+    return t->name->opaque_fields != NULL;
 }
 
 JL_DLLEXPORT size_t jl_get_field_offset(jl_datatype_t *ty, int field) JL_CANSAFEPOINT
@@ -3056,9 +3086,11 @@ JL_DLLEXPORT jl_value_t *jl_resolve_typegroup(jl_module_t *module, jl_svec_t *ty
 
             uint32_t *atomicfields = NULL;
             uint32_t *constfields = NULL;
-            jl_process_field_attrs(fattrs, fnames, mutabl, 1, &atomicfields, &constfields);
+            uint32_t *opaque_fields = NULL;
+            jl_process_field_attrs(fattrs, fnames, mutabl, 1, &atomicfields, &constfields, &opaque_fields);
             dt->name->atomicfields = atomicfields;
             dt->name->constfields = constfields;
+            dt->name->opaque_fields = opaque_fields;
 
             if (dt->types != NULL) {
                 jl_compute_field_offsets(dt);

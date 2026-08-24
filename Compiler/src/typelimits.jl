@@ -329,7 +329,11 @@ const issimpleenoughtupleelem = issimpleenoughtype
 
 function n_initialized(t::Const)
     nf = nfields(t.val)
-    return something(findfirst(i::Int->!isdefined(t.val,i), 1:nf), nf+1)-1
+    T = typeof(t.val)
+    first_undef = findfirst(1:nf) do i
+        !Base.isfieldopaque(T, i) && !isdefined(t.val, i)
+    end
+    return something(first_undef, nf + 1) - 1
 end
 function n_initialized(pstruct::PartialStruct)
     undefs = _getundefs(pstruct)
@@ -623,6 +627,10 @@ end
         n_initialized_merged = min(n_initialized(typea), n_initialized(typeb))
         anyrefine = n_initialized_merged > fldmin
         for i = 1:nflds
+            if Base.isfieldopaque(aty, i)
+                fields[i] = fieldtype(aty, i)
+                continue
+            end
             ai = getfield_tfunc(𝕃, typea, Const(i))
             bi = getfield_tfunc(𝕃, typeb, Const(i))
             ft = fieldtype(aty, i)

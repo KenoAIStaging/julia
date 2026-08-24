@@ -333,6 +333,7 @@ void jl_init_common_symbols(void)
     jl_statement_sym = jl_symbol("statement");
     jl_all_sym = jl_symbol("all");
     jl_atomic_sym = jl_symbol("atomic");
+    jl_opaque_sym = jl_symbol("opaque");
     jl_not_atomic_sym = jl_symbol("not_atomic");
     jl_unordered_sym = jl_symbol("unordered");
     jl_singlethread_sym = jl_symbol("singlethread");

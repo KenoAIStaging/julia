@@ -24,7 +24,6 @@ for (T, c) in (
         (Core.TypeMapEntry, [:sig, :simplesig, :guardsigs, :func, :isleafsig, :issimplesig, :va]),
         (Core.TypeMapLevel, []),
         (Core.TypeName, [:name, :module, :names, :wrapper, :hash, :n_uninitialized, :flags]),
-        # The two unnamed fields are the hidden `super` and `types` caches.
         (DataType, [:name, :parameters, :instance, :hash]),
         (TypeVar, [:name, :ub, :lb]),
         (Core.Memory, [:length, :ptr]),
@@ -42,11 +41,11 @@ for (T, c) in (
         (Core.Method, [:primary_world, :did_scan_source, :dispatch_status, :interferences]),
         (Core.MethodInstance, [:cache, :flags, :dispatch_status, :precompile]),
         (Core.MethodTable, [:defs]),
-        (Core.MethodCache, [:leafcache, :cache, :var""]),
+        (Core.MethodCache, [:leafcache, :cache, :writelock_owner, :writelock_count]),
         (Core.TypeMapEntry, [:next, :min_world, :max_world]),
         (Core.TypeMapLevel, [:arg1, :targ, :name1, :tname, :list, :any]),
         (Core.TypeName, [:cache, :linearcache, :Typeofwrapper, :max_args, :cache_entry_count]),
-        (DataType, [:var"", :layout]),
+        (DataType, [:super, :types, :layout]),
         (Core.Memory, []),
         (Core.GenericMemoryRef, []),
         (Task, [:_state, :preempt_request, :running_time_ns, :finished_at, :first_enqueued_at, :last_started_running_at, :waiting_on, :bound_cancel_token]),
@@ -56,23 +55,96 @@ for (T, c) in (
 end
 @test [i for i in 1:fieldcount(DataType) if Base.isfieldatomic(DataType, i)] == [2, 4, 6]
 
+# Opaque fields participate in layout and reflection, but ordinary field operations reject them.
+for (T, fields) in (
+        (DataType, [:super, :types]),
+        (Core.TypeName, [:opaque_fields]),
+        (Core.MethodCache, [:writelock_owner, :writelock_count]),
+    )
+    @test Set(fieldname(T, i) for i in 1:fieldcount(T) if Base.isfieldopaque(T, i)) == Set(fields)
+end
+
 @test_throws(ErrorException("setfield!: const field .name of type DataType cannot be changed"),
     setfield!(Int, :name, Int.name))
 @test_throws(ErrorException("setfield!: const field .name of type DataType cannot be changed"),
     (Base.Experimental.@force_compile; setfield!(Int, :name, Int.name)))
 
-# Lazy DataType metadata is exposed through accessors, not backing fields.
-@test fieldindex(DataType, :super, false) == 0
-@test fieldindex(DataType, :types, false) == 0
+# Lazy DataType metadata is exposed through accessors, not ordinary backing-field access.
+@test fieldnames(DataType) == (:name, :super, :parameters, :types, :instance, :layout, :hash, :flags)
+@test fieldcount(DataType) == Base.datatype_nfields(DataType) == 8
+@test Base.datatype_npointers(DataType) == 5
+@test sizeof(DataType) >= fieldoffset(DataType, fieldcount(DataType)) + sizeof(fieldtype(DataType, fieldcount(DataType)))
+@test fieldindex(DataType, :super, false) == 2
+@test fieldindex(DataType, :types, false) == 4
 @test :super in propertynames(Int)
 @test :types in propertynames(Int)
+@test hasproperty(Int, :super) && hasproperty(Int, :types)
+@test hasfield(DataType, :super) && hasfield(DataType, :types)
 @test Int.super === supertype(Int)
 @test Int.types === Base.datatype_fieldtypes(Int)
-@test getproperty(Int, :super, :acquire) === supertype(Int)
-@test getproperty(Int, :types, :acquire) === Base.datatype_fieldtypes(Int)
-@test_throws FieldError getfield(Int, :super)
-@test_throws FieldError getfield(Int, :types)
-@test_throws FieldError setfield!(Int, :super, Any, :release)
+for order in (:unordered, :monotonic, :acquire, :sequentially_consistent)
+    @test getproperty(Int, :super, order) === supertype(Int)
+    @test getproperty(Int, :types, order) === Base.datatype_fieldtypes(Int)
+end
+@test_throws(ConcurrencyViolationError("getfield: atomic field cannot be accessed non-atomically"),
+    getproperty(Int, :super, :not_atomic))
+@test_throws(ConcurrencyViolationError("invalid atomic ordering"),
+    getproperty(Int, :types, :release))
+@test_throws ErrorException("getfield: field .super of type DataType is opaque") getfield(Int, :super)
+@test_throws ErrorException("getfield: field .types of type DataType is opaque") getfield(Int, :types, :acquire)
+@test_throws ErrorException("getfield: field .super of type DataType is opaque") getfield(Int, 2)
+@test_throws ErrorException("getfield: field .types of type DataType is opaque") getfield(Int, 4, :monotonic)
+@test_throws BoundsError getfield(Int, 9)
+@test_throws ErrorException("isdefined: field .super of type DataType is opaque") isdefined(Int, :super)
+@test_throws ErrorException("isdefined: field .types of type DataType is opaque") isdefined(Int, 4, :acquire)
+@test_throws(ErrorException("setfield!: field .super of type DataType is opaque"),
+    setfield!(Int, :super, Any, :release))
+@test_throws(ErrorException("swapfield!: field .super of type DataType is opaque"),
+    swapfield!(Int, :super, Any, :sequentially_consistent))
+@test_throws(ErrorException("modifyfield!: field .super of type DataType is opaque"),
+    modifyfield!(Int, :super, identity, Any, :sequentially_consistent))
+@test_throws(ErrorException("replacefield!: field .super of type DataType is opaque"),
+    replacefield!(Int, :super, Any, Any, :sequentially_consistent, :sequentially_consistent))
+@test_throws(ErrorException("setfieldonce!: field .super of type DataType is opaque"),
+    setfieldonce!(Int, :super, Any, :sequentially_consistent, :sequentially_consistent))
+
+let cache = Core.methodtable.cache
+    @test fieldnames(Core.MethodCache)[3:4] == (:writelock_owner, :writelock_count)
+    @test_throws(ErrorException("getfield: field .writelock_owner of type MethodCache is opaque"),
+        getfield(cache, :writelock_owner, :unordered))
+    @test_throws(ErrorException("isdefined: field .writelock_count of type MethodCache is opaque"),
+        isdefined(cache, 4))
+end
+
+let T = Core._structtype(@__MODULE__, gensym(:OpaqueFields62847), Core.svec(),
+                         Core.svec(:payload), Core.svec(1, :opaque), false, 1)
+    Core._setsuper!(T, Any)
+    Core._typebody!(T, Core.svec(Any))
+    payload = Ref{Any}(nothing)
+    payload_ref = WeakRef(payload)
+    value = ccall(:jl_new_struct, Any, (Any, Any), T, payload)
+    payload = nothing
+    @test fieldnames(T) == (:payload,)
+    @test fieldtype(T, :payload) === Any
+    @test fieldoffset(T, 1) == 0
+    @test Base.isfieldopaque(T, :payload)
+    @test_throws ErrorException getfield(value, :payload)
+    @test occursin("#opaque", sprint(show, value))
+    GC.@preserve value begin
+        GC.gc(true)
+        @test payload_ref.value isa Ref{Any}
+    end
+end
+
+struct HiddenDataTypeGC62847{T}
+    x::T
+end
+@noinline hidden_fieldtypes_weakref_62847(T) = WeakRef(Base.datatype_fieldtypes(T))
+let T = HiddenDataTypeGC62847{Tuple{Int,Float64}}
+    fieldtypes_ref = hidden_fieldtypes_weakref_62847(T)
+    GC.gc(true)
+    @test fieldtypes_ref.value === Base.datatype_fieldtypes(T)
+end
 
 @test_throws(ErrorException("invalid field attribute const for immutable struct"),
     @eval struct ABCDconst
@@ -9391,9 +9463,13 @@ let A = Issue61347.A, S2 = Issue61347.S2
     # including within optimized code.
     lazy = getfield(supertype(S2{A{A{A{A{Int}}}}}), :parameters)[1]
     expected = A{S2{A{A{A{A{A{A{Int}}}}}}}}
-    @noinline compiled_probe(x::DataType) =
-        (isdefined(x, :super), supertype(x), isdefined(x, :super))
-    @test compiled_probe(Base.inferencebarrier(lazy)) === (false, expected, false)
+    @noinline compiled_super(x::DataType) = supertype(x)
+    @noinline compiled_isdefined_super(x::DataType) = isdefined(x, :super)
+    @test_throws(ErrorException("isdefined: field .super of type DataType is opaque"),
+        compiled_isdefined_super(Base.inferencebarrier(lazy)))
+    @test compiled_super(Base.inferencebarrier(lazy)) === expected
+    @test_throws(ErrorException("isdefined: field .super of type DataType is opaque"),
+        compiled_isdefined_super(Base.inferencebarrier(lazy)))
     @test lazy.super === expected
     @test (@atomic :acquire lazy.super) === expected
 end

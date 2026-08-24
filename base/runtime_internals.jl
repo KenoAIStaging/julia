@@ -562,6 +562,29 @@ function isfieldatomic(@nospecialize(t::Type), s::Int)
 end
 
 """
+    isfieldopaque(t::DataType, s::Union{Int,Symbol})::Bool
+
+Determine whether ordinary field operations are prohibited for field `s` of type `t`.
+Opaque fields remain visible to reflection and to the runtime's internal accessors.
+"""
+function isfieldopaque(@nospecialize(t::Type), s::Symbol)
+    @_foldable_meta
+    t = unwrap_unionall(t)
+    isa(t, DataType) || return false
+    return isfieldopaque(t, fieldindex(t, s, false))
+end
+function isfieldopaque(@nospecialize(t::Type), s::Int)
+    @_foldable_meta
+    t = unwrap_unionall(t)
+    isa(t, DataType) || return false
+    1 <= s <= length(t.name.names) || return false
+    return ccall(:jl_is_field_opaque, Cint, (Any, Csize_t), t, s - 1) != 0
+end
+
+datatype_has_opaque_fields(t::DataType) =
+    ccall(:jl_datatype_has_opaque_fields, Cint, (Any,), t) != 0
+
+"""
     @locals()
 
 Construct a dictionary of the names (as symbols) and values of all local
@@ -605,6 +628,8 @@ end
 datatype_fieldtypes(x::DataType) = ccall(:jl_get_fieldtypes, Core.SimpleVector, (Any,), x)
 datatype_fieldtypes_isdefined(x::DataType) =
     ccall(:jl_datatype_fieldtypes_isdefined, Cint, (Any,), x) != 0
+datatype_super_isdefined(x::DataType) =
+    ccall(:jl_datatype_super_isdefined, Cint, (Any,), x) != 0
 
 struct DataTypeLayout
     size::UInt32
@@ -1656,7 +1681,6 @@ See also [`hasproperty`](@ref), [`hasfield`](@ref).
 """
 propertynames(x) = fieldnames(typeof(x))
 propertynames(m::Module) = names(m)
-propertynames(::DataType) = (:name, :super, :parameters, :types, :instance, :layout, :hash, :flags)
 propertynames(x, private::Bool) = propertynames(x) # ignore private flag by default
 propertynames(x::Array) = () # hide the fields from tab completion to discourage calling `x.size` instead of `size(x)`, even though they are equivalent
 

@@ -41,10 +41,12 @@ julia> typeof(Point)
 DataType
 ```
 
-The runtime representation of `DataType` contains additional internal caches that are not
-exposed as named fields. Use reflection functions such as [`fieldnames`](@ref),
-[`fieldtypes`](@ref), and [`supertype`](@ref) rather than inspecting that representation
-directly.
+The `super` and `types` fields of `DataType` are internal caches. They are *opaque*: field
+reflection describes their layout, but ordinary field access cannot read or write them. The
+compatibility properties `.super` and `.types` use runtime accessors that populate the caches
+when necessary. Prefer reflection functions such as [`fieldnames`](@ref), [`fieldtypes`](@ref),
+and [`supertype`](@ref) rather than inspecting the representation directly. Opaque fields can be
+identified with [`Base.isfieldopaque`](@ref).
 
 ## Subtypes
 
