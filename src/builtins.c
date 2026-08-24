@@ -509,6 +509,13 @@ static uintptr_t type_object_id_(jl_value_t *v, jl_varidx_t *env, int *cacheable
         jl_datatype_t *dtv = (jl_datatype_t*)v;
         if (dtv->isconcretetype)
             return dtv->hash;
+        // a closed datatype (no free typevars, no dangling references, no
+        // open payloads) is interned in the type cache, so egal implies
+        // pointer-identical and the memoized structural typekey hash (when it
+        // did not fail to 0) is a sound, deterministic identity hash
+        if (dtv->hash != 0 && !dtv->hasfreetypevars && !dtv->hasescapingrefs &&
+            !dtv->hasopenegal)
+            return dtv->hash;
         uintptr_t h = ~dtv->name->hash;
         size_t i, l = jl_nparams(v);
         for (i = 0; i < l; i++) {

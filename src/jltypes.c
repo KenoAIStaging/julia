@@ -189,12 +189,17 @@ JL_DLLEXPORT int jl_tvarref_occurs(jl_value_t *t, size_t idx) JL_NOTSAFEPOINT
     return tvarref_occurs_(t, idx);
 }
 
+static int has_open_typeegal(jl_value_t *v) JL_NOTSAFEPOINT;
+
 // does `v` occur inside any `TypeEgal` payload in `t`? A transparent
 // structural walk: the memoized freeness flags are payload-opaque, so they
-// cannot prune it (payload-carrying subtrees advertise as closed).
+// cannot prune it, but the `hasopenegal` bit (no open payload anywhere
+// below) can.
 static int typeegal_captures_var(jl_value_t *t, jl_tvar_t *v) JL_NOTSAFEPOINT
 {
     while (1) {
+        if (!has_open_typeegal(t))
+            return 0;
         if (jl_is_typeegal(t)) {
             jl_value_t *T = jl_typeeq_T(t);
             // direct occurrences are found by the flag-assisted walk (the
@@ -256,6 +261,8 @@ JL_DLLEXPORT int jl_typeegal_captures_var(jl_value_t *t, jl_tvar_t *v) JL_NOTSAF
 static int typeegal_captures_(jl_value_t *t, size_t depth) JL_NOTSAFEPOINT
 {
     while (1) {
+        if (!has_open_typeegal(t))
+            return 0;
         if (jl_is_typeegal(t)) {
             // `tvarref_occurs_` skips nested payloads, so only this payload's
             // own (frame-adjusted) references are examined
@@ -507,6 +514,50 @@ static int has_free_typevars(jl_value_t *v) JL_NOTSAFEPOINT
 JL_DLLEXPORT int jl_has_free_typevars(jl_value_t *v) JL_NOTSAFEPOINT
 {
     return has_free_typevars(v);
+}
+
+// does `v` contain (transparently, including inside nested payloads) a
+// `TypeEgal` whose payload is open — free typevars or references dangling at
+// the payload root? Only such payloads can be the target of a binder-crossing
+// attempt, so a clear bit prunes the transparent `typeegal_captures_*` scans.
+// Memoized as `hasopenegal` on datatypes and `JL_UNIONALL_OPENEGAL` on
+// binders (a binder never clears it: binding across a payload is rejected).
+static int has_open_typeegal(jl_value_t *v) JL_NOTSAFEPOINT
+{
+    while (1) {
+        if (jl_is_typevar(v) || jl_is_tvarref(v))
+            return 0;
+        if (jl_is_typeapp(v))
+            return 1; // unresolved application: conservatively scan
+        if (jl_is_unionall(v))
+            return (((jl_unionall_t*)v)->flags & JL_UNIONALL_OPENEGAL) != 0;
+        if (jl_is_datatype(v))
+            return ((jl_datatype_t*)v)->hasopenegal;
+        if (jl_is_uniontype(v) || jl_is_intersecttype(v)) {
+            if (has_open_typeegal(((jl_uniontype_t*)v)->a))
+                return 1;
+            v = ((jl_uniontype_t*)v)->b;
+        }
+        else if (jl_is_typeeq(v)) {
+            v = jl_typeeq_T(v);
+        }
+        else if (jl_is_typeegal(v)) {
+            jl_value_t *T = jl_typeegal_T(v);
+            return jl_has_free_typevars(T) || jl_has_dangling_tvarrefs(T) ||
+                   has_open_typeegal(T);
+        }
+        else if (jl_is_vararg(v)) {
+            jl_vararg_t *vm = (jl_vararg_t*)v;
+            if (!vm->T)
+                return 0;
+            if (vm->N && has_open_typeegal(vm->N))
+                return 1;
+            v = vm->T;
+        }
+        else {
+            return 0;
+        }
+    }
 }
 
 static void find_free_typevars(jl_value_t *v, jl_typeenv_t *env, jl_array_t *out) JL_CANSAFEPOINT
@@ -1506,6 +1557,8 @@ JL_DLLEXPORT jl_value_t *jl_new_unionall_raw(jl_sym_t *name, jl_value_t *lb, jl_
     }
     if (has_refs_above(lb, 0) || has_refs_above(ub, 0) || has_refs_above(body, 1))
         flags |= JL_UNIONALL_ESCAPINGREFS;
+    if (has_open_typeegal(lb) || has_open_typeegal(ub) || has_open_typeegal(body))
+        flags |= JL_UNIONALL_OPENEGAL;
     u->flags = flags;
     u->hash = jl_compute_unionall_hash(u);
     return (jl_value_t*)u;
@@ -2933,6 +2986,7 @@ void jl_precompute_memoized_dt(jl_datatype_t *dt, int cacheable)
     int istuple = (dt->name == jl_tuple_typename);
     dt->hasfreetypevars = 0;
     dt->hasescapingrefs = 0;
+    dt->hasopenegal = 0;
     dt->maybe_subtype_of_cache = 1;
     dt->isconcretetype = !dt->name->abstract;
     dt->isdispatchtuple = istuple;
@@ -2951,6 +3005,8 @@ void jl_precompute_memoized_dt(jl_datatype_t *dt, int cacheable)
             if (dt->hasescapingrefs)
                 dt->isconcretetype = 0;
         }
+        if (!dt->hasopenegal)
+            dt->hasopenegal = has_open_typeegal(p);
         if (istuple) {
             if (dt->isconcretetype)
                 dt->isconcretetype = (jl_is_datatype(p) && ((jl_datatype_t*)p)->isconcretetype) ||
@@ -4173,6 +4229,10 @@ static jl_value_t *inst_type_w_(jl_value_t *t, jl_typeenv_t *env, jl_typestack_t
     jl_datatype_t *tt = (jl_datatype_t*)t;
     jl_svec_t *tp = tt->parameters;
     if (tp == jl_emptysvec)
+        return t;
+    // no free typevars to substitute, no dangling references to resolve or
+    // shift, and no open payload to reject a crossing binder: invariant
+    if (!tt->hasfreetypevars && !tt->hasescapingrefs && !tt->hasopenegal)
         return t;
     jl_typename_t *tn = tt->name;
     if (tn == jl_tuple_typename)

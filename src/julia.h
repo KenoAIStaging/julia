@@ -641,6 +641,7 @@ typedef struct {
 #define JL_UNIONALL_VAROCCURS 0x1  // the binder occurs in `body` (memoized)
 #define JL_UNIONALL_ESCAPINGREFS 0x2  // some reference escapes this node (memoized)
 #define JL_UNIONALL_ALWAYSCOV 0x4  // the binder has a guaranteed covariant occurrence in `body` (memoized)
+#define JL_UNIONALL_OPENEGAL 0x8   // bounds or body contain a `TypeEgal` with an open payload (memoized, cf. `jl_datatype_t.hasopenegal`)
 
 // represents the "name" part of a DataType, describing the syntactic structure
 // of a type and storing all data common to different instantiations of the type,
@@ -774,6 +775,7 @@ typedef struct _jl_datatype_t {
     uint32_t ismutationfree:1; // whether any mutable memory is reachable through this type (in the type or via fields)
     uint32_t isidentityfree:1; // whether this type or any object reachable through its fields has non-content-based identity
     uint32_t hasescapingrefs:1; // contains a TypeVarRef whose binder is not within this object (e.g. an unbound template like the body of `Vector`)
+    uint32_t hasopenegal:1; // contains a `TypeEgal` whose payload is open (free typevars or refs dangling at the payload root); prunes the transparent payload scans
     uint32_t smalltag:6; // whether this type has a small-tag optimization
 } jl_datatype_t;
 
@@ -1990,7 +1992,9 @@ STATIC_INLINE jl_value_t *jl_typeeq_T(jl_value_t *v JL_PROPAGATES_ROOT) JL_NOTSA
 
 // `TypeEgal{T}` shares the `jl_typeeq_t` layout, but its sole instance is `T`
 // itself (matched by `===` rather than `==`); used for the dispatch-cache
-// specialization on type values. Free typevars are not permitted inside `T`.
+// specialization on type values. The payload is an opaque identity token: `T`
+// may be open (free typevars, dangling refs), but no enclosing binder may
+// bind across it (rejected by the `UnionAll` constructors).
 STATIC_INLINE jl_value_t *jl_typeegal_T(jl_value_t *v JL_PROPAGATES_ROOT) JL_NOTSAFEPOINT
 {
     assert(jl_is_typeegal(v));

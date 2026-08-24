@@ -111,6 +111,8 @@ jl_datatype_t *jl_new_uninitialized_datatype(void)
     jl_set_typetagof(t, jl_datatype_tag, 0);
     t->hash = 0;
     t->hasfreetypevars = 0;
+    t->hasescapingrefs = 0;
+    t->hasopenegal = 0;
     t->isdispatchtuple = 0;
     t->isbitstype = 0;
     t->isprimitivetype = 0;
@@ -2973,6 +2975,12 @@ JL_DLLEXPORT jl_value_t *jl_resolve_typegroup(jl_module_t *module, jl_svec_t *ty
             }
 
             jl_gc_write(datatypes[i], datatypes[i]->parameters, jl_svec_t, params);
+
+            // The wrapper setup below instantiates through this object, and
+            // instantiation prunes on the memoized flags — they must reflect
+            // the just-assigned parameters (recomputed again in step 2.5 for
+            // the rebuilt template; cf. the same ordering in jl_new_datatype)
+            jl_precompute_memoized_dt(datatypes[i], 0);
 
             // Create wrapper UnionAll chain
             if (datatypes[i]->name->wrapper == NULL) {

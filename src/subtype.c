@@ -6063,6 +6063,8 @@ static int tvarref_always_occurs_cov(jl_value_t *v, size_t d, jl_param_pos_t par
     }
     else if (jl_is_unionall(v)) {
         jl_unionall_t *ua = (jl_unionall_t*)v;
+        if (!(ua->flags & JL_UNIONALL_ESCAPINGREFS))
+            return 0; // no reference escapes, so none reaches the binder
         // the bounds live outside the binder (same frame as `v`), the body
         // one frame further in
         return tvarref_always_occurs_cov(ua->ub, d, PARAM_NONE) ||
@@ -6076,6 +6078,8 @@ static int tvarref_always_occurs_cov(jl_value_t *v, size_t d, jl_param_pos_t par
         return tvarref_always_occurs_cov(jl_some_Type_T(v), d, PARAM_INVARIANT);
     }
     else if (jl_is_datatype(v)) {
+        if (!((jl_datatype_t*)v)->hasescapingrefs)
+            return 0; // contains no dangling references at all
         jl_param_pos_t nparam = jl_is_tuple_type(v) ? PARAM_COVARIANT : param;
         for (size_t i = 0; i < jl_nparams(v); i++) {
             if (tvarref_always_occurs_cov(jl_tparam(v, i), d, nparam))
