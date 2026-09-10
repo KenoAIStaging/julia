@@ -585,9 +585,12 @@ read!(filename::AbstractString, a) = open(io->read!(io, a), convert(String, file
 # The generic-IO `cancel` convention (referenced as such below): in methods
 # over abstract `IO`, the inner reads/writes go through arbitrary, possibly
 # user-extended methods that need not accept a `cancel` keyword. The
-# resolved token therefore gates *between* those calls, via explicit
-# cancellation points, while any parks inside them run under the ambient
-# scope.
+# resolved token therefore gates *between* those calls, while any parks
+# inside them run under the ambient scope. The gates are level-triggered
+# checks (`checkcancel`), not compiled cancellation points: nothing they
+# guard is reset-safe, so a reset region established here would be torn
+# down by the very next call, and establishing one costs more than the
+# cheap operations (an exhausted buffer, a one-byte read) on these paths.
 
 """
     readuntil(stream::IO, delim; keep::Bool = false)
@@ -746,12 +749,11 @@ function copyline(out::IO, s::IO; keep::Bool=false, cancel::CancelTokenArg=DEFAU
     if keep
         return copyuntil(out, s, 0x0a; keep=true, cancel)
     else
-        tok = resolve_cancel_token(cancel)
-        @cancel_check tok
+        tok = check_cancel_arg(cancel)
         # more complicated to deal with CRLF logic
         while !eof(s)
             # token-gate between the reads (generic-IO cancel convention)
-            @cancel_check tok
+            checkcancel(tok)
             b = read(s, UInt8)
             b == 0x0a && break
             if b == 0x0d && !eof(s)
@@ -884,11 +886,10 @@ isreadonly(s) = isreadable(s) && !iswritable(s)
 write(io::IO, x) = throw(MethodError(write, (io, x)))
 function write(io::IO, x1, xs...; cancel::CancelTokenArg=DEFAULT_CANCEL)
     # check for cancellations between each write
-    tok = resolve_cancel_token(cancel)
-    @cancel_check tok
+    tok = check_cancel_arg(cancel)
     written::Int = write(io, x1)
     for x in xs
-        @cancel_check tok
+        checkcancel(tok)
         written += write(io, x)
     end
     return written
@@ -914,8 +915,7 @@ write(s::IO, x::Bool) = write(s, UInt8(x))
 write(to::IO, p::Ptr) = write(to, convert(UInt, p))
 
 function write(s::IO, A::AbstractArray; cancel::CancelTokenArg=DEFAULT_CANCEL)
-    tok = resolve_cancel_token(cancel)
-    @cancel_check tok
+    tok = check_cancel_arg(cancel)
     if !isbitstype(eltype(A))
         error("`write` is not supported on non-isbits arrays")
     end
@@ -929,8 +929,7 @@ function write(s::IO, A::AbstractArray; cancel::CancelTokenArg=DEFAULT_CANCEL)
 end
 
 function write(s::IO, A::StridedArray; cancel::CancelTokenArg=DEFAULT_CANCEL)
-    tok = resolve_cancel_token(cancel)
-    @cancel_check tok
+    tok = check_cancel_arg(cancel)
     if !isbitstype(eltype(A))
         error("`write` is not supported on non-isbits arrays")
     end
@@ -1009,8 +1008,7 @@ read(s::IO, ::Type{Bool}) = (read(s, UInt8) != 0)
 read(s::IO, ::Type{Ptr{T}}) where {T} = convert(Ptr{T}, read(s, UInt))
 
 function read!(s::IO, A::AbstractArray{T}; cancel::CancelTokenArg=DEFAULT_CANCEL) where {T}
-    tok = resolve_cancel_token(cancel)
-    @cancel_check tok
+    tok = check_cancel_arg(cancel)
     if isbitstype(T) && _checkcontiguous(Bool, A)
         GC.@preserve A unsafe_read(s, pointer(A), elsize(A) * length(A))
     else
@@ -1034,11 +1032,11 @@ end
 # TODO: because the generic `write` design relies on a bug (#9498), we have to
 # explicitly add a `cancel` kwarg to avoid hitting the ::AbstractArray method
 function write(s::IO, B::BitArray; cancel::CancelTokenArg=DEFAULT_CANCEL)
-    @cancel_check resolve_cancel_token(cancel)
+    check_cancel_arg(cancel)
     return write(s, B.chunks)
 end
 function read!(s::IO, B::BitArray; cancel::CancelTokenArg=DEFAULT_CANCEL)
-    @cancel_check resolve_cancel_token(cancel)
+    check_cancel_arg(cancel)
     n = length(B)
     Bc = B.chunks
     read!(s, Bc)
@@ -1050,8 +1048,7 @@ function read!(s::IO, B::BitArray; cancel::CancelTokenArg=DEFAULT_CANCEL)
 end
 
 function read!(s::IO, A::StridedArray{T}; cancel::CancelTokenArg=DEFAULT_CANCEL) where {T}
-    tok = resolve_cancel_token(cancel)
-    @cancel_check tok
+    tok = check_cancel_arg(cancel)
     if !isbitstype(T) || _checkcontiguous(Bool, A)
         return invoke(read!, Tuple{IO, AbstractArray}, s, A)
     end
@@ -1105,11 +1102,10 @@ function copyuntil(out::IO, s::IO, delim::AbstractChar; keep::Bool=false, cancel
     if delim ≤ '\x7f'
         return copyuntil(out, s, delim % UInt8; keep, cancel)
     end
-    tok = resolve_cancel_token(cancel)
-    @cancel_check tok
+    tok = check_cancel_arg(cancel)
     for c in readeach(s, Char)
         # token-gate between the reads (generic-IO cancel convention)
-        @cancel_check tok
+        checkcancel(tok)
         if c == delim
             keep && write(out, c)
             break
@@ -1129,7 +1125,7 @@ function _copyuntil(out, s::IO, delim::T, keep::Bool, tok::MaybeToken=nothing) w
     output! = isa(out, IO) ? write : push!
     for c in readeach(s, T)
         # token-gate between the reads (generic-IO cancel convention)
-        @cancel_check tok
+        checkcancel(tok)
         if c == delim
             keep && output!(out, c)
             break
@@ -1247,7 +1243,7 @@ end
 function readuntil(io::IO, target::AbstractVector{T}; keep::Bool=false,
                    cancel::CancelTokenArg=DEFAULT_CANCEL) where T
     # entry gate only (generic-IO cancel convention)
-    @cancel_check resolve_cancel_token(cancel)
+    check_cancel_arg(cancel)
     out = (T === UInt8 ? resize!(StringVector(16), 0) : Vector{T}())
     readuntil_vector!(io, target, keep, out)
     return out
@@ -1255,7 +1251,7 @@ end
 function copyuntil(out::IO, io::IO, target::AbstractVector; keep::Bool=false, cancel::CancelTokenArg=DEFAULT_CANCEL)
     # entry gate only, ahead of readuntil_vector!'s generic reads
     # (generic-IO cancel convention)
-    @cancel_check resolve_cancel_token(cancel)
+    check_cancel_arg(cancel)
     readuntil_vector!(io, target, keep, out)
     return out
 end
@@ -1279,7 +1275,7 @@ julia> rm("my_file.txt");
 function readchomp(x; cancel::CancelTokenArg=DEFAULT_CANCEL)
     # `x` may be anything readable (a stream, file name, command): entry
     # gate only (generic-IO cancel convention)
-    @cancel_check resolve_cancel_token(cancel)
+    check_cancel_arg(cancel)
     return chomp(read(x, String))
 end
 
@@ -1293,14 +1289,13 @@ The size of `b` will be increased if needed (i.e. if `nb` is greater than `lengt
 and enough bytes could be read), but it will never be decreased.
 """
 function readbytes!(s::IO, b::AbstractArray{UInt8}, nb=length(b); cancel::CancelTokenArg=DEFAULT_CANCEL)
-    tok = resolve_cancel_token(cancel)
-    @cancel_check tok
+    tok = check_cancel_arg(cancel)
     require_one_based_indexing(b)
     olb = lb = length(b)
     nr = 0
     while nr < nb && !eof(s)
         # token-gate between the reads (generic-IO cancel convention)
-        @cancel_check tok
+        checkcancel(tok)
         a = read(s, UInt8)
         nr += 1
         if nr > lb
@@ -1397,7 +1392,7 @@ end
 
 function iterate(itr::EachLine, state=nothing)
     # token-gate between lines (generic-IO cancel convention)
-    @cancel_check itr.cancel
+    checkcancel(itr.cancel)
     eof(itr.stream) && return (itr.ondone(); nothing)
     (readline(itr.stream; keep=itr.keep, cancel=itr.cancel), nothing)
 end

@@ -105,7 +105,7 @@ end
     # operation (run/open/success/read), threaded down here so an explicit
     # token - or an explicit `cancel = nothing` shield - governs the spawn
     # itself, not whatever the ambient scope happens to be.
-    @cancel_check tok
+    checkcancel(tok)
     loop = eventloop()
     cpumask = cmd.cpus
     cpumask === nothing || (cpumask = as_cpumask(cpumask))
@@ -381,8 +381,7 @@ spawn_opts_inherit(in::Redirectable=RawFD(0), out::Redirectable=RawFD(1), err::R
     Redirectable[in, out, err, extra...]
 
 function eachline(cmd::AbstractCmd; keep::Bool=false, cancel::CancelTokenArg=DEFAULT_CANCEL)
-    tok = resolve_cancel_token(cancel)
-    @cancel_check tok
+    tok = check_cancel_arg(cancel)
     out = PipeEndpoint()
     processes = _spawn(cmd, Redirectable[devnull, out, stderr], tok)
     # if the user consumes all the data, also check process exit status for success
@@ -513,8 +512,7 @@ end
 Run `command` and return the resulting output as an array of bytes.
 """
 function read(cmd::AbstractCmd; cancel::CancelTokenArg=DEFAULT_CANCEL)
-    tok = resolve_cancel_token(cancel)
-    @cancel_check tok
+    tok = check_cancel_arg(cancel)
     procs = open(cmd, "r", devnull; cancel=tok)
     bytes = read(procs.out; cancel=tok)
     success(procs; cancel=tok) || pipeline_error(procs)
@@ -551,8 +549,7 @@ Use [`pipeline`](@ref) to control I/O redirection.
 See also: [`Cmd`](@ref).
 """
 function run(cmds::AbstractCmd, args...; wait::Bool = true, cancel::CancelTokenArg=DEFAULT_CANCEL)
-    tok = resolve_cancel_token(cancel)
-    @cancel_check tok
+    tok = check_cancel_arg(cancel)
     if wait
         ps = _spawn(cmds, spawn_opts_inherit(args...), tok)
         success(ps; cancel=tok) || pipeline_error(ps)
@@ -616,8 +613,7 @@ section in the manual), and tell whether it was successful (exited with a code o
 An exception is raised if the process cannot be started.
 """
 function success(cmd::AbstractCmd; cancel::CancelTokenArg=DEFAULT_CANCEL)
-    tok = resolve_cancel_token(cancel)
-    @cancel_check tok
+    tok = check_cancel_arg(cancel)
     return success(_spawn(cmd, tok); cancel=tok)
 end
 

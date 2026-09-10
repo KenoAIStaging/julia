@@ -988,6 +988,26 @@ end
 checkcancel(::Nothing) = nothing
 checkcancel(tok::CancellationToken) = checkcancel(tok.source)
 
+# The level-triggered check of the scoped-default token, for the entry gates
+# of operations that take nanoseconds themselves (a bulk read from a buffer,
+# a small-operand `BigInt` operation). Its slow path re-resolves the source
+# (the scope is unchanged since the fast path resolved it), takes no
+# GC-tracked argument and never returns, so the caller needs no GC frame for
+# it: the fast path stays a handful of loads and branches.
+@inline function checkcancel_default()
+    src = default_cancel_source()
+    src === nothing && return nothing
+    st = @atomic :monotonic src.state
+    st == 0x00 && return nothing
+    _throw_cancelled_default()
+end
+@noinline function _throw_cancelled_default()
+    src = default_cancel_source()::CancellationTokenSource
+    # deliver the severity current at throw time (the state only ever rises)
+    st = @atomic :acquire src.state
+    throw(CancellationRequest(st))
+end
+
 ## CANCEL_TOKEN
 struct CancelTokenKey <: AbstractScopedValue{Union{Nothing, CancellationToken}} end
 
@@ -1051,18 +1071,28 @@ end
 # exact: `CancellationToken` is an immutable wrapper, so the copy is egal to
 # the token in the scope.
 @inline function default_cancel_token()
+    s = default_cancel_source()
+    s === nothing && return nothing
+    return CancellationToken(s)
+end
+
+# The resolution proper works on the source rather than the token: a
+# `Union{Nothing, CancellationTokenSource}` is a plain pointer, whereas
+# returning the immutable token wrapper in a union needs a GC-rooted slot
+# in the caller's frame - and the slow path takes no GC-tracked argument
+# either - so a caller needs no GC frame for the lookup at all.
+@inline function default_cancel_source()
     ct = current_task()
     if getfield(ct, :bound_cancel_default) !== 0x00
         # the field's declared type (Union{Nothing, CancellationTokenSource})
         # narrows through the `=== nothing` check without a type-tag load
-        s = @atomic :monotonic ct.bound_cancel_token
-        s === nothing && return nothing
-        return CancellationToken(s)
+        return @atomic :monotonic ct.bound_cancel_token
     end
-    return _default_cancel_token_slow(ct)
+    return _default_cancel_source_slow()
 end
 
-@noinline function _default_cancel_token_slow(ct::Task)
+@noinline function _default_cancel_source_slow()
+    ct = current_task()
     tok = nothing
     scope = Core.current_scope()::Union{Scope, Nothing}
     if scope !== nothing
@@ -1075,15 +1105,10 @@ end
     # unsafe point for CancellationLowering, so it cannot break a published
     # reset region's (region, token) coherence: any live region is torn down
     # before the store and re-established at the next cancellation point.
-    @atomic :monotonic ct.bound_cancel_token = tok === nothing ? nothing : tok.source
+    src = tok === nothing ? nothing : tok.source
+    @atomic :monotonic ct.bound_cancel_token = src
     setfield!(ct, :bound_cancel_default, 0x01)
-    return tok
-end
-
-@inline function default_cancel_source()
-    tok = default_cancel_token()
-    tok === nothing && return nothing
-    return (tok::CancellationToken).source
+    return src
 end
 
 ## `cancel` keyword-argument plumbing
@@ -1116,6 +1141,16 @@ cancel_source(::Nothing) = nothing
     tok = resolve_cancel_token(cancel)
     tok === nothing || checkcancel(tok.source)
     return tok
+end
+# For the scoped default, the check's never-returning slow path keeps the
+# token from being live across a call, so the caller needs no GC frame (see
+# checkcancel_default).
+@inline function check_cancel_arg(::UseDefaultToken)
+    src = default_cancel_source()
+    src === nothing && return nothing
+    st = @atomic :monotonic src.state
+    st == 0x00 || _throw_cancelled_default()
+    return CancellationToken(src)
 end
 
 # The lighter entry check for APIs with a non-blocking fast path: an

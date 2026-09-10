@@ -1008,8 +1008,7 @@ function copyuntil(out::IO, io::GenericIOBuffer, delim::UInt8; keep::Bool=false,
 end
 
 function copyline(out::GenericIOBuffer, s::IO; keep::Bool=false, cancel::CancelTokenArg=DEFAULT_CANCEL)
-    tok = resolve_cancel_token(cancel)
-    @cancel_check tok
+    tok = check_cancel_arg(cancel)
     # the resolved token (or explicit shield) governs the inner copyuntil,
     # which does the actual blocking reads
     # If the data is copied into the middle of the buffer of `out` instead of appended to the end,
