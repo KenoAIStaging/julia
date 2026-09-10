@@ -1,0 +1,75 @@
+{
+  "cli_version": "0.10.6",
+  "checkpoint_id": "01M26QYJCPGR91NC1NYGT4KQXT",
+  "session_id": "32ed5077-e4a6-4005-b457-8b9979feb748",
+  "strategy": "manual-commit",
+  "created_at": "2026-09-10T22:45:26.636157555Z",
+  "branch": "kf/cancellation-perf-regressions",
+  "checkpoints_count": 1,
+  "files_touched": [
+    "base/cancellation.jl",
+    "base/io.jl",
+    "base/iobuffer.jl",
+    "base/iostream.jl",
+    "base/process.jl"
+  ],
+  "agent": "Claude Code",
+  "model": "claude-fable-5-1",
+  "turn_id": "d40df5f2a19a",
+  "checkpoint_transcript_start": 793,
+  "transcript_lines_at_start": 793,
+  "compact_transcript_start": 84,
+  "token_usage": {
+    "input_tokens": 0,
+    "cache_creation_tokens": 0,
+    "cache_read_tokens": 0,
+    "output_tokens": 0,
+    "api_call_count": 0
+  },
+  "skill_events_version": 1,
+  "skill_events": [
+    {
+      "id": "claude-skill-toolu_01W4Lmmodi6R71NsMvUYcNxs",
+      "event_type": "tool_invocation",
+      "skill": {
+        "name": "c-static-analysis"
+      },
+      "source": {
+        "agent": "claude-code",
+        "signal": "skill_tool_use",
+        "confidence": "explicit"
+      },
+      "turn_id": "d40df5f2a19a",
+      "transcript_anchor": {
+        "unit": "line",
+        "start": 540,
+        "end": 541,
+        "entry_ids": [
+          "2a0e0820-6bc5-49d0-95f2-83adace12c1c"
+        ],
+        "tool_use_id": "toolu_01W4Lmmodi6R71NsMvUYcNxs"
+      },
+      "native": {
+        "tool_name": "Skill",
+        "tool_use_id": "toolu_01W4Lmmodi6R71NsMvUYcNxs"
+      },
+      "collapse": {
+        "target": "tool_pair",
+        "label": "Skill: c-static-analysis",
+        "default_collapsed": true
+      }
+    }
+  ],
+  "initial_attribution": {
+    "calculated_at": "2026-09-10T22:45:26.367992168Z",
+    "agent_lines": 90,
+    "agent_removed": 66,
+    "human_added": 0,
+    "human_modified": 0,
+    "human_removed": 0,
+    "total_committed": 90,
+    "total_lines_changed": 156,
+    "agent_percentage": 100,
+    "metric_version": 2
+  }
+}
