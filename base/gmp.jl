@@ -156,6 +156,30 @@ const bitcnt_t = Culong
 
 gmpz(op::Symbol) = Expr(:tuple, QuoteNode(Symbol(:__gmpz_, op)), GlobalRef(MPZ, :libgmp))
 
+# GMP computations are cancellable: every MPZ operation checks the governing
+# token ahead of its foreign call, so a checkless BigInt loop still observes
+# a cancellation at its next operation. An operation whose inputs are large
+# enough for it to run long is additionally a compiled cancellation point
+# (`@cancel_check`), whose reset region spans the foreign call (annotated
+# `reset_safe`): a cancellation delivered mid-computation then unwinds the
+# call. Establishing that region (a `setjmp`) costs about as much as an
+# operation on a few limbs, so below `CANCEL_LIMBS` limbs of work (the
+# operand size, or the scalar argument bounding the operation's cost) the
+# operation only performs the cheap level-triggered check. The compiled point
+# lives out of line, so that its `setjmp` does not shape the frame of the
+# small-operand fast path either.
+const CANCEL_LIMBS = 32
+@noinline function cancellable_big(f::F, args::Vararg{Any, N}) where {F, N}
+    Base.@cancel_check
+    return f(args...)
+end
+@inline function cancellable(work::Integer, f::F, args::Vararg{Any, N}) where {F, N}
+    work > CANCEL_LIMBS && return cancellable_big(f, args...)
+    Base.checkcancel_default()
+    return f(args...)
+end
+limbs(a::BigInt) = abs(a.size)
+
 init!(x::BigInt) = (ccall((:__gmpz_init, libgmp), Cvoid, (mpz_t,), x); x)
 init2!(x::BigInt, a) = (ccall((:__gmpz_init2, libgmp), Cvoid, (mpz_t, bitcnt_t), x, a); x)
 
@@ -164,38 +188,49 @@ realloc2(a) = realloc2!(BigInt(), a)
 
 sizeinbase(a::BigInt, b) = Int(ccall((:__gmpz_sizeinbase, libgmp), Csize_t, (mpz_t, Cint), a, b))
 
+# `_op` is the bare foreign call, `op!` the cancellable entry point (see above)
 for (op, nbits) in (:add => :(BITS_PER_LIMB*(1 + max(abs(a.size), abs(b.size)))),
                     :sub => :(BITS_PER_LIMB*(1 + max(abs(a.size), abs(b.size)))),
                     :mul => 0, :fdiv_q => 0, :tdiv_q => 0, :cdiv_q => 0,
                     :fdiv_r => 0, :tdiv_r => 0, :cdiv_r => 0,
                     :gcd => 0, :lcm => 0, :and => 0, :ior => 0, :xor => 0)
     op! = Symbol(op, :!)
+    _op = Symbol(:_, op)
     fname = Symbol(:__gmpz_, op)
     @eval begin
-        $op!(x::BigInt, a::BigInt, b::BigInt) =
-            (Base.@cancel_check; Base.@assume_effects :reset_safe @ccall(libgmp.$fname(x::mpz_t, a::mpz_t, b::mpz_t)::Cvoid); x)
+        @inline $_op(x::BigInt, a::BigInt, b::BigInt) =
+            Base.@assume_effects :reset_safe @ccall(libgmp.$fname(x::mpz_t, a::mpz_t, b::mpz_t)::Cvoid)
+        $op!(x::BigInt, a::BigInt, b::BigInt) = (cancellable(max(limbs(a), limbs(b)), $_op, x, a, b); x)
         $op(a::BigInt, b::BigInt) = $op!(BigInt(nbits=$nbits), a, b)
         $op!(x::BigInt, b::BigInt) = $op!(x, x, b)
     end
 end
 
-invert!(x::BigInt, a::BigInt, b::BigInt) =
-    (Base.@cancel_check; Base.@assume_effects :reset_safe @ccall libgmp.__gmpz_invert(x::mpz_t, a::mpz_t, b::mpz_t)::Cint)
+@inline _invert(x::BigInt, a::BigInt, b::BigInt) =
+    Base.@assume_effects :reset_safe @ccall libgmp.__gmpz_invert(x::mpz_t, a::mpz_t, b::mpz_t)::Cint
+invert!(x::BigInt, a::BigInt, b::BigInt) = cancellable(max(limbs(a), limbs(b)), _invert, x, a, b)
 invert!(x::BigInt, b::BigInt) = invert!(x, x, b)
 invert(a::BigInt, b::BigInt) = (ret=BigInt(); invert!(ret, a, b); ret)
 
-for op in (:add_ui, :sub_ui, :mul_ui, :mul_2exp, :fdiv_q_2exp, :pow_ui, :bin_ui)
+# `work` bounds the operation's cost in limbs (see `cancellable`)
+for (op, work) in (:add_ui => :(limbs(a)), :sub_ui => :(limbs(a)), :mul_ui => :(limbs(a)),
+                   :mul_2exp => :(limbs(a) + b ÷ BITS_PER_LIMB), :fdiv_q_2exp => :(limbs(a)),
+                   :pow_ui => :(max(limbs(a), b)), :bin_ui => :(max(limbs(a), b)))
     op! = Symbol(op, :!)
+    _op = Symbol(:_, op)
     fname = Symbol(:__gmpz_, op)
     @eval begin
-        $op!(x::BigInt, a::BigInt, b) =
-            (Base.@cancel_check; Base.@assume_effects :reset_safe @ccall(libgmp.$fname(x::mpz_t, a::mpz_t, b::Culong)::Cvoid); x)
+        @inline $_op(x::BigInt, a::BigInt, b) =
+            Base.@assume_effects :reset_safe @ccall(libgmp.$fname(x::mpz_t, a::mpz_t, b::Culong)::Cvoid)
+        $op!(x::BigInt, a::BigInt, b) = (cancellable($work, $_op, x, a, b); x)
         $op(a::BigInt, b) = $op!(BigInt(), a, b)
         $op!(x::BigInt, b) = $op!(x, x, b)
     end
 end
 
-ui_sub!(x::BigInt, a, b::BigInt) = (Base.@cancel_check; Base.@assume_effects :reset_safe @ccall(libgmp.__gmpz_ui_sub(x::mpz_t, a::Culong, b::mpz_t)::Cvoid); x)
+@inline _ui_sub(x::BigInt, a, b::BigInt) =
+    Base.@assume_effects :reset_safe @ccall(libgmp.__gmpz_ui_sub(x::mpz_t, a::Culong, b::mpz_t)::Cvoid)
+ui_sub!(x::BigInt, a, b::BigInt) = (cancellable(limbs(b), _ui_sub, x, a, b); x)
 ui_sub(a, b::BigInt) = ui_sub!(BigInt(), a, b)
 
 for op in (:scan1, :scan0)
@@ -204,23 +239,29 @@ for op in (:scan1, :scan0)
     @eval $op(a::BigInt, b) = Int(signed(ccall($(gmpz(op)), Culong, (mpz_t, Culong), a, b)))
 end
 
-mul_si!(x::BigInt, a::BigInt, b) = (Base.@cancel_check; Base.@assume_effects :reset_safe @ccall(libgmp.__gmpz_mul_si(x::mpz_t, a::mpz_t, b::Clong)::Cvoid); x)
+@inline _mul_si(x::BigInt, a::BigInt, b) =
+    Base.@assume_effects :reset_safe @ccall(libgmp.__gmpz_mul_si(x::mpz_t, a::mpz_t, b::Clong)::Cvoid)
+mul_si!(x::BigInt, a::BigInt, b) = (cancellable(limbs(a), _mul_si, x, a, b); x)
 mul_si(a::BigInt, b) = mul_si!(BigInt(), a, b)
 mul_si!(x::BigInt, b) = mul_si!(x, x, b)
 
 for op in (:neg, :com, :sqrt, :set)
     op! = Symbol(op, :!)
+    _op = Symbol(:_, op)
     fname = Symbol(:__gmpz_, op)
     @eval begin
-        $op!(x::BigInt, a::BigInt) =
-            (Base.@cancel_check; Base.@assume_effects :reset_safe @ccall(libgmp.$fname(x::mpz_t, a::mpz_t)::Cvoid); x)
+        @inline $_op(x::BigInt, a::BigInt) =
+            Base.@assume_effects :reset_safe @ccall(libgmp.$fname(x::mpz_t, a::mpz_t)::Cvoid)
+        $op!(x::BigInt, a::BigInt) = (cancellable(limbs(a), $_op, x, a); x)
         $op(a::BigInt) = $op!(BigInt(), a)
     end
     op === :set && continue # MPZ.set!(x) would make no sense
     @eval $op!(x::BigInt) = $op!(x, x)
 end
 
-fac_ui!(x::BigInt, a) = (Base.@cancel_check; Base.@assume_effects :reset_safe @ccall(libgmp.__gmpz_fac_ui(x::mpz_t, a::Culong)::Cvoid); x)
+@inline _fac_ui(x::BigInt, a) =
+    Base.@assume_effects :reset_safe @ccall(libgmp.__gmpz_fac_ui(x::mpz_t, a::Culong)::Cvoid)
+fac_ui!(x::BigInt, a) = (cancellable(a, _fac_ui, x, a); x)
 fac_ui(a) = fac_ui!(BigInt(), a)
 
 for (op, T) in ((:set_ui, Culong), (:set_si, Clong), (:set_d, Cdouble))
@@ -236,21 +277,25 @@ popcount(a::BigInt) = Int(signed(ccall((:__gmpz_popcount, libgmp), Culong, (mpz_
 mpn_popcount(d::Ptr{Limb}, s::Integer) = Int(ccall((:__gmpn_popcount, libgmp), Culong, (Ptr{Limb}, Csize_t), d, s))
 mpn_popcount(a::BigInt) = mpn_popcount(a.d, abs(a.size))
 
-function tdiv_qr!(x::BigInt, y::BigInt, a::BigInt, b::BigInt)
-    Base.@cancel_check
+@inline _tdiv_qr(x::BigInt, y::BigInt, a::BigInt, b::BigInt) =
     Base.@assume_effects :reset_safe @ccall libgmp.__gmpz_tdiv_qr(x::mpz_t, y::mpz_t, a::mpz_t, b::mpz_t)::Cvoid
+function tdiv_qr!(x::BigInt, y::BigInt, a::BigInt, b::BigInt)
+    cancellable(max(limbs(a), limbs(b)), _tdiv_qr, x, y, a, b)
     x, y
 end
 tdiv_qr(a::BigInt, b::BigInt) = tdiv_qr!(BigInt(), BigInt(), a, b)
 
+@inline _powm(x::BigInt, a::BigInt, b::BigInt, c::BigInt) =
+    Base.@assume_effects :reset_safe @ccall(libgmp.__gmpz_powm(x::mpz_t, a::mpz_t, b::mpz_t, c::mpz_t)::Cvoid)
 powm!(x::BigInt, a::BigInt, b::BigInt, c::BigInt) =
-    (Base.@cancel_check; Base.@assume_effects :reset_safe @ccall(libgmp.__gmpz_powm(x::mpz_t, a::mpz_t, b::mpz_t, c::mpz_t)::Cvoid); x)
+    (cancellable(max(limbs(a), limbs(b), limbs(c)), _powm, x, a, b, c); x)
 powm(a::BigInt, b::BigInt, c::BigInt) = powm!(BigInt(), a, b, c)
 powm!(x::BigInt, b::BigInt, c::BigInt) = powm!(x, x, b, c)
 
-function gcdext!(x::BigInt, y::BigInt, z::BigInt, a::BigInt, b::BigInt)
-    Base.@cancel_check
+@inline _gcdext(x::BigInt, y::BigInt, z::BigInt, a::BigInt, b::BigInt) =
     Base.@assume_effects :reset_safe @ccall libgmp.__gmpz_gcdext(x::mpz_t, y::mpz_t, z::mpz_t, a::mpz_t, b::mpz_t)::Cvoid
+function gcdext!(x::BigInt, y::BigInt, z::BigInt, a::BigInt, b::BigInt)
+    cancellable(max(limbs(a), limbs(b)), _gcdext, x, y, z, a, b)
     x, y, z
 end
 gcdext(a::BigInt, b::BigInt) = gcdext!(BigInt(), BigInt(), BigInt(), a, b)
@@ -263,8 +308,13 @@ cmp_d(a::BigInt, b) = Int(ccall((:__gmpz_cmp_d, libgmp), Cint, (mpz_t, Cdouble),
 mpn_cmp(a::Ptr{Limb}, b::Ptr{Limb}, c) = ccall((:__gmpn_cmp, libgmp), Cint, (Ptr{Limb}, Ptr{Limb}, Clong), a, b, c)
 mpn_cmp(a::BigInt, b::BigInt, c) = mpn_cmp(a.d, b.d, c)
 
-get_str!(x, a, b::BigInt) = (Base.@cancel_check; Base.@assume_effects :reset_safe @ccall(libgmp.__gmpz_get_str(x::Ptr{Cchar}, a::Cint, b::mpz_t)::Ptr{Cchar}); x)
-set_str!(x::BigInt, a, b) = Int(begin Base.@cancel_check; Base.@assume_effects :reset_safe @ccall(libgmp.__gmpz_set_str(x::mpz_t, a::Ptr{UInt8}, b::Cint)::Cint) end)
+@inline _get_str(x, a, b::BigInt) =
+    Base.@assume_effects :reset_safe @ccall(libgmp.__gmpz_get_str(x::Ptr{Cchar}, a::Cint, b::mpz_t)::Ptr{Cchar})
+get_str!(x, a, b::BigInt) = (cancellable(limbs(b), _get_str, x, a, b); x)
+@inline _set_str(x::BigInt, a, b) =
+    Base.@assume_effects :reset_safe @ccall(libgmp.__gmpz_set_str(x::mpz_t, a::Ptr{UInt8}, b::Cint)::Cint)
+# the length of the C string `a` is unknown here: always a compiled point
+set_str!(x::BigInt, a, b) = Int(cancellable_big(_set_str, x, a, b))
 get_d(a::BigInt) = ccall((:__gmpz_get_d, libgmp), Cdouble, (mpz_t,), a)
 
 function export!(a::AbstractVector{T}, n::BigInt; order::Integer=-1, nails::Integer=0, endian::Integer=0) where {T<:Base.BitInteger}

@@ -669,12 +669,14 @@ JL_DLLEXPORT void *jl_malloc(size_t sz) JL_CANSAFEPOINT
 // === GMP allocation hooks ===================================================
 // These are special reset-safe versions of GMP's allocation functions. GMP is
 // generally reset-safe, but our allocators are not, so unpublish the reset
-// region around them as the *_reset_safe entry points above do.
+// region around them as the *_reset_safe entry points above do. Only an MPZ
+// operation on large operands establishes a region (see base/gmp.jl), so
+// the plain allocator is taken up front when none is published.
 
 JL_DLLEXPORT void *jl_gmp_counted_malloc(size_t sz)
 {
     jl_task_t *ct = jl_get_current_task();
-    if (ct == NULL || ct->ptls == NULL)
+    if (ct == NULL || ct->ptls == NULL || jl_atomic_load_relaxed(&ct->reset_ctx) == NULL)
         return jl_gc_counted_malloc(sz);
     jl_reset_ctx_t *reset_ctx = reset_region_unpublish(ct);
     void *data = jl_gc_counted_malloc(sz);
@@ -685,7 +687,7 @@ JL_DLLEXPORT void *jl_gmp_counted_malloc(size_t sz)
 JL_DLLEXPORT void *jl_gmp_counted_realloc_with_old_size(void *p, size_t old, size_t sz)
 {
     jl_task_t *ct = jl_get_current_task();
-    if (ct == NULL || ct->ptls == NULL)
+    if (ct == NULL || ct->ptls == NULL || jl_atomic_load_relaxed(&ct->reset_ctx) == NULL)
         return jl_gc_counted_realloc_with_old_size(p, old, sz);
     jl_reset_ctx_t *reset_ctx = reset_region_unpublish(ct);
     void *data = jl_gc_counted_realloc_with_old_size(p, old, sz);
@@ -696,7 +698,7 @@ JL_DLLEXPORT void *jl_gmp_counted_realloc_with_old_size(void *p, size_t old, siz
 JL_DLLEXPORT void jl_gmp_counted_free_with_size(void *p, size_t sz)
 {
     jl_task_t *ct = jl_get_current_task();
-    if (ct == NULL || ct->ptls == NULL) {
+    if (ct == NULL || ct->ptls == NULL || jl_atomic_load_relaxed(&ct->reset_ctx) == NULL) {
         jl_gc_counted_free_with_size(p, sz);
         return;
     }
