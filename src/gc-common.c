@@ -605,6 +605,11 @@ STATIC_INLINE void reset_region_republish(jl_task_t *ct, jl_reset_ctx_t *reset_c
     reset_region_deliver_pending(ct);
 }
 
+//
+// The allocating variants are only reached with a region published: an
+// allocation site that may execute inside a region branches on the published
+// context and takes the plain entry point when there is none (see
+// CancellationLowering).
 JL_DLLEXPORT jl_value_t *jl_gc_small_alloc_reset_safe(jl_ptls_t ptls, int offset, int osize,
                                                       jl_value_t *type) JL_CANSAFEPOINT
 {
@@ -637,9 +642,13 @@ JL_DLLEXPORT void *jl_gc_alloc_typed_reset_safe(jl_ptls_t ptls, size_t sz, void 
     return val;
 }
 
+// The write barrier's slow path is annotated outright (it is rare and already
+// behind a branch), so this one is reached without a region published too.
 JL_DLLEXPORT void jl_gc_queue_root_reset_safe(const jl_value_t *ptr)
 {
     jl_task_t *ct = jl_current_task;
+    if (jl_atomic_load_relaxed(&ct->reset_ctx) == NULL)
+        return jl_gc_queue_root(ptr);
     jl_reset_ctx_t *reset_ctx = reset_region_unpublish(ct);
     jl_gc_queue_root(ptr);
     reset_region_republish(ct, reset_ctx);

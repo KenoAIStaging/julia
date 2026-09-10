@@ -25,8 +25,10 @@
 // (julia.reset_region metadata), and FinalLowerGC lowers those sites to
 // *_reset_safe runtime entry points that unpublish/republish the region
 // themselves, so they need no per-site drop and the region even survives
-// them. Functions that are not reset_safe need no instrumentation: no reset
-// region can be open while they run.
+// them. Since most executions of most such sites find no region published,
+// an allocation site branches on the published context and takes the plain
+// allocator when there is none. Functions that are not reset_safe need no
+// instrumentation: no reset region can be open while they run.
 
 #include "llvm-version.h"
 #include "passes.h"
@@ -37,8 +39,10 @@
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/MDBuilder.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/Support/Debug.h>
 #include <llvm/ADT/Statistic.h>
 #include <llvm/TargetParser/Triple.h>
@@ -538,6 +542,14 @@ bool CancellationLowering::runOnFunction(Function &F) {
                     continue;
                 if (CI->isLifetimeStartOrEnd())
                     continue;
+                // memcpy/memmove/memset are the program's own stores in bulk
+                // form (unsafe_copyto!, fill!, ...): they follow the store
+                // rule above, not the call rule for runtime machinery.
+                if (isa<MemIntrinsic>(CI)) {
+                    if (instrumented && !hasResetSafeMetadata(CI))
+                        UnsafePoints.push_back(CI);
+                    continue;
+                }
 
                 // Check for reset_safe metadata (in both walks: an untagged
                 // call in a merely-reset_safe function may invoke code whose
@@ -563,19 +575,31 @@ bool CancellationLowering::runOnFunction(Function &F) {
                             ID == Intrinsic::prefetch) {
                             continue;
                         }
+                        // The GC.@preserve markers are liveness bookkeeping
+                        // that LateLowerGCFrame deletes outright.
+                        if (Callee->getName().starts_with("llvm.julia.gc_preserve_"))
+                            continue;
                     }
                     // Skip the setjmp and safepoint calls we just created
                     if (Callee && (Callee->getName() == jl_setjmp_name ||
                                    Callee->getName() == "julia.safepoint"))
                         continue;
-                    // Known-safe julia runtime intrinsics: pure address
-                    // computations that neither observe nor publish state a
-                    // reset could tear. These commonly appear as ccall
+                    // Pure computation - an LLVM intrinsic (llvm.smax,
+                    // llvm.ctlz, llvm.fmuladd, the overflow-checked
+                    // arithmetic, ...) or one of the julia.* address/tag
+                    // computations (julia.pointer_from_objref, julia.typeof,
+                    // ...) that accesses no memory - neither observes nor
+                    // publishes state a reset could tear, so the region spans
+                    // it. The address computations commonly appear as ccall
                     // argument-conversion glue (unsafe_convert of a mutable
-                    // object), and must not invalidate a reset region
+                    // object) and must not invalidate a reset region
                     // published across an adjacent reset-safe foreign call.
-                    if (Callee && (Callee->getName() == "julia.pointer_from_objref" ||
-                                   Callee->getName() == "julia.gc_loaded"))
+                    // A clear here would not merely be wasted work: in a loop
+                    // body its volatile store and fence pin every otherwise
+                    // loop-invariant computation around the intrinsic inside
+                    // the loop.
+                    if (Callee && CI->doesNotAccessMemory() &&
+                        (Callee->isIntrinsic() || Callee->getName().starts_with("julia.")))
                         continue;
                     // Allocations and write barriers are safe to span:
                     // FinalLowerGC (stock and MMTk) lowers annotated sites
@@ -665,18 +689,19 @@ bool CancellationLowering::runOnFunction(Function &F) {
         }
     }
 
-    // Annotate the allocation and write-barrier sites that may execute while
-    // a reset region is published: FinalLowerGC lowers exactly these to the
-    // *_reset_safe runtime entry points, which unpublish/republish the
-    // region themselves (no per-site drop is needed, and the region survives
-    // the operation). Carrying an open region is a per-site property, not a
+    // Find the allocation and write-barrier sites that may execute while a
+    // reset region is published: only the *_reset_safe runtime entry points,
+    // which unpublish/republish the region themselves (no per-site drop is
+    // needed, and the region survives the operation), may run then, and
+    // FinalLowerGC lowers sites carrying the julia.reset_region annotation
+    // to them. Carrying an open region is a per-site property, not a
     // function-level one, so track the clears and publishes inserted above
-    // through each block: a site escapes annotation only when every path to
-    // it has already cleared the region, or when no publication reaches it
-    // at all. Block entry state comes from the reachability computed above
+    // through each block: a site is exempt only when every path to it has
+    // already cleared the region, or when no publication reaches it at all.
+    // Block entry state comes from the reachability computed above
     // (everything, for a function that may inherit an open region from its
-    // caller); an unneeded annotation only costs the entry point's (cheap)
-    // region handling.
+    // caller).
+    SmallVector<CallInst*, 16> RegionAllocSites;
     for (auto &BB : F) {
         bool region_open = blockMayOpenAtEntry(&BB);
         for (auto &I : BB) {
@@ -686,15 +711,63 @@ bool CancellationLowering::runOnFunction(Function &F) {
             }
             else if (auto *CI = dyn_cast<CallInst>(&I)) {
                 Function *Callee = CI->getCalledFunction();
-                if (!Callee)
+                if (!Callee || !region_open)
                     continue;
                 StringRef Name = Callee->getName();
-                if (region_open && (Name == "julia.gc_alloc_obj" ||
-                                    Name == "julia.write_barrier")) {
+                if (Name == "julia.gc_alloc_obj")
+                    RegionAllocSites.push_back(CI);
+                else if (Name == "julia.write_barrier") {
+                    // The barrier's slow path (the parent is old) is rare
+                    // and already behind a branch: annotate it outright.
                     CI->setMetadata("julia.reset_region", MDNode::get(F.getContext(), {}));
                     Changed = true;
                 }
             }
+        }
+    }
+
+    // "May execute with a region published" is a weak property: every
+    // allocation of a function that inherits its caller's region qualifies,
+    // and most executions of most such sites find no region published at all
+    // (nothing on the call stack has established one). Rather than routing
+    // every execution through the reset-safe entry point - whose own check
+    // for that case costs an extra call and a dependent load chain on every
+    // allocation - branch here on the published context, which is one load
+    // away: the plain allocator on the (likely) unpublished path, the
+    // reset-safe one otherwise.
+    if (!RegionAllocSites.empty() && !reset_ctx_ptr)
+        computeResetCtxPtr(F, pgcstack_inst);
+    for (CallInst *CI : RegionAllocSites) {
+        Changed = true;
+        LLVMContext &LLVMCtx = F.getContext();
+        Type *PtrTy = PointerType::getUnqual(LLVMCtx);
+        IRBuilder<> Builder(CI);
+        Builder.SetCurrentDebugLocation(CI->getDebugLoc());
+        LoadInst *cur = Builder.CreateAlignedLoad(PtrTy, reset_ctx_ptr, Align(sizeof(void*)), /*isVolatile*/true, "reset_ctx_cur");
+        cur->setOrdering(AtomicOrdering::Monotonic);
+        setResetSafeMetadata(cur);
+        Value *published = Builder.CreateICmpNE(cur, ConstantPointerNull::get(cast<PointerType>(PtrTy)), "region_published");
+        Instruction *SlowTerm = nullptr, *FastTerm = nullptr;
+        SplitBlockAndInsertIfThenElse(published, CI, &SlowTerm, &FastTerm,
+                                      MDBuilder(LLVMCtx).createBranchWeights(1, 1 << 12));
+        SlowTerm->getParent()->setName("alloc_in_region");
+        FastTerm->getParent()->setName("alloc_no_region");
+        CallInst *Slow = cast<CallInst>(CI->clone());
+        Slow->insertBefore(SlowTerm->getIterator());
+        Slow->setMetadata("julia.reset_region", MDNode::get(LLVMCtx, {}));
+        if (CI->hasName())
+            Slow->setName(CI->getName() + ".region");
+        // The original call moves to the fast block; the split block keeps
+        // its uses, merged through a PHI.
+        BasicBlock *Tail = CI->getParent();
+        CI->moveBefore(FastTerm->getIterator());
+        if (!CI->getType()->isVoidTy()) {
+            PHINode *phi = PHINode::Create(CI->getType(), 2, "", Tail->getFirstNonPHIIt());
+            CI->replaceAllUsesWith(phi);
+            phi->addIncoming(CI, FastTerm->getParent());
+            phi->addIncoming(Slow, SlowTerm->getParent());
+            phi->takeName(CI);
+            CI->setName(phi->getName() + ".plain");
         }
     }
 

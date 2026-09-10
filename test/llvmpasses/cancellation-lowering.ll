@@ -14,7 +14,12 @@ declare ptr @julia.gc_alloc_obj(ptr, i64, ptr)
 declare ptr @ijl_box_int64(i64)
 declare ptr @ijl_apply_generic(ptr, ptr, i32)
 declare i32 @tail_target(ptr)
-declare ptr @julia.pointer_from_objref(ptr addrspace(11))
+declare ptr @julia.pointer_from_objref(ptr addrspace(11)) memory(none)
+declare ptr addrspace(10) @julia.typeof(ptr addrspace(10)) memory(none)
+declare i64 @llvm.smax.i64(i64, i64)
+declare void @llvm.memcpy.p0.p0.i64(ptr noalias writeonly, ptr noalias readonly, i64, i1 immarg)
+declare token @llvm.julia.gc_preserve_begin(...)
+declare void @llvm.julia.gc_preserve_end(token)
 
 ; Test basic cancellation point lowering with reset_ctx cleared before return
 define i32 @test_cancellation_point() {
@@ -135,21 +140,31 @@ entry:
 ; and write barriers do not drop: sites that may execute with a region
 ; published are annotated with julia.reset_region instead, and FinalLowerGC
 ; lowers them to reset-safe runtime entry points that unpublish/republish
-; the region themselves. A site on a path where the region was already
-; dropped (here: after the untagged call) is not annotated. No region is
-; established (no setjmp), and the region is NOT cleared at the return: it
-; belongs to the caller.
+; the region themselves. Since most executions of such a site find no
+; region published, an allocation branches on the published context: the
+; plain (unannotated) allocation when there is none, the annotated one
+; otherwise. A site on a path where the region was already dropped (here:
+; after the untagged call) gets neither. No region is established (no
+; setjmp), and the region is NOT cleared at the return: it belongs to the
+; caller.
 define ptr @test_implicit_runtime_drop(i64 %v) "julia.ipo_reset_safe" {
 entry:
 ; CHECK-LABEL: @test_implicit_runtime_drop
 ; CHECK-NOT: setjmp
 ; CHECK: %reset_ctx_ptr = getelementptr i8, ptr %current_task
-; CHECK: %obj = call ptr @julia.gc_alloc_obj({{.*}}), !julia.reset_region
+; CHECK: %reset_ctx_cur = load atomic volatile ptr, ptr %reset_ctx_ptr monotonic
+; CHECK-NEXT: %region_published = icmp ne ptr %reset_ctx_cur, null
+; CHECK-NEXT: br i1 %region_published, label %alloc_in_region, label %alloc_no_region
+; CHECK: alloc_in_region:
+; CHECK-NEXT: %obj.region = call ptr @julia.gc_alloc_obj({{.*}}), !julia.reset_region
+; CHECK: alloc_no_region:
+; CHECK-NEXT: %obj.plain = call ptr @julia.gc_alloc_obj({{.*}}){{$}}
+; CHECK: %obj = phi ptr [ %obj.plain, %alloc_no_region ], [ %obj.region, %alloc_in_region ]
 ; CHECK-NEXT: call void @some_safe_call(), !julia.reset_safe
 ; CHECK-NEXT: store atomic volatile ptr null, ptr %reset_ctx_ptr release
 ; CHECK-NEXT: fence syncscope("singlethread") seq_cst
 ; CHECK-NEXT: %box = call ptr @ijl_box_int64(i64 %v)
-; CHECK: %obj2 = call ptr @julia.gc_alloc_obj({{.*}}){{$}}
+; CHECK-NEXT: %obj2 = call ptr @julia.gc_alloc_obj({{.*}}){{$}}
 ; CHECK-NOT: setjmp
 ; CHECK-NOT: store
 ; CHECK: ret ptr %obj
@@ -162,16 +177,24 @@ entry:
 }
 
 ; In a function with cancellation points of its own, an allocation site
-; between the region's publication and the next drop is annotated (not
-; dropped): FinalLowerGC lowers it to a reset-safe entry point.
+; between the region's publication and the next drop is not dropped: it
+; branches on the published context, and FinalLowerGC lowers the annotated
+; arm to a reset-safe entry point.
 define ptr @test_alloc_in_region() {
 entry:
 ; CHECK-LABEL: @test_alloc_in_region
 ; CHECK: call i32 @{{.*}}setjmp
 ; CHECK-NEXT: store atomic volatile ptr %cancel_ucontext, ptr %reset_ctx_ptr release
 ; CHECK: cancel_pt_cont:
-; CHECK: %obj = call ptr @julia.gc_alloc_obj({{.*}}), !julia.reset_region
-; CHECK: store atomic volatile ptr null, ptr %reset_ctx_ptr release
+; CHECK-NEXT: %reset_ctx_cur = load atomic volatile ptr, ptr %reset_ctx_ptr monotonic
+; CHECK-NEXT: %region_published = icmp ne ptr %reset_ctx_cur, null
+; CHECK-NEXT: br i1 %region_published, label %alloc_in_region, label %alloc_no_region
+; CHECK: alloc_in_region:
+; CHECK-NEXT: %obj.region = call ptr @julia.gc_alloc_obj({{.*}}), !julia.reset_region
+; CHECK: alloc_no_region:
+; CHECK-NEXT: %obj.plain = call ptr @julia.gc_alloc_obj({{.*}}){{$}}
+; CHECK: %obj = phi ptr [ %obj.plain, %alloc_no_region ], [ %obj.region, %alloc_in_region ]
+; CHECK-NEXT: store atomic volatile ptr null, ptr %reset_ctx_ptr release
 ; CHECK-NEXT: ret ptr %obj
   %pgcstack = call ptr @julia.get_pgcstack()
   %result = call i32 @julia.cancellation_point()
@@ -335,6 +358,54 @@ entry:
   %result = call i32 @julia.cancellation_point()
   %r = musttail call ptr @julia.pointer_from_objref(ptr addrspace(11) %obj)
   ret ptr %r
+}
+
+; Pure computation cannot tear a region: an LLVM intrinsic that accesses no
+; memory (llvm.smax and friends), the julia.* address/tag computations
+; declared memory(none), and the GC.@preserve markers (deleted outright by
+; LateLowerGCFrame) get no clear in either walk. memcpy/memmove/memset are
+; the program's own stores in bulk form and follow the store rule: in a
+; merely reset_safe function they are covered by the IPO contract, so
+; nothing here needs the reset context at all (it is not even computed).
+define i64 @test_pure_computation_inherited(i64 %a, i64 %b, ptr %dst, ptr %src, ptr addrspace(10) %obj) "julia.ipo_reset_safe" {
+entry:
+; CHECK-LABEL: @test_pure_computation_inherited
+; CHECK-NOT: reset_ctx
+; CHECK: ret i64 %m
+  %pgcstack = call ptr @julia.get_pgcstack()
+  %m = call i64 @llvm.smax.i64(i64 %a, i64 %b)
+  %tok = call token (...) @llvm.julia.gc_preserve_begin(ptr addrspace(10) %obj)
+  call void @llvm.memcpy.p0.p0.i64(ptr %dst, ptr %src, i64 16, i1 false)
+  call void @llvm.julia.gc_preserve_end(token %tok)
+  %t = call ptr addrspace(10) @julia.typeof(ptr addrspace(10) %obj)
+  ret i64 %m
+}
+
+; In an instrumented function the same pure computation is still spanned,
+; while the memcpy is an unsafe point like any other store of the function.
+define void @test_pure_computation_instrumented(i64 %a, i64 %b, ptr %dst, ptr %src, ptr addrspace(10) %obj) {
+entry:
+; CHECK-LABEL: @test_pure_computation_instrumented
+; CHECK: call i32 @{{.*}}setjmp
+; CHECK-NEXT: store atomic volatile ptr %cancel_ucontext, ptr %reset_ctx_ptr release
+; CHECK: cancel_pt_cont:
+; CHECK-NEXT: %m = call i64 @llvm.smax.i64(i64 %a, i64 %b)
+; CHECK-NEXT: %tok = call token (...) @llvm.julia.gc_preserve_begin(ptr addrspace(10) %obj)
+; CHECK-NEXT: %t = call ptr addrspace(10) @julia.typeof(ptr addrspace(10) %obj)
+; CHECK-NEXT: store atomic volatile ptr null, ptr %reset_ctx_ptr release
+; CHECK-NEXT: fence syncscope("singlethread") seq_cst
+; CHECK-NEXT: call void @llvm.memcpy.p0.p0.i64(ptr %dst, ptr %src, i64 16, i1 false)
+; CHECK-NEXT: call void @llvm.julia.gc_preserve_end(token %tok)
+; CHECK-NEXT: store atomic volatile ptr null, ptr %reset_ctx_ptr release
+; CHECK-NEXT: ret void
+  %pgcstack = call ptr @julia.get_pgcstack()
+  %result = call i32 @julia.cancellation_point()
+  %m = call i64 @llvm.smax.i64(i64 %a, i64 %b)
+  %tok = call token (...) @llvm.julia.gc_preserve_begin(ptr addrspace(10) %obj)
+  %t = call ptr addrspace(10) @julia.typeof(ptr addrspace(10) %obj)
+  call void @llvm.memcpy.p0.p0.i64(ptr %dst, ptr %src, i64 16, i1 false)
+  call void @llvm.julia.gc_preserve_end(token %tok)
+  ret void
 }
 
 !0 = !{}
