@@ -2607,30 +2607,44 @@ static void jl_prune_idset(_Atomic(jl_svec_t*) *pkeys, _Atomic(jl_genericmemory_
     size_t l = jl_svec_len(keys), i;
     if (l == 0)
         return;
-    arraylist_t keys_list;
-    arraylist_new(&keys_list, 0);
+    // Keys with a hash are found through the keyset; the others (specializations
+    // whose signature has free type variables) only by a linear scan from the
+    // end of the svec that stops at the first `jl_nothing`. The insertion logic
+    // in `jl_specializations_get_linfo_` relies on this layout too: indexed
+    // keys from the front, the others from the back, with at least one
+    // `jl_nothing` in between. Keep it when pruning.
+    arraylist_t hashed, unhashed;
+    arraylist_new(&hashed, 0);
+    arraylist_new(&unhashed, 0);
     for (i = 0; i < l; i++) {
         jl_value_t *k = jl_svecref(keys, i);
         if (k == jl_nothing)
             continue;
-        if (ptrhash_get(&serialization_order, k) != HT_NOTFOUND)
-            arraylist_push(&keys_list, k);
+        if (ptrhash_get(&serialization_order, k) == HT_NOTFOUND)
+            continue;
+        arraylist_push(key_hash(i, (jl_value_t*)keys) ? &hashed : &unhashed, k);
     }
     jl_genericmemory_t *keyset = jl_atomic_load_relaxed(pkeyset);
+    // a key with a hash is always indexed, so a set without an index has none
+    assert(hashed.len == 0 || keyset != (jl_genericmemory_t*)jl_an_empty_memory_any);
     _Atomic(jl_genericmemory_t*)keyset2;
     jl_atomic_store_relaxed(&keyset2, (jl_genericmemory_t*)jl_an_empty_memory_any);
-    jl_svec_t *keys2 = jl_alloc_svec_uninit(keys_list.len);
-    for (i = 0; i < keys_list.len; i++) {
-        jl_binding_t *ref = (jl_binding_t*)keys_list.items[i];
-        jl_svecset(keys2, i, ref);
-        // a set without an index (none of its keys has a hash) stays without one
-        if (keyset != (jl_genericmemory_t*)jl_an_empty_memory_any)
+    jl_svec_t *keys2 = jl_emptysvec;
+    if (hashed.len + unhashed.len > 0) {
+        keys2 = jl_alloc_svec_uninit(hashed.len + 1 + unhashed.len);
+        for (i = 0; i < hashed.len; i++) {
+            jl_svecset(keys2, i, hashed.items[i]);
             jl_smallintset_insert(&keyset2, parent, key_hash, i, (jl_value_t*)keys2);
+        }
+        jl_svecset(keys2, hashed.len, jl_nothing);
+        for (i = 0; i < unhashed.len; i++)
+            jl_svecset(keys2, hashed.len + 1 + i, unhashed.items[i]);
     }
-    arraylist_free(&keys_list);
+    arraylist_free(&hashed);
+    arraylist_free(&unhashed);
     // The replacements take over the old objects' serialization slots, so that
     // the pruned keys are not serialized. The shared empty singletons (everything
-    // was pruned, or the set has no index) keep their own entries, though:
+    // was pruned, or no indexed key is left) keep their own entries, though:
     // registering them at another slot would move every other reference to them.
     void *idx = ptrhash_get(&serialization_order, keys);
     assert(idx != HT_NOTFOUND && idx != (void*)(uintptr_t)-1);
