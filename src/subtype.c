@@ -64,16 +64,20 @@ typedef struct {
 // ever lower the channel (see `jl_stenv_t.bound_channel`); per-variable, the
 // strongest contribution wins (see `jl_varbinding_t.lb_certainty`).
 typedef enum {
-    BOUND_NONE  = 0, // no (non-Bottom) lower-bound contribution yet
-    BOUND_PROXY = 1, // derives from a context that not every instance of the query
-                     // reaches (another variable's declared bounds, or a right-side
-                     // union arm an instance may not take): such an instance need
-                     // not bind this var at all
-    BOUND_EQ    = 2, // derives from a query value reached through an `==`
-                     // equality wrapper (`Type{A}`): every `==`-equal rep of the
-                     // query also binds this var, but only to an `==`-equal value
-    BOUND_EGAL  = 3, // derives from an egality-pinned position (`TypeEgal`/type
-                     // tag): the value is `===`-certain
+    BOUND_NONE    = 0, // no (non-Bottom) lower-bound contribution yet
+    BOUND_SKIPPED = 1, // derives from a right-side union arm that some instance of
+                       // the query does not take (`union_arm_uncertain`): such an
+                       // instance makes none of the bindings found there
+    BOUND_PROXY   = 2, // derives from another variable's declared bounds: a lower
+                       // bound found there need not exist for every instance (a
+                       // `==`-equal rep of the query need not bind this var at all),
+                       // while an invariant parameter of the bound is taken to be
+                       // shared by every member
+    BOUND_EQ      = 3, // derives from a query value reached through an `==`
+                       // equality wrapper (`Type{A}`): every `==`-equal rep of the
+                       // query also binds this var, but only to an `==`-equal value
+    BOUND_EGAL    = 4, // derives from an egality-pinned position (`TypeEgal`/type
+                       // tag): the value is `===`-certain
 } jl_bound_certainty_t;
 
 // Linked list storing the type variable environment. A new jl_varbinding_t
@@ -121,6 +125,10 @@ typedef struct jl_varbinding_t {
     int8_t lb_required;  // a lower-bound contribution came from a covariant tuple
                          // element that is present in every concrete member of
                          // the current left-side branch
+    int8_t inv_certainty; // strongest channel (jl_bound_certainty_t) in which an
+                          // invariant occurrence was recorded; such an occurrence
+                          // pins the var for every instance of the query unless it
+                          // was recorded in a context some instance skips
     int8_t lb_spell;     // spelling authority (`jl_stenv_t.spell_channel`) of the
                          // contribution that supplied the current `lb` OBJECT.
                          // Among `==`-equal spellings the runtime binding takes
@@ -174,9 +182,10 @@ typedef struct JL_GC_TRACKED_TYPE jl_stenv_t {
                               // (`Type{A}` matched by `==`), to BOUND_PROXY inside
                               // a bounds-consistency check on a typevar-containing
                               // x-term (whose bindings derive from another var's
-                              // declared bounds rather than from a query value) and
-                              // inside a right-side union arm that an instance of
-                              // the left side may not take (`union_arm_uncertain`)
+                              // declared bounds rather than from a query value), to
+                              // BOUND_SKIPPED inside a right-side union arm that an
+                              // instance of the left side may not take
+                              // (`union_arm_uncertain`)
     int value_descent;        // true inside a bounds-consistency check on a closed
                               // x-term: the x-term is then a concrete type OBJECT
                               // (a candidate variable bound), so structural descent
@@ -391,8 +400,9 @@ static int current_env_length(jl_stenv_t *e)
 }
 
 // Per-var saved env layout:
-// [occurs_inv, occurs_cov, cov_diag, max_offset, lb_certainty, lb_required, lb_spell].
-#define JL_SAVEDENV_BYTES_PER_VAR 7
+// [occurs_inv, occurs_cov, cov_diag, max_offset, lb_certainty, lb_required, lb_spell,
+//  inv_certainty].
+#define JL_SAVEDENV_BYTES_PER_VAR 8
 
 // Combined covariance count used for diagonal-rule decisions: the max of the
 // counter for the current consistency-check scope and the largest count
@@ -407,7 +417,7 @@ typedef struct {
     int8_t *buf;
     int rdepth;
     int diverged;
-    int8_t _space[56]; // == 8 * JL_SAVEDENV_BYTES_PER_VAR
+    int8_t _space[64]; // == 8 * JL_SAVEDENV_BYTES_PER_VAR
     jl_gcframe_t gcframe;
     jl_value_t *roots[24]; // == 8 * 3 (lb, ub, innervars)
 } jl_savedenv_t;
@@ -455,6 +465,7 @@ static void re_save_env(jl_stenv_t *e, jl_savedenv_t *se, int root)
         se->buf[j++] = v->lb_certainty;
         se->buf[j++] = v->lb_required;
         se->buf[j++] = v->lb_spell;
+        se->buf[j++] = v->inv_certainty;
         v = v->prev;
     }
     assert(i == nroots); (void)nroots;
@@ -559,6 +570,7 @@ static void restore_env(jl_stenv_t *e, jl_savedenv_t *se, int root) JL_NOTSAFEPO
         v->lb_certainty = se->buf[j++];
         v->lb_required = se->buf[j++];
         v->lb_spell = se->buf[j++];
+        v->inv_certainty = se->buf[j++];
         v = v->prev;
     }
     assert(i == nroots); (void)nroots;
@@ -1048,6 +1060,8 @@ static void record_var_occurrence(jl_varbinding_t *vb, jl_stenv_t *e, jl_param_p
         if (param == PARAM_INVARIANT && e->invdepth > vb->depth0) {
             if (vb->occurs_inv < 2)
                 vb->occurs_inv++;
+            if (vb->inv_certainty < e->bound_channel)
+                vb->inv_certainty = e->bound_channel;
         }
         else if (vb->occurs_cov < 2) {
             vb->occurs_cov++;
@@ -1722,7 +1736,10 @@ static jl_value_t *subtype_unionall_envout_value(jl_value_t *t, jl_unionall_t *u
 {
     if (vb->intvalued && lb == (jl_value_t*)jl_any_type)
         return (jl_value_t*)jl_wrap_vararg(NULL, NULL, 0, 0); // special token result that represents N::Int in the envout
-    if (!vb->occurs_inv && lb != jl_bottom_type) {
+    // an invariant occurrence recorded in a context some instance skips does not pin
+    // the var for every instance: its bounds then count like lower bounds found there
+    int inv_pinned = vb->inv_certainty > BOUND_SKIPPED;
+    if (!inv_pinned && lb != jl_bottom_type) {
         if (is_leaf_bound(lb)) {
             jl_value_t *marker = eq_pinned_envout_marker(u, vb, lb, new_tvar, constrained);
             if (marker)
@@ -1751,7 +1768,7 @@ static jl_value_t *subtype_unionall_envout_value(jl_value_t *t, jl_unionall_t *u
         *new_tvar = (jl_value_t*)jl_new_typevar(u->var->name, jl_bottom_type, lb);
         return wrap_tvar_env(*new_tvar, constrained);
     }
-    if (lb == vb->ub || lb != jl_bottom_type) {
+    if (inv_pinned && (lb == vb->ub || lb != jl_bottom_type)) {
         // TODO (lb != jl_bottom_type): for now return the least solution, which is what
         // method parameters expect.
         if (vb->tainted_inner || has_universal_typevar(lb, e))
@@ -1942,9 +1959,12 @@ static int subtype_unionall(jl_value_t *t, jl_unionall_t *u, jl_stenv_t *e, int8
         // however, is present in every concrete member even when the tuple tail
         // length is free, so a statically constraining right-side element at that
         // position records `lb_required` while matching that tuple element.
-        // A right-side union arm that some member may not take is a BOUND_PROXY
-        // context as well: `Any <: Union{Nothing,S}` binds `S`, but `nothing` does not.
-        int eff_constrained = (vb.occurs_inv ||
+        // A right-side union arm that some member may not take (BOUND_SKIPPED) is
+        // such a context as well: `Any <: Union{Nothing,S}` binds `S`, but `nothing`
+        // does not. Nor does an invariant occurrence in such an arm pin the var:
+        // `AbstractVector{Int} <: Union{Vector{Int},AbstractVector{S}}` pins `S`,
+        // but `Vector{Int}` matches the closed arm.
+        int eff_constrained = (vb.inv_certainty > BOUND_SKIPPED ||
             (cov_count(&vb) && u->var->lb == jl_bottom_type &&
              (vb.lb_certainty > BOUND_PROXY || vb.lb_required)));
         jl_value_t *val = subtype_unionall_envout_value(t, u, e, &vb, lb, &new_tvar,
@@ -2926,17 +2946,17 @@ static int subtype(jl_value_t *x, jl_value_t *y, jl_stenv_t *e, jl_param_pos_t p
             jl_value_t *arm = pick_union_element(y, e, 1);
             if (e->instance_envout && (e->diverged || union_arm_uncertain(x, y, arm, e))) {
                 // An instance of `x` may be matched by another arm, so the bindings
-                // made while matching this one need not exist for it: like a declared
-                // bound (`subtype_ccheck`), the arm is a BOUND_PROXY context, and no
-                // tuple element inside it is present in every instance either.
+                // made while matching this one need not exist for it: the arm is a
+                // BOUND_SKIPPED context, and no tuple element inside it is present in
+                // every instance either.
                 e->diverged = 1;
                 int saved_channel = e->bound_channel;
                 int saved_spell = e->spell_channel;
                 int saved_required = e->ignore_lb_required;
-                if (e->bound_channel > BOUND_PROXY)
-                    e->bound_channel = BOUND_PROXY;
-                if (e->spell_channel > BOUND_PROXY)
-                    e->spell_channel = BOUND_PROXY;
+                if (e->bound_channel > BOUND_SKIPPED)
+                    e->bound_channel = BOUND_SKIPPED;
+                if (e->spell_channel > BOUND_SKIPPED)
+                    e->spell_channel = BOUND_SKIPPED;
                 e->ignore_lb_required = 1;
                 int sub = subtype(x, arm, e, param);
                 e->bound_channel = saved_channel;
@@ -6223,6 +6243,9 @@ static int merge_env(jl_stenv_t *e, jl_savedenv_t *me, jl_savedenv_t *se, int co
         // weakest contributor
         if (v->lb_spell < me->buf[m+6])
             me->buf[m+6] = v->lb_spell;
+        // an invariant pin holds for every member only if every branch made it
+        if (v->inv_certainty < me->buf[m+7])
+            me->buf[m+7] = v->inv_certainty;
         m = m + JL_SAVEDENV_BYTES_PER_VAR;
         n = n + 3;
         v = v->prev;

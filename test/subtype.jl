@@ -3129,6 +3129,26 @@ end
 @test intersection_env(Tuple{Vector{Any},Any}, Tuple{Vector{S},Union{Nothing,S}} where S)[2] === Core.svec(Any)
 @test intersection_env(Tuple{Tuple{Int,DataType}}, Tuple{Union{Tuple{Int,Type{Int}},Tuple{S,Any}}} where S)[2] === Core.svec(Int)
 @test intersection_env(Tuple{Core.TypeEgal{Float64}}, Tuple{Union{Type{Int},Type{S}}} where S)[2] === Core.svec(Float64)
+# Nor does an invariant occurrence in such an arm pin the var: `Vector{Int}` matches
+# the closed arm, and `Vector{Int}` the first arm with `S = Int` from the first slot
+for (lhs, rhs) in ((Tuple{AbstractVector{Int}}, Tuple{Union{Vector{Int},AbstractVector{S}}} where S),
+                   (Tuple{Vector}, Tuple{Union{Vector{Int},Vector{S}}} where S),
+                   (Tuple{Type}, Tuple{Union{Type{Int},Type{S}}} where S),
+                   (Tuple{DenseVector{Int},Vector{String}},
+                    Tuple{Union{Vector{S},DenseVector{Int}},Union{Vector{S},DenseVector{String}}} where S))
+    e = only(intersection_env(lhs, rhs)[2])
+    @test e isa Core.SimpleVector && e[1] isa TypeVar && !e[2]
+end
+let e = intersection_env(Tuple{AbstractVector{Integer},Integer},
+                         Tuple{Union{Vector{Integer},AbstractVector{T}},T} where T)[2]
+    # `T = Int` for `(Vector{Integer}, 1)`, which takes the closed arm
+    @test only(e) isa Core.SimpleVector && only(e)[1] isa TypeVar && only(e)[2] && only(e)[1].lb === Union{}
+end
+# while an occurrence that every member reaches still pins the var
+@test intersection_env(Tuple{AbstractVector{Int},Int}, Tuple{Union{Vector{Int},AbstractVector{T}},T} where T)[2] === Core.svec(Int)
+# and concrete signatures keep their exact bindings
+@test intersection_env(Tuple{Vector{Float64}}, Tuple{Union{Vector{Int},AbstractVector{S}}} where S)[2] === Core.svec(Float64)
+@test intersection_env(Tuple{Tuple{Int,Int}}, Tuple{Union{Tuple{Int,Nothing},Tuple{S,Any}}} where S)[2] === Core.svec(Int)
 # A fixed tuple prefix before a free vararg length guarantees a matching
 # right-side tuple element exists, but range and maybe-empty tuple tails do not.
 let rhs = Tuple{typeof(intersection_env), Type{<:Tuple{Vararg{E}}}} where E

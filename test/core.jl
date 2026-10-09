@@ -9239,6 +9239,19 @@ t63514(x::Union{Type{Int},S}) where {S} = @isdefined(S) ? S : false
 u63514(x::Union{Tuple{Int,Nothing},Tuple{S,Any}}) where {S} = @isdefined(S) ? S : false
 @test (r -> u63514(r[]))(Ref{Tuple{Int,Any}}((1, nothing))) === u63514((1, nothing)) === false
 @test (r -> u63514(r[]))(Ref{Tuple{Int,Any}}((1, 2.0))) === u63514((1, 2.0)) === Int
+# including a static parameter that occurs invariantly in the arm
+h_sparam_union_arm(x::Union{Vector{Int},AbstractVector{S}}) where {S} = @isdefined(S) ? S : false
+v_sparam_union_arm(x::Union{Vector{Int},AbstractVector{S}}) where {S} = S
+let r = Ref{AbstractVector{Int}}([1])
+    @test (r -> h_sparam_union_arm(r[]))(r) === h_sparam_union_arm([1]) === false
+    @test_throws UndefVarError (r -> v_sparam_union_arm(r[]))(r)
+    @test (r -> h_sparam_union_arm(r[]))(Ref{AbstractVector}([1.0])) === Float64
+end
+# or in an arm that the abstract argument type is sent to by the bindings of an
+# earlier argument, when a concrete one would not be
+w_sparam_union_arm(a::S, b::Union{Vector{S},DenseVector{W}}) where {S,W} = @isdefined(W) ? W : false
+@test (r -> w_sparam_union_arm(r[], [1]))(Ref{Integer}(1)) === w_sparam_union_arm(1, [1]) === false
+@test (r -> w_sparam_union_arm(r[], [1]))(Ref{Integer}(Int8(1))) === w_sparam_union_arm(Int8(1), [1]) === Int
 
 # Static parameters constrained indirectly through other static-parameter bounds
 # are defined.
