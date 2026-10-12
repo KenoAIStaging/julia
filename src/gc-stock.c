@@ -3139,6 +3139,16 @@ static void gc_mark_roots(jl_gc_markqueue_t *mq) JL_NOTSAFEPOINT
         gc_try_claim_and_push(mq, v, NULL);
         gc_heap_snapshot_record_array_edge_index((jl_value_t*)jl_anytuple_type_type, (jl_value_t*)v, i);
     }
+    for (size_t i = 0; i < N_SUBTYPE_DECLARED_CACHE; i++) {
+        jl_svec_t *v = jl_atomic_load_relaxed(&jl_subtype_declared_cache[i]);
+        gc_try_claim_and_push(mq, v, NULL);
+        gc_heap_snapshot_record_gc_roots((jl_value_t*)v, "subtype_declared_cache");
+    }
+    for (size_t i = 0; i < N_SUBTYPE_FREE_CELLS; i++) {
+        jl_value_t *v = jl_atomic_load_relaxed(&jl_subtype_free_cells[i]);
+        gc_try_claim_and_push(mq, v, NULL);
+        gc_heap_snapshot_record_gc_roots(v, "subtype_free_cells");
+    }
     gc_try_claim_and_push(mq, _jl_debug_method_invalidation, NULL);
     gc_heap_snapshot_record_gc_roots((jl_value_t*)_jl_debug_method_invalidation, "debug_method_invalidation");
     // constants

@@ -529,6 +529,12 @@ extern JL_DLLEXPORT jl_value_t *jl_compile_and_emit_func JL_GLOBALLY_ROOTED;
 extern JL_DLLEXPORT size_t jl_typeinf_world;
 extern JL_DLLEXPORT jl_value_t *jl_libdl_dlopen_func JL_GLOBALLY_ROOTED;
 extern _Atomic(jl_typemap_entry_t*) call_cache[N_CALL_CACHE] JL_GLOBALLY_ROOTED;
+// the cells of the binders' declared bounds for subtyping, and the threads'
+// free lists of cells (see subtype.c)
+#define N_SUBTYPE_DECLARED_CACHE 4096
+extern _Atomic(jl_svec_t*) jl_subtype_declared_cache[N_SUBTYPE_DECLARED_CACHE] JL_GLOBALLY_ROOTED;
+#define N_SUBTYPE_FREE_CELLS 256
+extern _Atomic(jl_value_t*) jl_subtype_free_cells[N_SUBTYPE_FREE_CELLS] JL_GLOBALLY_ROOTED;
 
 void free_stack(void *stkbuf, size_t bufsz) JL_NOTSAFEPOINT;
 
