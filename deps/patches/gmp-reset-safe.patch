@@ -1,0 +1,796 @@
+diff -ru a/gmp-impl.h b/gmp-impl.h
+--- a/gmp-impl.h
++++ b/gmp-impl.h
+@@ -2065,6 +2065,42 @@
+     __x->_mp_d = TMP_ALLOC_LIMBS (NLIMBS);				\
+   } while (0)
+ 
++/* Asynchronous interruption.
++
++   An application may abandon a GMP function at an arbitrary instruction,
++   for instance by a longjmp out of a signal handler or out of one of its
++   memory functions (Julia does both to cancel a computation).  The
++   outputs of the abandoned operation then hold unspecified values, and
++   memory may leak, but each mpz_t (including the numerator and
++   denominator of an mpq_t) remains well-formed, so that it may still be
++   read, written as an output, or cleared:
++
++     - ABSIZ (z) <= ALLOC (z), and PTR (z) points to at least ALLOC (z)
++       limbs of live memory;
++     - if ALLOC (z) != 0, the block at PTR (z) was obtained from the
++       memory functions and no other mpz_t owns it (has it as PTR with a
++       nonzero ALLOC).
++
++   Code that updates SIZ, PTR and ALLOC of an mpz_t (or swaps blocks
++   between two of them) does so in an order that keeps these conditions
++   after every store: for instance SIZ is raised only once a block of that
++   size is installed, and a new block is installed under the smaller of
++   the old and new ALLOC.  Where consecutive stores depend on this order,
++   GMP_SIGNAL_FENCE keeps the compiler from merging or reordering them.
++   (A call through the memory function pointers is opaque to the compiler,
++   so stores made before such a call are already complete when it starts.)
++   The interruption is assumed to run on the same thread, so no hardware
++   fence is needed.  */
++#if defined (__GNUC__) || defined (__clang__)
++#define GMP_SIGNAL_FENCE()  __asm__ __volatile__ ("" ::: "memory")
++#elif defined (__STDC_VERSION__) && __STDC_VERSION__ >= 201112L \
++  && ! defined (__STDC_NO_ATOMICS__) && ! defined (__cplusplus)
++#include <stdatomic.h>
++#define GMP_SIGNAL_FENCE()  atomic_signal_fence (memory_order_seq_cst)
++#else
++#define GMP_SIGNAL_FENCE()  do {} while (0)
++#endif
++
+ #if WANT_ASSERT
+ static inline void *
+ _mpz_newalloc (mpz_ptr z, mp_size_t n)
+diff -ru a/mpq/clear.c b/mpq/clear.c
+--- a/mpq/clear.c
++++ b/mpq/clear.c
+@@ -34,8 +34,6 @@
+ void
+ mpq_clear (mpq_ptr x)
+ {
+-  if (ALLOC (NUM(x)))
+-    __GMP_FREE_FUNC_LIMBS (PTR(NUM(x)), ALLOC(NUM(x)));
+-  if (ALLOC (DEN(x)))
+-    __GMP_FREE_FUNC_LIMBS (PTR(DEN(x)), ALLOC(DEN(x)));
++  mpz_clear (NUM(x));
++  mpz_clear (DEN(x));
+ }
+diff -ru a/mpq/clears.c b/mpq/clears.c
+--- a/mpq/clears.c
++++ b/mpq/clears.c
+@@ -40,10 +40,7 @@
+ 
+   do
+     {
+-      if (ALLOC (NUM(x)))
+-	__GMP_FREE_FUNC_LIMBS (PTR(NUM(x)), ALLOC(NUM(x)));
+-      if (ALLOC (DEN(x)))
+-	__GMP_FREE_FUNC_LIMBS (PTR(DEN(x)), ALLOC(DEN(x)));
++      mpq_clear (x);
+       x = va_arg (ap, mpq_ptr);
+     }
+   while (x != NULL);
+diff -ru a/mpq/div.c b/mpq/div.c
+--- a/mpq/div.c
++++ b/mpq/div.c
+@@ -57,16 +57,11 @@
+ 
+       /* We checked for op1 == op2: we are not in the x=x/x case.
+ 	 We compute x=y/x by computing x=inv(x)*y */
+-      MPN_PTR_SWAP (PTR(NUM(quot)), ALLOC(NUM(quot)),
+-		    PTR(DEN(quot)), ALLOC(DEN(quot)));
+-      if (op2_size > 0)
++      mpz_swap (NUM(quot), DEN(quot));
++      /* Keep the denominator positive.  */
++      if (op2_size < 0)
+ 	{
+-	  SIZ(NUM(quot)) = SIZ(DEN(quot));
+-	  SIZ(DEN(quot)) = op2_size;
+-	}
+-      else
+-	{
+-	  SIZ(NUM(quot)) = - SIZ(DEN(quot));
++	  SIZ(NUM(quot)) = - SIZ(NUM(quot));
+ 	  SIZ(DEN(quot)) = - op2_size;
+ 	}
+       mpq_mul (quot, quot, op1);
+diff -ru a/mpq/inp_str.c b/mpq/inp_str.c
+--- a/mpq/inp_str.c
++++ b/mpq/inp_str.c
+@@ -42,8 +42,8 @@
+   if (fp == NULL)
+     fp = stdin;
+ 
+-  SIZ(DEN(q)) = 1;
+   MPZ_NEWALLOC (DEN(q), 1)[0] = 1;
++  SIZ(DEN(q)) = 1;
+ 
+   nread = mpz_inp_str (mpq_numref(q), fp, base);
+   if (nread == 0)
+diff -ru a/mpq/inv.c b/mpq/inv.c
+--- a/mpq/inv.c
++++ b/mpq/inv.c
+@@ -45,26 +45,26 @@
+   else if (UNLIKELY (num_size == 0))
+     DIVIDE_BY_ZERO;
+ 
+-  SIZ(DEN(dest)) = num_size;
+-  SIZ(NUM(dest)) = den_size;
+-
+-  /* If dest == src we may just swap the numerator and denominator;
+-     we ensured that the new denominator is positive.  */
++  /* If dest == src we may just swap the numerator and denominator.  */
+ 
+   if (dest == src)
+     {
+-      MP_PTR_SWAP (PTR(NUM(dest)), PTR(DEN(dest)));
+-      MP_SIZE_T_SWAP (ALLOC(NUM(dest)), ALLOC(DEN(dest)));
++      mpz_swap (NUM(dest), DEN(dest));
+     }
+   else
+     {
+       mp_ptr dp;
+ 
+-      den_size = ABS (den_size);
+-      dp = MPZ_NEWALLOC (NUM(dest), den_size);
+-      MPN_COPY (dp, PTR(DEN(src)), den_size);
++      dp = MPZ_NEWALLOC (NUM(dest), ABS (den_size));
++      MPN_COPY (dp, PTR(DEN(src)), ABS (den_size));
+ 
+       dp = MPZ_NEWALLOC (DEN(dest), num_size);
+       MPN_COPY (dp, PTR(NUM(src)), num_size);
+     }
++
++  /* Set the sizes only once blocks of these sizes are in place (see
++     "Asynchronous interruption" in gmp-impl.h); we ensured that the new
++     denominator is positive.  */
++  SIZ(DEN(dest)) = num_size;
++  SIZ(NUM(dest)) = den_size;
+ }
+diff -ru a/mpq/md_2exp.c b/mpq/md_2exp.c
+--- a/mpq/md_2exp.c
++++ b/mpq/md_2exp.c
+@@ -101,8 +101,8 @@
+   if (SIZ(NUM(src)) == 0)
+     {
+       SIZ(NUM(dst)) = 0;
+-      SIZ(DEN(dst)) = 1;
+       MPZ_NEWALLOC (DEN(dst), 1)[0] = 1;
++      SIZ(DEN(dst)) = 1;
+       return;
+     }
+ 
+diff -ru a/mpq/set.c b/mpq/set.c
+--- a/mpq/set.c
++++ b/mpq/set.c
+@@ -39,13 +39,13 @@
+   mp_ptr dp;
+ 
+   num_size = SIZ(NUM(src));
+-  SIZ(NUM(dest)) = num_size;
+   abs_num_size = ABS (num_size);
+   dp = MPZ_NEWALLOC (NUM(dest), abs_num_size);
++  SIZ(NUM(dest)) = num_size;
+   MPN_COPY (dp, PTR(NUM(src)), abs_num_size);
+ 
+   den_size = SIZ(DEN(src));
+-  SIZ(DEN(dest)) = den_size;
+   dp = MPZ_NEWALLOC (DEN(dest), den_size);
++  SIZ(DEN(dest)) = den_size;
+   MPN_COPY (dp, PTR(DEN(src)), den_size);
+ }
+diff -ru a/mpq/set_d.c b/mpq/set_d.c
+--- a/mpq/set_d.c
++++ b/mpq/set_d.c
+@@ -76,8 +76,8 @@
+       if (d == 0.0)
+ 	{
+ 	  SIZ(NUM(dest)) = 0;
+-	  SIZ(DEN(dest)) = 1;
+ 	  MPZ_NEWALLOC (DEN(dest), 1)[0] = 1;
++	  SIZ(DEN(dest)) = 1;
+ 	  return;
+ 	}
+ 
+diff -ru a/mpq/set_den.c b/mpq/set_den.c
+--- a/mpq/set_den.c
++++ b/mpq/set_den.c
+@@ -38,8 +38,8 @@
+   mp_size_t abs_size = ABS (size);
+   mp_ptr dp;
+ 
+-  SIZ(DEN(dest)) = size;
+   dp = MPZ_NEWALLOC (DEN(dest), abs_size);
++  SIZ(DEN(dest)) = size;
+ 
+   MPN_COPY (dp, PTR(den), abs_size);
+ }
+diff -ru a/mpq/set_f.c b/mpq/set_f.c
+--- a/mpq/set_f.c
++++ b/mpq/set_f.c
+@@ -45,8 +45,8 @@
+     {
+       /* set q=0 */
+       SIZ(NUM(q)) = 0;
+-      SIZ(DEN(q)) = 1;
+       MPZ_NEWALLOC (DEN(q), 1)[0] = 1;
++      SIZ(DEN(q)) = 1;
+       return;
+     }
+ 
+@@ -64,8 +64,8 @@
+       MPN_COPY (num_ptr + fexp - abs_fsize, fptr, abs_fsize);
+ 
+       SIZ(NUM(q)) = fsize >= 0 ? fexp : -fexp;
+-      SIZ(DEN(q)) = 1;
+       MPZ_NEWALLOC (DEN(q), 1)[0] = 1;
++      SIZ(DEN(q)) = 1;
+     }
+   else
+     {
+diff -ru a/mpq/set_num.c b/mpq/set_num.c
+--- a/mpq/set_num.c
++++ b/mpq/set_num.c
+@@ -38,8 +38,8 @@
+   mp_size_t abs_size = ABS (size);
+   mp_ptr dp;
+ 
+-  SIZ(NUM(dest)) = size;
+   dp = MPZ_NEWALLOC (NUM(dest), abs_size);
++  SIZ(NUM(dest)) = size;
+ 
+   MPN_COPY (dp, PTR(num), abs_size);
+ }
+diff -ru a/mpq/set_str.c b/mpq/set_str.c
+--- a/mpq/set_str.c
++++ b/mpq/set_str.c
+@@ -48,8 +48,8 @@
+   slash = strchr (str, '/');
+   if (slash == NULL)
+     {
+-      SIZ(DEN(q)) = 1;
+       MPZ_NEWALLOC (DEN(q), 1)[0] = 1;
++      SIZ(DEN(q)) = 1;
+ 
+       return mpz_set_str (mpq_numref(q), str, base);
+     }
+diff -ru a/mpq/set_z.c b/mpq/set_z.c
+--- a/mpq/set_z.c
++++ b/mpq/set_z.c
+@@ -38,9 +38,9 @@
+   mp_ptr dp;
+ 
+   num_size = SIZ (src);
+-  SIZ(NUM(dest)) = num_size;
+   abs_num_size = ABS (num_size);
+   dp = MPZ_NEWALLOC (NUM(dest), abs_num_size);
++  SIZ(NUM(dest)) = num_size;
+   MPN_COPY (dp, PTR(src), abs_num_size);
+ 
+   MPZ_NEWALLOC (DEN(dest), 1)[0] = 1;
+diff -ru a/mpq/swap.c b/mpq/swap.c
+--- a/mpq/swap.c
++++ b/mpq/swap.c
+@@ -33,10 +33,7 @@
+ void
+ mpq_swap (mpq_ptr u, mpq_ptr v) __GMP_NOTHROW
+ {
+-  MP_SIZE_T_SWAP (ALLOC(NUM(u)), ALLOC(NUM(v)));
+-  MP_SIZE_T_SWAP (ALLOC(DEN(u)), ALLOC(DEN(v)));
+-  MP_SIZE_T_SWAP (SIZ(NUM(u)), SIZ(NUM(v)));
+-  MP_SIZE_T_SWAP (SIZ(DEN(u)), SIZ(DEN(v)));
+-  MP_PTR_SWAP (PTR(NUM(u)), PTR(NUM(v)));
+-  MP_PTR_SWAP (PTR(DEN(u)), PTR(DEN(v)));
++  /* mpz_swap keeps each part well-formed throughout.  */
++  mpz_swap (NUM(u), NUM(v));
++  mpz_swap (DEN(u), DEN(v));
+ }
+diff -ru a/mpz/and.c b/mpz/and.c
+--- a/mpz/and.c
++++ b/mpz/and.c
+@@ -64,8 +64,9 @@
+ 	    /* Don't re-read op1_ptr and op2_ptr.  Since res_size <=
+ 	       MIN(op1_size, op2_size), res is not changed when op1
+ 	       is identical to res or op2 is identical to res.  */
++	    res_ptr = MPZ_NEWALLOC (res, res_size);
+ 	    SIZ (res) = res_size;
+-	    mpn_and_n (MPZ_NEWALLOC (res, res_size), op1_ptr, op2_ptr, res_size);
++	    mpn_and_n (res_ptr, op1_ptr, op2_ptr, res_size);
+ 	    return;
+ 	  }
+ 
+diff -ru a/mpz/bin_ui.c b/mpz/bin_ui.c
+--- a/mpz/bin_ui.c
++++ b/mpz/bin_ui.c
+@@ -376,8 +376,8 @@
+     {
+       if (k == 0)
+ 	{
+-	  SIZ (r) = 1;
+ 	  MPZ_NEWALLOC (r, 1)[0] = 1;
++	  SIZ (r) = 1;
+ 	}
+ #if APARTAJ_KALKULOJ > 2
+       else if (k > 1)
+diff -ru a/mpz/clear.c b/mpz/clear.c
+--- a/mpz/clear.c
++++ b/mpz/clear.c
+@@ -35,6 +35,20 @@
+ void
+ mpz_clear (mpz_ptr x)
+ {
+-  if (ALLOC (x))
+-    __GMP_FREE_FUNC_LIMBS (PTR (x), ALLOC(x));
++  static const mp_limb_t dummy_limb=0xc1a0;
++  mp_ptr p = PTR (x);
++  mp_size_t alloc = ALLOC (x);
++
++  if (alloc)
++    {
++      /* Leave X as mpz_init does before freeing the block, so that X is
++	 still well-formed and does not refer to freed memory if this is
++	 abandoned (see "Asynchronous interruption" in gmp-impl.h).  */
++      SIZ (x) = 0;
++      GMP_SIGNAL_FENCE ();
++      ALLOC (x) = 0;
++      GMP_SIGNAL_FENCE ();
++      PTR (x) = (mp_ptr) &dummy_limb;
++      __GMP_FREE_FUNC_LIMBS (p, alloc);
++    }
+ }
+diff -ru a/mpz/clears.c b/mpz/clears.c
+--- a/mpz/clears.c
++++ b/mpz/clears.c
+@@ -40,8 +40,7 @@
+ 
+   do
+     {
+-      if (ALLOC (x))
+-	__GMP_FREE_FUNC_LIMBS (PTR (x), ALLOC (x));
++      mpz_clear (x);
+       x = va_arg (ap, mpz_ptr);
+     }
+   while (x != NULL);
+diff -ru a/mpz/gcd.c b/mpz/gcd.c
+--- a/mpz/gcd.c
++++ b/mpz/gcd.c
+@@ -53,36 +53,38 @@
+   /* GCD(0, V) == V.  */
+   if (usize == 0)
+     {
++      if (g != v)
++	{
++	  tp = MPZ_NEWALLOC (g, vsize);
++	  MPN_COPY (tp, vp, vsize);
++	}
+       SIZ (g) = vsize;
+-      if (g == v)
+-	return;
+-      tp = MPZ_NEWALLOC (g, vsize);
+-      MPN_COPY (tp, vp, vsize);
+       return;
+     }
+ 
+   /* GCD(U, 0) == U.  */
+   if (vsize == 0)
+     {
++      if (g != u)
++	{
++	  tp = MPZ_NEWALLOC (g, usize);
++	  MPN_COPY (tp, up, usize);
++	}
+       SIZ (g) = usize;
+-      if (g == u)
+-	return;
+-      tp = MPZ_NEWALLOC (g, usize);
+-      MPN_COPY (tp, up, usize);
+       return;
+     }
+ 
+   if (usize == 1)
+     {
+-      SIZ (g) = 1;
+       MPZ_NEWALLOC (g, 1)[0] = mpn_gcd_1 (vp, vsize, up[0]);
++      SIZ (g) = 1;
+       return;
+     }
+ 
+   if (vsize == 1)
+     {
+-      SIZ(g) = 1;
+       MPZ_NEWALLOC (g, 1)[0] = mpn_gcd_1 (up, usize, vp[0]);
++      SIZ(g) = 1;
+       return;
+     }
+ 
+diff -ru a/mpz/gcdext.c b/mpz/gcdext.c
+--- a/mpz/gcdext.c
++++ b/mpz/gcdext.c
+@@ -76,8 +76,8 @@
+ 	SIZ (t) = 0;
+       if (s != NULL)
+ 	{
+-	  SIZ (s) = ssize;
+ 	  MPZ_NEWALLOC (s, 1)[0] = 1;
++	  SIZ (s) = ssize;
+ 	}
+       return;
+     }
+diff -ru a/mpz/mul.c b/mpz/mul.c
+--- a/mpz/mul.c
++++ b/mpz/mul.c
+@@ -103,25 +103,22 @@
+   wsize = usize + vsize;
+   if (ALLOC (w) < wsize)
+     {
+-      /* Allocate-install-free-last (mirroring _mpz_realloc), so W stays
+-	 structurally valid at every interruptible point: an asynchronous
+-	 unwind (e.g. Julia task cancellation delivered inside the
+-	 allocation hook) between any two statements leaves PTR/ALLOC/SIZ
+-	 mutually consistent, at worst leaking the just-allocated block.
+-	 The previous order freed the old limbs and raised ALLOC before the
+-	 new block was installed, so an unwind there left W pointing at
+-	 freed memory with an overstated capacity, which a later mpz_clear
+-	 double-freed.  */
++      /* Install a new block and free the old one last (mirroring
++	 _mpz_realloc), so W stays well-formed if this is abandoned (see
++	 "Asynchronous interruption" in gmp-impl.h), at worst leaking a
++	 block.  The old value is not copied, so first make SIZ zero
++	 (usize and vsize were read above, so this is fine even when W is
++	 also an input).  As old_alloc < wsize, installing PTR before ALLOC
++	 never makes ALLOC exceed the block.  */
+       mp_ptr old_wp = wp;
+       mp_size_t old_alloc = ALLOC (w);
+       wp = __GMP_ALLOCATE_FUNC_LIMBS (wsize);
+-      PTR (w) = wp;
+-      /* The old value is not copied; don't let SIZ describe uninitialized
+-	 limbs if the operation is unwound before the final SIZ store.
+-	 (usize/vsize were captured above - clearing SIZ is safe even when
+-	 W aliases an input.)  */
+       SIZ (w) = 0;
++      GMP_SIGNAL_FENCE ();
++      PTR (w) = wp;
++      GMP_SIGNAL_FENCE ();
+       ALLOC (w) = wsize;
++      GMP_SIGNAL_FENCE ();
+       if (old_alloc != 0)
+ 	{
+ 	  if (old_wp == up || old_wp == vp)
+diff -ru a/mpz/powm.c b/mpz/powm.c
+--- a/mpz/powm.c
++++ b/mpz/powm.c
+@@ -84,8 +84,11 @@
+ 	{
+ 	  /* b^0 mod m,  b is anything and m is non-zero.
+ 	     Result is 1 mod m, i.e., 1 or 0 depending on if m = 1.  */
+-	  SIZ(r) = n != 1 || mp[0] != 1;
++	  /* Set SIZ after the limb (keeping SIZ <= ALLOC throughout), but
++	     test M first: R may be M.  */
++	  mp_size_t rn = n != 1 || mp[0] != 1;
+ 	  MPZ_NEWALLOC (r, 1)[0] = 1;
++	  SIZ(r) = rn;
+ 	  TMP_FREE;	/* we haven't really allocated anything here */
+ 	  return;
+ 	}
+diff -ru a/mpz/powm_sec.c b/mpz/powm_sec.c
+--- a/mpz/powm_sec.c
++++ b/mpz/powm_sec.c
+@@ -58,8 +58,11 @@
+ 	{
+ 	  /* b^0 mod m,  b is anything and m is non-zero.
+ 	     Result is 1 mod m, i.e., 1 or 0 depending on if m = 1.  */
+-	  SIZ(r) = n != 1 || mp[0] != 1;
++	  /* Set SIZ after the limb (keeping SIZ <= ALLOC throughout), but
++	     test M first: R may be M.  */
++	  rn = n != 1 || mp[0] != 1;
+ 	  MPZ_NEWALLOC (r, 1)[0] = 1;
++	  SIZ(r) = rn;
+ 	  return;
+ 	}
+       DIVIDE_BY_ZERO;
+diff -ru a/mpz/powm_ui.c b/mpz/powm_ui.c
+--- a/mpz/powm_ui.c
++++ b/mpz/powm_ui.c
+@@ -145,8 +145,11 @@
+ 	    }
+ 	  /* Exponent is zero, result is 1 mod M, i.e., 1 or 0 depending on if
+ 	     M equals 1.  */
+-	  SIZ(r) = mn != 1 || mp[0] != 1;
++	  /* Set SIZ after the limb (keeping SIZ <= ALLOC throughout), but
++	     test M first: R may be M.  */
++	  mp_size_t rn = mn != 1 || mp[0] != 1;
+ 	  MPZ_NEWALLOC (r, 1)[0] = 1;
++	  SIZ(r) = rn;
+ 	  return;
+ 	}
+ 
+diff -ru a/mpz/realloc.c b/mpz/realloc.c
+--- a/mpz/realloc.c
++++ b/mpz/realloc.c
+@@ -34,7 +34,8 @@
+ void *
+ _mpz_realloc (mpz_ptr m, mp_size_t new_alloc)
+ {
+-  mp_ptr mp;
++  mp_ptr mp, old_mp;
++  mp_size_t old_alloc;
+ 
+   /* Never allocate zero space. */
+   new_alloc = MAX (new_alloc, 1);
+@@ -50,40 +51,37 @@
+ 	__GMP_ALLOC_OVERFLOW_FUNC ();
+     }
+ 
+-  /* Allocate-copy-install-free-last (rather than realloc-in-place), so the
+-     mpz is structurally valid at every interruptible point: an asynchronous
+-     unwind (e.g. Julia task cancellation delivered inside GMP) between any
+-     two statements leaves PTR/ALLOC/SIZ mutually consistent, at worst
+-     leaking the block that was not yet freed.  The realloc-based version
+-     has a window where PTR (m) dangles - the old block is freed inside the
+-     allocation hook before the new pointer is stored - which a later
+-     mpz_clear would double free.  ALLOC is stepped through MIN (old, new)
+-     so that capacity is understated, never overstated, in every window.  */
++  /* Allocate a new block, copy, install it, and free the old block last,
++     rather than calling the reallocate function, which frees the old block
++     before its caller can store the new pointer: if this is abandoned (see
++     "Asynchronous interruption" in gmp-impl.h), the old block may leak but
++     M never refers to freed memory.  */
+   mp = __GMP_ALLOCATE_FUNC_LIMBS (new_alloc);
+-  if (ALLOC (m) != 0)
+-    {
+-      mp_ptr old_mp = PTR (m);
+-      mp_size_t old_alloc = ALLOC (m);
+-      mp_size_t copy_size = MIN (ABSIZ (m), MIN (old_alloc, new_alloc));
+-      if (copy_size > new_alloc)
+-	copy_size = new_alloc;
+-      MPN_COPY (mp, old_mp, copy_size);
+-
+-      /* Don't create an invalid number; if the current value doesn't fit after
+-	 reallocation, clear it to 0.  */
+-      if (UNLIKELY (ABSIZ (m) > new_alloc))
+-	SIZ (m) = 0;
+-
+-      if (new_alloc < old_alloc)
+-	ALLOC (m) = new_alloc;
+-      PTR (m) = mp;
+-      ALLOC (m) = new_alloc;
+-      __GMP_FREE_FUNC_LIMBS (old_mp, old_alloc);
+-    }
+-  else
+-    {
+-      PTR (m) = mp;
+-      ALLOC (m) = new_alloc;
+-    }
++  old_mp = PTR (m);
++  old_alloc = ALLOC (m);
++
++  /* Don't create an invalid number; if the current value doesn't fit after
++     reallocation, clear it to 0.  */
++  if (UNLIKELY (ABSIZ (m) > new_alloc))
++    SIZ (m) = 0;
++
++  /* SIZ can exceed ALLOC in a garbage output (an abandoned operation's,
++     or one deliberately left so by a caller), so bound the copy by both.  */
++  if (old_alloc != 0)
++    MPN_COPY (mp, old_mp, MIN (ABSIZ (m), old_alloc));
++
++  /* Install the new block under ALLOC = MIN (old_alloc, new_alloc), so
++     that ALLOC never exceeds the size of the block PTR points to.  */
++  GMP_SIGNAL_FENCE ();
++  if (new_alloc < old_alloc)
++    ALLOC (m) = new_alloc;
++  GMP_SIGNAL_FENCE ();
++  PTR (m) = mp;
++  GMP_SIGNAL_FENCE ();
++  ALLOC (m) = new_alloc;
++  GMP_SIGNAL_FENCE ();
++
++  if (old_alloc != 0)
++    __GMP_FREE_FUNC_LIMBS (old_mp, old_alloc);
+   return (void *) mp;
+ }
+diff -ru a/mpz/realloc2.c b/mpz/realloc2.c
+--- a/mpz/realloc2.c
++++ b/mpz/realloc2.c
+@@ -34,7 +34,8 @@
+ void
+ mpz_realloc2 (mpz_ptr m, mp_bitcnt_t bits)
+ {
+-  mp_size_t new_alloc;
++  mp_size_t new_alloc, old_alloc;
++  mp_ptr mp, old_mp;
+ 
+   bits -= (bits != 0);		/* Round down, except if 0 */
+   new_alloc = 1 + bits / GMP_NUMB_BITS;
+@@ -45,19 +46,29 @@
+ 	__GMP_ALLOC_OVERFLOW_FUNC ();
+     }
+ 
+-  if (ALLOC (m) == 0)
+-    {
+-      PTR (m) = __GMP_ALLOCATE_FUNC_LIMBS (new_alloc);
+-    }
+-  else
+-    {
+-      PTR (m) = __GMP_REALLOCATE_FUNC_LIMBS (PTR(m), ALLOC(m), new_alloc);
++  /* As in _mpz_realloc: allocate, copy, install, and free the old block
++     last, so that M stays well-formed if this is abandoned.  */
++  mp = __GMP_ALLOCATE_FUNC_LIMBS (new_alloc);
++  old_mp = PTR (m);
++  old_alloc = ALLOC (m);
+ 
+-      /* Don't create an invalid number; if the current value doesn't fit after
+-	 reallocation, clear it to 0.  */
+-      if (ABSIZ(m) > new_alloc)
+-	SIZ(m) = 0;
+-    }
++  /* Don't create an invalid number; if the current value doesn't fit after
++     reallocation, clear it to 0.  */
++  if (ABSIZ (m) > new_alloc)
++    SIZ (m) = 0;
++
++  if (old_alloc != 0)
++    MPN_COPY (mp, old_mp, MIN (ABSIZ (m), old_alloc));
++
++  GMP_SIGNAL_FENCE ();
++  if (new_alloc < old_alloc)
++    ALLOC (m) = new_alloc;
++  GMP_SIGNAL_FENCE ();
++  PTR (m) = mp;
++  GMP_SIGNAL_FENCE ();
++  ALLOC (m) = new_alloc;
++  GMP_SIGNAL_FENCE ();
+ 
+-  ALLOC(m) = new_alloc;
++  if (old_alloc != 0)
++    __GMP_FREE_FUNC_LIMBS (old_mp, old_alloc);
+ }
+diff -ru a/mpz/sqrt.c b/mpz/sqrt.c
+--- a/mpz/sqrt.c
++++ b/mpz/sqrt.c
+@@ -49,7 +49,6 @@
+ 
+   /* The size of the root is accurate after this simple calculation.  */
+   root_size = (op_size + 1) / 2;
+-  SIZ (root) = root_size;
+ 
+   op_ptr = PTR (op);
+ 
+@@ -73,4 +72,7 @@
+ 
+       mpn_sqrtrem (root_ptr, NULL, op_ptr, op_size);
+     }
++
++  /* Only now that a block of this size is in place.  */
++  SIZ (root) = root_size;
+ }
+diff -ru a/mpz/sqrtrem.c b/mpz/sqrtrem.c
+--- a/mpz/sqrtrem.c
++++ b/mpz/sqrtrem.c
+@@ -53,7 +53,6 @@
+ 
+   /* The size of the root is accurate after this simple calculation.  */
+   root_size = (op_size + 1) / 2;
+-  SIZ (root) = root_size;
+ 
+   op_ptr = PTR (op);
+ 
+@@ -79,6 +78,9 @@
+       rem_size = mpn_sqrtrem (root_ptr, rem_ptr, op_ptr, op_size);
+     }
+ 
++  /* Only now that a block of this size is in place.  */
++  SIZ (root) = root_size;
++
+   /* Write remainder size last, to make this function give only the square root
+      remainder, when passed ROOT == REM.  */
+   SIZ (rem) = rem_size;
+diff -ru a/mpz/swap.c b/mpz/swap.c
+--- a/mpz/swap.c
++++ b/mpz/swap.c
+@@ -33,7 +33,27 @@
+ void
+ mpz_swap (mpz_ptr u, mpz_ptr v) __GMP_NOTHROW
+ {
+-  MP_SIZE_T_SWAP (ALLOC(u), ALLOC(v));
+-  MP_SIZE_T_SWAP (SIZ(u), SIZ(v));
+-  MP_PTR_SWAP (PTR(v), PTR(u));
++  mp_ptr up = PTR (u), vp = PTR (v);
++  mp_size_t ualloc = ALLOC (u), valloc = ALLOC (v);
++  mp_size_t usize = SIZ (u), vsize = SIZ (v);
++
++  /* Exchange the blocks through a state where neither U nor V owns one,
++     so that each stays well-formed if this is abandoned (see
++     "Asynchronous interruption" in gmp-impl.h): no block ever has two
++     owners, and SIZ never exceeds ALLOC.  An interruption at the wrong
++     moment leaks the blocks instead.  This also works when U == V.  */
++  SIZ (u) = 0;
++  SIZ (v) = 0;
++  GMP_SIGNAL_FENCE ();
++  ALLOC (u) = 0;
++  ALLOC (v) = 0;
++  GMP_SIGNAL_FENCE ();
++  PTR (u) = vp;
++  PTR (v) = up;
++  GMP_SIGNAL_FENCE ();
++  ALLOC (u) = valloc;
++  ALLOC (v) = ualloc;
++  GMP_SIGNAL_FENCE ();
++  SIZ (u) = vsize;
++  SIZ (v) = usize;
+ }
+diff -ru a/mpz/tdiv_qr_ui.c b/mpz/tdiv_qr_ui.c
+--- a/mpz/tdiv_qr_ui.c
++++ b/mpz/tdiv_qr_ui.c
+@@ -66,8 +66,8 @@
+ 	{
+ 	  SIZ(quot) = 0;
+ 	  rl = np[0];
+-	  SIZ(rem) = ns >= 0 ? 1 : -1;
+ 	  MPZ_NEWALLOC (rem, 1)[0] = rl;
++	  SIZ(rem) = ns >= 0 ? 1 : -1;
+ 	  return rl;
+ 	}
+ 
+@@ -89,8 +89,8 @@
+ 	SIZ(rem) = 0;
+       else
+ 	{
+-	  SIZ(rem) = ns >= 0 ? 1 : -1;
+ 	  MPZ_NEWALLOC (rem, 1)[0] = rl;
++	  SIZ(rem) = ns >= 0 ? 1 : -1;
+ 	}
+       qn = nn - (qp[nn - 1] == 0);
+     }
+diff -ru a/mpz/tdiv_r.c b/mpz/tdiv_r.c
+--- a/mpz/tdiv_r.c
++++ b/mpz/tdiv_r.c
+@@ -52,8 +52,8 @@
+     {
+       if (num != rem)
+ 	{
+-	  SIZ (rem) = ns;
+ 	  rp = MPZ_NEWALLOC (rem, nl);
++	  SIZ (rem) = ns;
+ 	  np = PTR (num);
+ 	  MPN_COPY (rp, np, nl);
+ 	}
+diff -ru a/mpz/tdiv_r_ui.c b/mpz/tdiv_r_ui.c
+--- a/mpz/tdiv_r_ui.c
++++ b/mpz/tdiv_r_ui.c
+@@ -62,8 +62,8 @@
+       if (nn == 1)		/* tdiv_qr requirements; tested above for 0 */
+ 	{
+ 	  rl = np[0];
+-	  SIZ(rem) = ns >= 0 ? 1 : -1;
+ 	  MPZ_NEWALLOC (rem, 1)[0] = rl;
++	  SIZ(rem) = ns >= 0 ? 1 : -1;
+ 	  return rl;
+ 	}
+ 
+@@ -87,8 +87,8 @@
+ 	SIZ(rem) = 0;
+       else
+ 	{
+-	  SIZ(rem) = ns >= 0 ? 1 : -1;
+ 	  MPZ_NEWALLOC (rem, 1)[0] = rl;
++	  SIZ(rem) = ns >= 0 ? 1 : -1;
+ 	}
+     }
+ 
+diff -ru a/rand/randlc2x.c b/rand/randlc2x.c
+--- a/rand/randlc2x.c
++++ b/rand/randlc2x.c
+@@ -316,8 +316,8 @@
+   /* Avoid SIZ(a) == 0 to avoid checking for special case in lc().  */
+   if (SIZ (p->_mp_a) == 0)
+     {
+-      SIZ (p->_mp_a) = 1;
+       MPZ_NEWALLOC (p->_mp_a, 1)[0] = CNST_LIMB (0);
++      SIZ (p->_mp_a) = 1;
+     }
+ 
+   MPN_SET_UI (p->_cp, p->_cn, c);
