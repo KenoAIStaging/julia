@@ -2181,6 +2181,86 @@ end
     end
 end
 
+# BigInt arithmetic through the `MPZ` wrappers, whose libgmp calls are
+# `:reset_safe` when the loaded libgmp supports it (`Base.GMP.RESET_SAFE`): a
+# region published by a cancellation point stays published across a run of
+# in-place calls, so a cancellation abandons the libgmp computation itself.
+# An abandoned output has an unspecified value, but must stay a valid BigInt:
+# its limbs within its allocation, its top limb nonzero, and usable by any
+# further BigInt operation (the decimal round trip is slow for huge values).
+function _valid_bigint(x::BigInt; roundtrip::Bool=true)
+    n = abs(x.size)
+    n <= x.alloc || return false
+    n == 0 || unsafe_load(x.d, n) != 0 || return false
+    (x + 1) - 1 == x || return false
+    return !roundtrip || parse(BigInt, string(x)) == x
+end
+
+function _gmp_victim(f::HandshakeFlags, z::BigInt, n::UInt)
+    Base.@cancel_check
+    _reset_safe_handshake(f)
+    return Base.GMP.MPZ.fac_ui!(z, n)
+end
+
+@testset "cancellation lands inside libgmp compute" begin
+    # A single long libgmp call (ten seconds or more if not cancelled), stopped
+    # either by `cancel!`'s shootdown or, with only the source's state raised
+    # and no signal sent, by an allocation hook republishing the region in
+    # the middle of the computation.
+    if Threads.nthreads(:default) >= 2 && Base.GMP.RESET_SAFE[]
+        for signal in (true, false)
+            f = HandshakeFlags(false, true, false)
+            z = BigInt()
+            t, src = cancellable_spawn(() -> _gmp_victim(f, z, UInt(40_000_000)))
+            @test timedwait(() -> @atomic(:acquire, f.left), 30.0) == :ok
+            sleep(1.0) # let it get deep into the fac_ui call
+            signal ? cancel!(src) : Base._raise_state!(src, 0x1)
+            # cancelled promptly, not at call completion
+            @test timedwait(() -> istaskdone(t), 5.0) == :ok
+            wait(t; throw=false)
+            @test istaskfailed(t)
+            @test t.result isa CancellationRequest
+            @test _valid_bigint(z; roundtrip=false)
+        end
+        @test factorial(big(25)) == prod(big(1):big(25))
+    end
+end
+
+function _inplace_bigint_loop!(b::BigInt, m::BigInt)
+    while true
+        t = BigInt() # grown from scratch below, through the allocation hooks
+        Base.@cancel_check
+        Base.GMP.MPZ.add_ui!(b, b, UInt(12345))
+        Base.GMP.MPZ.mul!(t, b, b)
+        Base.GMP.MPZ.tdiv_r!(b, t, m)
+    end
+end
+
+@testset "in-place BigInt arithmetic under cancellation" begin
+    # Cancellations racing a loop of in-place calls on a BigInt the caller
+    # keeps: wherever the reset lands (libgmp compute, an allocation hook, the
+    # loop's cancellation point), the BigInt stays valid and the library
+    # healthy.
+    if Threads.nthreads(:default) >= 2
+        deadline = time() + 8
+        rounds = 0
+        while time() < deadline
+            b = big(rounds)
+            m = big(10)^(isodd(rounds) ? 3000 : 60)
+            t, src = cancellable_spawn(() -> _inplace_bigint_loop!(b, m))
+            rounds % 3 == 0 || sleep(0.001 * (rounds % 7))
+            cancel!(src)
+            @test wait_cancelled(t, src)
+            @test istaskfailed(t)
+            @test t.result isa CancellationRequest
+            @test _valid_bigint(b)
+            rounds += 1
+        end
+        @test rounds > 0
+        @test factorial(big(20)) == 2432902008176640000
+    end
+end
+
 # BLAS cancellation handler: it executes on the thread blocked in the dgemm,
 # where the library's thread-local cancel token is exactly the one the
 # in-flight operation is bound to. The function pointers are pre-resolved
