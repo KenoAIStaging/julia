@@ -4627,6 +4627,36 @@ static jl_value_t *normalize_to_cacheable_sig(jl_method_instance_t *mi JL_PROPAG
     return mi2->specTypes;
 }
 
+// Whether a codegen failure for the unspecialized code of `mi` is more likely an error in
+// user code than a compiler bug: a broken generated function, or a broken `llvmcall` (or
+// other code that only the compiler can run). Such code still goes to the interpreter,
+// which raises the error where the offending code is executed.
+static int codegen_failure_is_user_error(jl_method_instance_t *mi, size_t world) JL_CANSAFEPOINT
+{
+    jl_code_info_t *src = NULL;
+    if (jl_is_method(mi->def.value)) {
+        jl_method_t *def = mi->def.method;
+        if (def->generator != NULL)
+            return 1;
+        jl_value_t *source = def->source;
+        if (source == NULL || source == jl_nothing)
+            return 0;
+        src = jl_uncompress_ir(def, NULL, source);
+    }
+    else {
+        jl_code_instance_t *uninferred = jl_cached_uninferred(jl_atomic_load_relaxed(&mi->cache), world);
+        if (uninferred == NULL)
+            return 0;
+        src = (jl_code_info_t*)jl_atomic_load_relaxed(&uninferred->inferred);
+        if (!jl_is_code_info(src))
+            return 0;
+    }
+    JL_GC_PUSH1(&src);
+    int requires_compiler = jl_code_requires_compiler(src, 0);
+    JL_GC_POP();
+    return requires_compiler;
+}
+
 static jl_code_instance_t *jl_compile_method_very_internal(jl_method_instance_t *mi JL_PROPAGATES_ROOT, size_t world,
     jl_value_t *F, jl_value_t **args, uint32_t nargs,
     enum internal_compilation_triggers cause) JL_CANSAFEPOINT
@@ -4824,6 +4854,22 @@ static jl_code_instance_t *jl_compile_method_very_internal(jl_method_instance_t 
                             jl_throw(jl_new_struct(jl_missingcodeerror_type, (jl_value_t*)mi));
                         }
                         jl_generate_fptr_for_unspecialized(codeinst);
+                        jl_callptr_t null = NULL;
+                        if (jl_atomic_load_acquire(&codeinst->invoke) == NULL &&
+                            codegen_failure_is_user_error(jl_get_ci_mi(codeinst), world)) {
+                            // let the interpreter report the error at the offending statement
+                            jl_atomic_cmpswap(&codeinst->invoke, &null, jl_fptr_interpret_call);
+                        }
+                        if (jl_atomic_load_acquire(&codeinst->invoke) == NULL) {
+                            // codegen failed (it printed the cause); do not silently
+                            // run the code in the interpreter instead
+                            jl_typeinf_timing_end(inference_start, is_recompile);
+                            if (jl_is_method(def))
+                                jl_errorf("Internal error: failed to compile method %s in module %s",
+                                          jl_symbol_name(def->name),
+                                          jl_symbol_name(def->module->name));
+                            jl_error("Internal error: failed to compile toplevel thunk");
+                        }
                     }
                 }
                 if (need_copy_to_mi_cache(mi->sparam_vals, unspec, cause)) {

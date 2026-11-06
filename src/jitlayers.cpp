@@ -570,9 +570,8 @@ void jl_generate_fptr_for_unspecialized_impl(jl_code_instance_t *unspec)
         JL_UNLOCK(&jitlock); // Might GC
     }
     JL_GC_POP();
-    jl_callptr_t null = nullptr;
-    // if we hit a codegen bug (or ran into a broken generated function or llvmcall), fall back to the interpreter as a last resort
-    jl_atomic_cmpswap(&unspec->invoke, &null, jl_fptr_interpret_call_addr);
+    // if we hit a codegen bug (or ran into a broken generated function or llvmcall),
+    // `unspec->invoke` stays NULL and the caller decides how to handle the failure
     if (timed) {
         if (measure_compile_time_enabled) {
             auto end = jl_hrtime();
