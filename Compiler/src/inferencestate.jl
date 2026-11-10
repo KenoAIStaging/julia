@@ -1043,6 +1043,20 @@ function sparam_definitely_egal_from_spec(v::TypeVar, sigtypes::Core.SimpleVecto
     for i = 1:min(length(sigtypes), length(spec.parameters))
         sigarg = sigtypes[i]
         specarg = spec.parameters[i]
+        if sigarg isa Core.TypeofVararg
+            # each argument matched by the vararg tail binds `v` like a separate slot
+            isdefined(sigarg, :T) || continue
+            sigelt = sigarg.T
+            has_invariant_sparam_occurrence(sigelt, v) && return true
+            if unwrap_unionall(sigelt) === v
+                tail_egal = true
+                for j = i:length(spec.parameters)
+                    tail_egal &= isdispatchelem(unwrapva(spec.parameters[j]))
+                end
+                tail_egal && return true
+            end
+            continue
+        end
         sigarg_unwrapped = unwrap_unionall(sigarg)
         if sigarg_unwrapped === v
             isdispatchelem(specarg) && return true

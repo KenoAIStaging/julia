@@ -9328,6 +9328,20 @@ g_type_key_tag(x::S, y::Union{Set{S},S}) where {S} = S
 @test (r -> g_type_key_tag(r[], Float64))(Ref{DataType}(Int)) === g_type_key_tag(Int, Float64) ===
     Union{Core.TypeEgal{Int},Core.TypeEgal{Float64}}
 
+# A call inferred for a variable number of arguments must leave a static parameter
+# that only those arguments bind undefined when there are none
+f_vararg_tail(x::S...) where {S} = @isdefined(S) ? S : :undef
+@test (v -> f_vararg_tail(v...))(Int[]) === f_vararg_tail() === :undef
+@test (v -> f_vararg_tail(v...))([1, 2]) === f_vararg_tail(1, 2) === Int
+g_vararg_tail(x::Vector{S}...) where {S} = @isdefined(S) ? S : :undef
+@test (v -> g_vararg_tail(v...))(Vector{Int}[]) === g_vararg_tail() === :undef
+@test (v -> g_vararg_tail(v...))([[1]]) === Int
+h_vararg_tail(t::Tuple{Vararg{S}}) where {S} = @isdefined(S) ? S : :undef
+@test (r -> h_vararg_tail(r[]))(Ref{Tuple{Vararg{Int}}}(())) === h_vararg_tail(()) === :undef
+@test (r -> h_vararg_tail(r[]))(Ref{Tuple{Vararg{Int}}}((1, 2))) === Int
+k_vararg_tail(x::S, y::S...) where {S} = S
+@test (v -> k_vararg_tail(1, v...))(Int[]) === Int
+
 # Static parameters constrained indirectly through other static-parameter bounds
 # are defined.
 f1_sparam_defined_62099(t::Type{E}) where E = @isdefined(E)
