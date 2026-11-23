@@ -1215,7 +1215,8 @@ FORCE_INLINE int gc_sweep_page_cells(gc_page_profiler_serializer_t *s, jl_gc_pag
     if (page_profile_enabled) {
         while ((char*)v <= lim) {
             int bits = v->bits.gc;
-            if (!gc_marked(bits) || (char*)v >= lim_newpages) {
+            if (!gc_marked(bits) || (char*)v >= lim_newpages ||
+                __unlikely(gc_is_scrubbed(v))) {
                 gc_page_profile_write_garbage(s, page_profile_enabled);
             }
             else {

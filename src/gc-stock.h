@@ -640,6 +640,12 @@ NOINLINE void jl_gc_free_page(jl_gc_pagemeta_t *p) JL_NOTSAFEPOINT;
 #else
 #define GC_DEBUG_ENV_ENABLED 0
 #endif
+
+STATIC_INLINE int gc_is_scrubbed(jl_taggedvalue_t *v) JL_NOTSAFEPOINT
+{
+    return GC_DEBUG_ENV_ENABLED &&
+        v->header == gc_set_bits(UINTPTR_MAX, GC_MARKED);
+}
 #ifdef MEMPROFILE
 #define MEMPROFILE_ENABLED 1
 #else
