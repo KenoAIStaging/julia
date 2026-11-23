@@ -2043,6 +2043,9 @@ CallInst *LateLowerGCFrame::EmitGCAllocBytes(IRBuilder<> &builder, CallInst *CI,
     auto &M = *builder.GetInsertBlock()->getModule();
     StoreInst *store = builder.CreateAlignedStore(
         tag, EmitTagPtr(builder, tag_type, T_size, newI), M.getDataLayout().getPointerABIAlignment(0));
+    // The allocation itself may remain observable after SROA makes the object dead.
+    // Keep its tag initialized so a GC in a later allocation can safely scan the cell.
+    store->setVolatile(true);
     store->setOrdering(AtomicOrdering::Unordered);
     store->setMetadata(LLVMContext::MD_tbaa, tbaa_tag);
     return newI;
