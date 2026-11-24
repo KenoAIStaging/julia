@@ -5,6 +5,9 @@
 #include "llvm-codegen-shared.h"
 #include "julia_assert.h"
 
+#include <llvm/ADT/SmallPtrSet.h>
+#include <llvm/ADT/Statistic.h>
+#include <llvm/Analysis/CFG.h>
 #include <llvm/Analysis/LoopInfo.h>
 #include <llvm/IR/IntrinsicInst.h>
 
@@ -12,6 +15,8 @@
 
 using namespace llvm;
 using namespace jl_alloc;
+
+STATISTIC(AddrToObjrefEscapes, "Number of allocations seen to escape through a reference made from their address");
 
 static bool hasObjref(Type *ty)
 {
@@ -170,6 +175,68 @@ JL_USED_FUNC void AllocUseInfo::dump()
     dump(dbgs());
 }
 
+// Whether a reference to the object may be made from `addr`, the address of it that
+// `julia.pointer_from_objref` returned, later in this function. Such a reference is not followed
+// from the allocation, and it needs an object that has a header and that the GC knows.
+static bool mayBecomeObjref(CallInst *addr, JuliaPassContext &pass)
+{
+    Function *to_objref = pass.pointer_to_objref_func;
+    if (!to_objref || to_objref->use_empty())
+        return false;
+    // The address is only known to be used as such while it stays in instructions that read or
+    // write the memory it points at, or that compute another address in it.
+    bool leaves = false;
+    SmallVector<Instruction*, 8> worklist{addr};
+    SmallPtrSet<Instruction*, 8> seen;
+    while (!leaves && !worklist.empty()) {
+        Instruction *cur = worklist.pop_back_val();
+        for (Use &use: cur->uses()) {
+            auto user = dyn_cast<Instruction>(use.getUser());
+            if (!user) {
+                leaves = true;
+                break;
+            }
+            if (isa<LoadInst>(user) || isa<ICmpInst>(user))
+                continue;
+            if (isa<StoreInst>(user) && use.getOperandNo() == StoreInst::getPointerOperandIndex())
+                continue;
+            if (isa<AtomicCmpXchgInst>(user) && use.getOperandNo() == AtomicCmpXchgInst::getPointerOperandIndex())
+                continue;
+            if (isa<AtomicRMWInst>(user) && use.getOperandNo() == AtomicRMWInst::getPointerOperandIndex())
+                continue;
+            if (isa<GetElementPtrInst>(user) || isa<BitCastInst>(user) || isa<AddrSpaceCastInst>(user)) {
+                if (seen.insert(user).second)
+                    worklist.push_back(user);
+                continue;
+            }
+            if (auto call = dyn_cast<CallInst>(user)) {
+                if (call->getCalledOperand() == to_objref)
+                    return true;
+                // None of the intrinsics keep the address
+                if (isa<IntrinsicInst>(call))
+                    continue;
+            }
+            leaves = true;
+            break;
+        }
+    }
+    if (!leaves)
+        return false;
+    // From there, it can come back as the operand of any conversion that runs afterwards
+    for (User *user: to_objref->users()) {
+        auto conv = dyn_cast<CallInst>(user);
+        if (!conv || conv->getCalledOperand() != to_objref || conv->getFunction() != addr->getFunction())
+            continue;
+        // except of one whose operand is older than the object
+        Value *src = conv->getArgOperand(0)->stripPointerCasts();
+        if (isa<Argument>(src) || isa<Constant>(src))
+            continue;
+        if (isPotentiallyReachable(addr, conv))
+            return true;
+    }
+    return false;
+}
+
 #ifndef __clang_gcanalyzer__
 #define REMARK(remark) if (options.ORE) options.ORE->emit(remark)
 #else
@@ -248,6 +315,20 @@ void jl_alloc::runEscapeAnalysis(llvm::CallInst *I, EscapeAnalysisRequiredArgs r
             }
             if (required.pass.pointer_from_objref_func == callee) {
                 required.use_info.addrescaped = true;
+                if (mayBecomeObjref(call, required.pass)) {
+                    LLVM_DEBUG(dbgs() << "Object address may be made into a reference again, marking escape\n");
+                    REMARK([&]() {
+                        std::string str;
+                        llvm::raw_string_ostream rso(str);
+                        inst->print(rso);
+                        return OptimizationRemarkMissed(DEBUG_TYPE, "AddrToObjref",
+                                                        inst)
+                               << "Object address may be made into a reference again, marking escape (" << ore::NV("Call", StringRef(str)) << ")";
+                    });
+                    ++AddrToObjrefEscapes;
+                    required.use_info.escaped = true;
+                    return false;
+                }
                 return true;
             }
             if (required.pass.gc_loaded_func == callee) {

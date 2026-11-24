@@ -1899,6 +1899,30 @@ let (r, w) = objref_and_weakref()
     x = objref_outlives_preserve(r, w, true)
     @test x isa Base.RefValue{Int} && x[] == 314159
 end
+# A reference made from the address of a local object refers to an object that can be used as one
+function objref_of_local(v::Int)
+    x = Ref(v)
+    GC.@preserve x begin
+        y = unsafe_pointer_to_objref(pointer_from_objref(x))::Base.RefValue{Int}
+        return y[]
+    end
+end
+@noinline function objref_of_local_returned(v::Int)
+    x = Ref(v)
+    return GC.@preserve x unsafe_pointer_to_objref(pointer_from_objref(x))
+end
+const objref_c_identity = @cfunction(identity, Ptr{Cvoid}, (Ptr{Cvoid},))
+@noinline function objref_of_local_through_c(v::Int)
+    x = Ref(v)
+    return GC.@preserve x unsafe_pointer_to_objref(ccall(objref_c_identity, Ptr{Cvoid}, (Ptr{Cvoid},),
+                                                         pointer_from_objref(x)))
+end
+@test objref_of_local(41) === 41
+let y = objref_of_local_returned(42), z = objref_of_local_through_c(43)
+    GC.gc()
+    @test y isa Base.RefValue{Int} && y[] == 42
+    @test z isa Base.RefValue{Int} && z[] == 43
+end
 
 let
     local a, aa

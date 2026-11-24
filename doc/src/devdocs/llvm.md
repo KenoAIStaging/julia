@@ -407,10 +407,16 @@ and is lowered to the corresponding address space cast after GC root lowering. T
 keep it in place until then, the intrinsic is not speculatable and is declared to
 modify memory that only the runtime can access, so the optimizer may neither
 execute it speculatively nor move it across another call. The caller remains
-responsible for the object being alive when the call is made. A pointer that
-`julia.pointer_from_objref` returned is no proof of that: as described above, the
-optimizer may already have removed the object it was taken from, or moved it to the
-stack.
+responsible for the object being alive when the call is made.
+
+For an object that is allocated in the same function, the allocation optimizer takes
+such a call into account. A reference that is made directly from the address that
+`julia.pointer_from_objref` returned for an object is replaced by the original
+reference, and an object whose address may reach such a call in another way is neither
+removed nor moved to the stack. The optimizer cannot see a call in another function,
+though. A pointer that `julia.pointer_from_objref` returned in one function is thus no
+proof in another one that there is an object: as described above, it may have been
+removed or moved to the stack.
 
 ### Keeping values alive in the absence of uses
 

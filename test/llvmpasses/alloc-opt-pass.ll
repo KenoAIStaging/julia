@@ -394,6 +394,74 @@ define ptr addrspace(10) @two_objref_fields_no_merge(ptr addrspace(10) %a, ptr a
 }
 ; CHECK-LABEL: }{{$}}
 
+; Test that a reference made from the address that was just taken of an object is the
+; original reference, so that the allocation is seen to be returned.
+; CHECK-LABEL: @objref_from_own_address
+; CHECK-NOT: @julia.pointer_to_objref
+; CHECK: %v = call{{.*}}@julia.gc_alloc_obj
+; CHECK-NOT: @julia.pointer_to_objref
+; CHECK: ret ptr addrspace(10) %v
+define ptr addrspace(10) @objref_from_own_address() {
+  %pgcstack = call ptr @julia.get_pgcstack()
+  %ptls = call ptr @julia.ptls_states()
+  %v = call noalias nonnull align 8 dereferenceable(8) ptr addrspace(10) @julia.gc_alloc_obj(ptr %ptls, i64 8, ptr addrspace(10) @tag) #7
+  %v_derived = addrspacecast ptr addrspace(10) %v to ptr addrspace(11)
+  store i64 1, ptr addrspace(11) %v_derived, align 8
+  %raw = call ptr @julia.pointer_from_objref(ptr addrspace(11) %v_derived)
+  %ref = call ptr addrspace(10) @julia.pointer_to_objref(ptr %raw)
+  ret ptr addrspace(10) %ref
+}
+; CHECK-LABEL: }{{$}}
+
+; Test that an allocation stays on the heap when its address leaves the function and a
+; reference is then made from an address that may be the same one.
+; CHECK-LABEL: @objref_from_leaked_address
+; CHECK: call{{.*}}@julia.gc_alloc_obj
+; CHECK: ret ptr addrspace(10) %ref
+define ptr addrspace(10) @objref_from_leaked_address() {
+  %pgcstack = call ptr @julia.get_pgcstack()
+  %ptls = call ptr @julia.ptls_states()
+  %v = call noalias nonnull align 8 dereferenceable(8) ptr addrspace(10) @julia.gc_alloc_obj(ptr %ptls, i64 8, ptr addrspace(10) @tag) #7
+  %v_derived = addrspacecast ptr addrspace(10) %v to ptr addrspace(11)
+  store i64 1, ptr addrspace(11) %v_derived, align 8
+  %raw = call ptr @julia.pointer_from_objref(ptr addrspace(11) %v_derived)
+  %tok = call token (...) @llvm.julia.gc_preserve_begin(ptr addrspace(10) %v)
+  %back = call ptr @external_pointer(ptr %raw)
+  %ref = call ptr addrspace(10) @julia.pointer_to_objref(ptr %back)
+  call void @llvm.julia.gc_preserve_end(token %tok)
+  ret ptr addrspace(10) %ref
+}
+; CHECK-LABEL: }{{$}}
+
+; Test that this does not keep an allocation on the heap when the reference is made from
+; an address that existed before it, or before its own address was taken.
+; CHECK-LABEL: @objref_from_other_address
+; CHECK-NOT: @julia.gc_alloc_obj
+; CHECK: %ref2 = call ptr addrspace(10) @julia.pointer_to_objref(ptr %before)
+; CHECK-NOT: @julia.gc_alloc_obj
+; CHECK: %ref = call ptr addrspace(10) @julia.pointer_to_objref(ptr %older)
+; CHECK: ret ptr addrspace(10) %ref
+define ptr addrspace(10) @objref_from_other_address(ptr %older) {
+  %pgcstack = call ptr @julia.get_pgcstack()
+  %ptls = call ptr @julia.ptls_states()
+  %before = call ptr @external_pointer(ptr null)
+  %ref2 = call ptr addrspace(10) @julia.pointer_to_objref(ptr %before)
+  %v = call noalias nonnull align 8 dereferenceable(8) ptr addrspace(10) @julia.gc_alloc_obj(ptr %ptls, i64 8, ptr addrspace(10) @tag) #7
+  %v_derived = addrspacecast ptr addrspace(10) %v to ptr addrspace(11)
+  store i64 1, ptr addrspace(11) %v_derived, align 8
+  %raw = call ptr @julia.pointer_from_objref(ptr addrspace(11) %v_derived)
+  %tok = call token (...) @llvm.julia.gc_preserve_begin(ptr addrspace(10) %v)
+  %back = call ptr @external_pointer(ptr %raw)
+  call void @llvm.julia.gc_preserve_end(token %tok)
+  %ref = call ptr addrspace(10) @julia.pointer_to_objref(ptr %older)
+  ret ptr addrspace(10) %ref
+}
+; CHECK-LABEL: }{{$}}
+
+declare ptr addrspace(10) @julia.pointer_to_objref(ptr)
+
+declare ptr @external_pointer(ptr)
+
 declare ptr @julia.ptls_states()
 
 declare ptr @julia.pointer_from_objref(ptr addrspace(11))
