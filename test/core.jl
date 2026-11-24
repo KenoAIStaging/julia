@@ -1946,6 +1946,14 @@ function dataptr_of_local_in_c()
     ccall(:jl_gc_get_total_bytes, Cvoid, (Ptr{Int64},), bytes)
     return bytes[]
 end
+mutable struct DataPtrOfLocal
+    bytes::Int64
+end
+function dataptr_of_local_struct_in_c()
+    s = DataPtrOfLocal(0)
+    ccall(:jl_gc_get_total_bytes, Cvoid, (Ref{DataPtrOfLocal},), s)
+    return s.bytes
+end
 function dataptr_of_local(v::Int)
     x = Ref(v)
     GC.@preserve x unsafe_store!(Ptr{Int}(pointer_from_objref(x)), v + 1)
@@ -1958,9 +1966,11 @@ function dataptr_of_local_explicit(v::Int)
 end
 let
     @test dataptr_of_local_in_c() isa Int64
+    @test dataptr_of_local_struct_in_c() isa Int64
     @test dataptr_of_local(46) === 47
     @test dataptr_of_local_explicit(48) === 0
     @test @allocated(dataptr_of_local_in_c()) == 0
+    @test @allocated(dataptr_of_local_struct_in_c()) == 0
     @test @allocated(dataptr_of_local(46)) == 0
     @test @allocated(dataptr_of_local_explicit(48)) == 0
 end

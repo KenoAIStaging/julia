@@ -39,7 +39,7 @@ function unsafe_convert(P::Union{Type{Ptr{T}},Type{Ptr{Cvoid}}}, b::RefValue{T})
     if allocatedinline(T)
         p = pointer_from_objref(b, false)
     elseif isconcretetype(T) && ismutabletype(T)
-        p = pointer_from_objref(b.x)
+        p = pointer_from_objref(b.x, false)
     else
         # If the slot is not leaf type, it could be either immutable or not.
         # If it is actually an immutable, then we can't take its pointer directly

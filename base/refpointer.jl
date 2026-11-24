@@ -129,7 +129,7 @@ function unsafe_convert(P::Union{Type{Ptr{T}},Type{Ptr{Cvoid}}}, b::RefArray{T})
     if allocatedinline(T)
         p = pointer(b.x, b.i)
     elseif isconcretetype(T) && ismutabletype(T)
-        p = pointer_from_objref(b.x[b.i])
+        p = pointer_from_objref(b.x[b.i], false)
     else
         # see comment on equivalent branch for RefValue
         p = pointerref(Ptr{Ptr{Cvoid}}(pointer(b.x, b.i)), 1, Core.sizeof(Ptr{Cvoid}))
