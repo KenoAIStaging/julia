@@ -635,11 +635,15 @@ STATIC_INLINE jl_value_t *jl_gc_big_alloc_inner(jl_ptls_t ptls, size_t sz) JL_CA
 
 
 // Instrumented version of jl_gc_big_alloc_inner, called into by LLVM-generated code.
+// Unlike for jl_gc_big_alloc_inner, the size does not include the tag.
 JL_DLLEXPORT jl_value_t *jl_gc_big_alloc(jl_ptls_t ptls, size_t sz, jl_value_t *type)
 {
-    jl_value_t *val = jl_gc_big_alloc_inner(ptls, sz);
+    size_t allocsz = sz + sizeof(jl_taggedvalue_t);
+    if (allocsz < sz) // overflow in adding the tag, size was "negative"
+        jl_throw(jl_memory_exception);
+    jl_value_t *val = jl_gc_big_alloc_inner(ptls, allocsz);
     jl_set_typeof(val, type);
-    maybe_record_alloc_to_profile(val, sz, (jl_datatype_t*)type);
+    maybe_record_alloc_to_profile(val, allocsz, (jl_datatype_t*)type);
     return val;
 }
 
@@ -1048,7 +1052,7 @@ STATIC_INLINE jl_value_t *jl_gc_small_alloc_inner(jl_ptls_t ptls, int offset,
     jl_gc_pool_t *p = (jl_gc_pool_t*)((char*)ptls + offset);
     assert(jl_atomic_load_relaxed(&ptls->gc_state) == 0);
 #ifdef MEMDEBUG
-    return jl_gc_big_alloc(ptls, osize, NULL);
+    return jl_gc_big_alloc(ptls, osize - sizeof(jl_taggedvalue_t), NULL);
 #endif
     maybe_collect(ptls);
     jl_atomic_store_relaxed(&ptls->gc_tls_common.gc_num.allocd,
@@ -1104,8 +1108,11 @@ STATIC_INLINE jl_value_t *jl_gc_small_alloc_inner(jl_ptls_t ptls, int offset,
 }
 
 // Instrumented version of jl_gc_small_alloc_inner, called into by LLVM-generated code.
-JL_DLLEXPORT jl_value_t *jl_gc_small_alloc(jl_ptls_t ptls, int offset, int osize, jl_value_t* type)
+// Unlike for jl_gc_small_alloc_inner, the size does not include the tag.
+JL_DLLEXPORT jl_value_t *jl_gc_small_alloc(jl_ptls_t ptls, int offset, int sz, jl_value_t* type)
 {
+    int osize = sz + (int)sizeof(jl_taggedvalue_t);
+    assert(((jl_gc_pool_t*)((char*)ptls + offset))->osize == osize && "sz must not include tag");
     jl_value_t *val = jl_gc_small_alloc_inner(ptls, offset, osize);
     jl_set_typeof(val, type);
     maybe_record_alloc_to_profile(val, osize, (jl_datatype_t*)type);

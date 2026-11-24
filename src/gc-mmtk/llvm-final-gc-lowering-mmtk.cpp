@@ -32,7 +32,7 @@ Value* FinalLowerGC::lowerGCAllocBytes(CallInst *target, Function &F)
         if (offset < 0) {
             newI = builder.CreateCall(
                 resetSafe ? bigAllocResetSafeFunc : bigAllocFunc,
-                { ptls, ConstantInt::get(T_size, sz + sizeof(void*)), type });
+                { ptls, ConstantInt::get(T_size, sz), type });
             if (sz > 0)
                 derefBytes = sz;
         }
@@ -40,7 +40,8 @@ Value* FinalLowerGC::lowerGCAllocBytes(CallInst *target, Function &F)
             // In this case instead of lowering julia.gc_alloc_bytes to jl_gc_small_alloc
             // We do a slowpath/fastpath check and lower it only on the slowpath, returning
             // the cursor and updating it in the fastpath.
-            auto pool_osize_i32 = ConstantInt::get(Type::getInt32Ty(F.getContext()), osize);
+            // the allocators take the size of the object without its tag
+            auto pool_osize_i32 = ConstantInt::get(Type::getInt32Ty(F.getContext()), osize - sizeof(jl_taggedvalue_t));
             auto pool_osize = ConstantInt::get(Type::getInt64Ty(F.getContext()), osize);
 
             // Should we generate fastpath allocation sequence here? We should always generate fastpath here for MMTk.

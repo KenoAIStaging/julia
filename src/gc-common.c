@@ -607,12 +607,12 @@ STATIC_INLINE void reset_region_republish(jl_task_t *ct, jl_reset_ctx_t *reset_c
     reset_region_deliver_pending(ct);
 }
 
-JL_DLLEXPORT jl_value_t *jl_gc_small_alloc_reset_safe(jl_ptls_t ptls, int offset, int osize,
+JL_DLLEXPORT jl_value_t *jl_gc_small_alloc_reset_safe(jl_ptls_t ptls, int offset, int sz,
                                                       jl_value_t *type) JL_CANSAFEPOINT
 {
     jl_task_t *ct = jl_atomic_load_relaxed(&ptls->current_task);
     jl_reset_ctx_t *reset_ctx = reset_region_unpublish(ct);
-    jl_value_t *val = jl_gc_small_alloc(ptls, offset, osize, type);
+    jl_value_t *val = jl_gc_small_alloc(ptls, offset, sz, type);
     reset_region_republish(ct, reset_ctx);
     return val;
 }

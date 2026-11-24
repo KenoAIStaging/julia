@@ -26,13 +26,14 @@ Value* FinalLowerGC::lowerGCAllocBytes(CallInst *target, Function &F)
         if (offset < 0) {
             newI = builder.CreateCall(
                 resetSafe ? bigAllocResetSafeFunc : bigAllocFunc,
-                { ptls, ConstantInt::get(T_size, sz + sizeof(void*)), type });
+                { ptls, ConstantInt::get(T_size, sz), type });
             if (sz > 0)
                 derefBytes = sz;
         }
         else {
             auto pool_offs = ConstantInt::get(Type::getInt32Ty(F.getContext()), offset);
-            auto pool_osize = ConstantInt::get(Type::getInt32Ty(F.getContext()), osize);
+            // the allocators take the size of the object without its tag
+            auto pool_osize = ConstantInt::get(Type::getInt32Ty(F.getContext()), osize - sizeof(jl_taggedvalue_t));
             newI = builder.CreateCall(resetSafe ? smallAllocResetSafeFunc : smallAllocFunc,
                                       { ptls, pool_offs, pool_osize, type });
             if (sz > 0)

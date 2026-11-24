@@ -12,7 +12,7 @@ target datalayout = "e-m:o-i64:64-f80:128-n8:16:32:64-S128"
 ; OPAQUE: %current_task = getelementptr inbounds ptr, ptr %gcstack, i64 -12
 ; OPAQUE: [[ptls_field:%.*]] = getelementptr inbounds i8, ptr %current_task,
 ; OPAQUE-NEXT: [[ptls_load:%.*]] = load ptr, ptr [[ptls_field]], align 8, !tbaa !0
-; OPAQUE-NEXT: %v = call noalias nonnull align {{[0-9]+}} dereferenceable({{[0-9]+}}) ptr addrspace(10) @ijl_gc_small_alloc(ptr [[ptls_load]], i32 [[SIZE_T:[0-9]+]], i32 16, i64 {{.*}} @tag {{.*}})
+; OPAQUE-NEXT: %v = call noalias nonnull align {{[0-9]+}} dereferenceable({{[0-9]+}}) ptr addrspace(10) @ijl_gc_small_alloc(ptr [[ptls_load]], i32 [[SIZE_T:[0-9]+]], i32 8, i64 {{.*}} @tag {{.*}})
 
 define {} addrspace(10)* @return_obj() {
   %pgcstack = call {}*** @julia.get_pgcstack()

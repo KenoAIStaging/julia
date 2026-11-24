@@ -1257,10 +1257,12 @@ JL_DLLEXPORT jl_value_t *jl_mmtk_gc_alloc_big(jl_ptls_t ptls, size_t sz)
 }
 
 // Instrumented version of jl_gc_small_alloc_inner, called into by LLVM-generated code.
-JL_DLLEXPORT jl_value_t *jl_gc_small_alloc(jl_ptls_t ptls, int offset, int osize, jl_value_t* type)
+// The size does not include the tag.
+JL_DLLEXPORT jl_value_t *jl_gc_small_alloc(jl_ptls_t ptls, int offset, int sz, jl_value_t* type)
 {
     assert(jl_atomic_load_relaxed(&ptls->gc_state) == 0);
 
+    int osize = sz + (int)sizeof(jl_taggedvalue_t);
     jl_value_t *val = jl_mmtk_gc_alloc_default(ptls, osize, 16, NULL);
     jl_set_typeof(val, type);
     maybe_record_alloc_to_profile(val, osize, (jl_datatype_t*)type);
@@ -1268,14 +1270,18 @@ JL_DLLEXPORT jl_value_t *jl_gc_small_alloc(jl_ptls_t ptls, int offset, int osize
 }
 
 // Instrumented version of jl_gc_big_alloc_inner, called into by LLVM-generated code.
+// The size does not include the tag.
 JL_DLLEXPORT jl_value_t *jl_gc_big_alloc(jl_ptls_t ptls, size_t sz, jl_value_t *type)
 {
     // TODO: assertion needed here?
     assert(jl_atomic_load_relaxed(&ptls->gc_state) == 0);
 
-    jl_value_t *val = jl_mmtk_gc_alloc_big(ptls, sz);
+    size_t allocsz = sz + sizeof(jl_taggedvalue_t);
+    if (allocsz < sz) // overflow in adding the tag, size was "negative"
+        jl_throw(jl_memory_exception);
+    jl_value_t *val = jl_mmtk_gc_alloc_big(ptls, allocsz);
     jl_set_typeof(val, type);
-    maybe_record_alloc_to_profile(val, sz, (jl_datatype_t*)type);
+    maybe_record_alloc_to_profile(val, allocsz, (jl_datatype_t*)type);
     return val;
 }
 

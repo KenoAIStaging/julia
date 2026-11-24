@@ -73,7 +73,7 @@ top:
 alloc:
 ; FINAL-DSE-LABEL: @gc_alloc_phi_cmp(
 ; FINAL-DSE: alloc:
-; FINAL-DSE: [[V:%.*]] = call noalias nonnull {{.*}} @ijl_gc_small_alloc(ptr {{.*}}, i32 {{[0-9]+}}, i32 16, i64 {{.*}} @tag {{.*}})
+; FINAL-DSE: [[V:%.*]] = call noalias nonnull {{.*}} @ijl_gc_small_alloc(ptr {{.*}}, i32 {{[0-9]+}}, i32 8, i64 {{.*}} @tag {{.*}})
 ; FINAL-DSE-NOT: store atomic
 ; FINAL-DSE: br label %merge
     %v = call noalias {} addrspace(10)* @julia.gc_alloc_obj({}** %current_task, i64 8, {} addrspace(10)* @tag)
@@ -542,11 +542,12 @@ attributes #10 = { nounwind willreturn memory(argmem: read) "julia.safepoint" }
 attributes #11 = { nounwind willreturn memory(read) "julia.safepoint" }
 attributes #12 = { nounwind willreturn memory(argmem: read) }
 
-; The physical allocator sizes include the hidden header, but their returned
-; pointers start after it, so they must not carry allocsize.
-; FINAL: declare noalias nonnull ptr addrspace(10) @ijl_gc_small_alloc(ptr, i32, i32, i64) #[[PHYSICAL_ALLOC_ATTRS:[0-9]+]]
-; FINAL: declare noalias nonnull ptr addrspace(10) @ijl_gc_big_alloc(ptr, i64, i64) #[[PHYSICAL_ALLOC_ATTRS]]
-; FINAL: attributes #[[PHYSICAL_ALLOC_ATTRS]] = { nounwind willreturn allockind("alloc") memory(argmem: read, inaccessiblemem: readwrite) }
+; The physical allocators take the size without the hidden header, which is what
+; follows the pointers that they return, so their allocsize is accurate.
+; FINAL: declare noalias nonnull ptr addrspace(10) @ijl_gc_small_alloc(ptr, i32, i32, i64) #[[SMALL_ALLOC_ATTRS:[0-9]+]]
+; FINAL: declare noalias nonnull ptr addrspace(10) @ijl_gc_big_alloc(ptr, i64, i64) #[[BIG_ALLOC_ATTRS:[0-9]+]]
+; FINAL-DAG: attributes #[[SMALL_ALLOC_ATTRS]] = { nounwind willreturn allockind("alloc") allocsize(2) memory(argmem: read, inaccessiblemem: readwrite) }
+; FINAL-DAG: attributes #[[BIG_ALLOC_ATTRS]] = { nounwind willreturn allockind("alloc") allocsize(1) memory(argmem: read, inaccessiblemem: readwrite) }
 
 ; CHECK: attributes [[ATTRS_STRIPPED]] = { nounwind willreturn "julia.safepoint" }
 

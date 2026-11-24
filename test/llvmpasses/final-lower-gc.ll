@@ -58,8 +58,24 @@ top:
   %pgcstack = call {}*** @julia.get_pgcstack()
   %ptls = call {}*** @julia.ptls_states()
   %ptls_i8 = bitcast {}*** %ptls to i8*
-; OPAQUE: %v = call noalias nonnull align {{[0-9]+}} dereferenceable({{[0-9]+}}) ptr addrspace(10) @ijl_gc_small_alloc
+; The allocators take the size of the object without its tag, which is the number of bytes
+; after the pointer that they return, as their `allocsize` says.
+; OPAQUE: %v = call noalias nonnull align {{[0-9]+}} dereferenceable(8) ptr addrspace(10) @ijl_gc_small_alloc(ptr %ptls_i8, i32 {{[0-9]+}}, i32 8, i64 12341234)
   %v = call {} addrspace(10)* @julia.gc_alloc_bytes(i8* %ptls_i8, i64 8, i64 12341234)
+  %0 = bitcast {} addrspace(10)* %v to {} addrspace(10)* addrspace(10)*
+  %1 = getelementptr {} addrspace(10)*, {} addrspace(10)* addrspace(10)* %0, i64 -1
+  store {} addrspace(10)* @tag, {} addrspace(10)* addrspace(10)* %1, align 8, !tbaa !0
+  ret {} addrspace(10)* %v
+}
+
+define {} addrspace(10)* @gc_alloc_lowering_big() {
+top:
+; CHECK-LABEL: @gc_alloc_lowering_big
+  %pgcstack = call {}*** @julia.get_pgcstack()
+  %ptls = call {}*** @julia.ptls_states()
+  %ptls_i8 = bitcast {}*** %ptls to i8*
+; OPAQUE: %v = call noalias nonnull align {{[0-9]+}} dereferenceable(4096) ptr addrspace(10) @ijl_gc_big_alloc(ptr %ptls_i8, i64 4096, i64 12341234)
+  %v = call {} addrspace(10)* @julia.gc_alloc_bytes(i8* %ptls_i8, i64 4096, i64 12341234)
   %0 = bitcast {} addrspace(10)* %v to {} addrspace(10)* addrspace(10)*
   %1 = getelementptr {} addrspace(10)*, {} addrspace(10)* addrspace(10)* %0, i64 -1
   store {} addrspace(10)* @tag, {} addrspace(10)* addrspace(10)* %1, align 8, !tbaa !0
@@ -89,7 +105,7 @@ top:
   %pgcstack = call {}*** @julia.get_pgcstack()
   %ptls = call {}*** @julia.ptls_states()
   %ptls_i8 = bitcast {}*** %ptls to i8*
-; OPAQUE: %v = call noalias nonnull align {{[0-9]+}} dereferenceable({{[0-9]+}}) ptr addrspace(10) @ijl_gc_small_alloc_reset_safe
+; OPAQUE: %v = call noalias nonnull align {{[0-9]+}} dereferenceable(8) ptr addrspace(10) @ijl_gc_small_alloc_reset_safe(ptr %ptls_i8, i32 {{[0-9]+}}, i32 8, i64 12341234)
   %v = call {} addrspace(10)* @julia.gc_alloc_bytes(i8* %ptls_i8, i64 8, i64 12341234), !julia.reset_region !3
   %0 = bitcast {} addrspace(10)* %v to {} addrspace(10)* addrspace(10)*
   %1 = getelementptr {} addrspace(10)*, {} addrspace(10)* addrspace(10)* %0, i64 -1

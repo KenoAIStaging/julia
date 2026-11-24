@@ -298,9 +298,8 @@ namespace jl_well_known {
 
     using jl_intrinsics::addGCAllocAttributes;
 
-    // The small and big allocators take a size including the hidden GC header but
-    // return a pointer after it. They cannot use `allocsize`, which would describe
-    // the returned pointer as the base of an allocation of the full object size.
+    // The small and big allocators take the size of the object without its header and
+    // return a pointer to after that header, so `allocsize` describes what they return.
 
     const WellKnownFunctionDescription GCBigAlloc(
         GC_BIG_ALLOC_NAME,
@@ -314,6 +313,7 @@ namespace jl_well_known {
                     false),
                 Function::ExternalLinkage,
                 GC_BIG_ALLOC_NAME);
+            bigAllocFunc->addFnAttr(Attribute::getWithAllocSizeArgs(ctx, 1, std::nullopt));
             return addGCAllocAttributes(bigAllocFunc);
         });
 
@@ -329,6 +329,7 @@ namespace jl_well_known {
                     false),
                 Function::ExternalLinkage,
                 GC_SMALL_ALLOC_NAME);
+            smallAllocFunc->addFnAttr(Attribute::getWithAllocSizeArgs(ctx, 2, std::nullopt));
             return addGCAllocAttributes(smallAllocFunc);
         });
 
@@ -411,6 +412,7 @@ namespace jl_well_known {
                     false),
                 Function::ExternalLinkage,
                 GC_BIG_ALLOC_RESET_SAFE_NAME);
+            bigAllocFunc->addFnAttr(Attribute::getWithAllocSizeArgs(ctx, 1, std::nullopt));
             return addResetSafeGCAllocAttributes(bigAllocFunc);
         });
 
@@ -426,6 +428,7 @@ namespace jl_well_known {
                     false),
                 Function::ExternalLinkage,
                 GC_SMALL_ALLOC_RESET_SAFE_NAME);
+            smallAllocFunc->addFnAttr(Attribute::getWithAllocSizeArgs(ctx, 2, std::nullopt));
             return addResetSafeGCAllocAttributes(smallAllocFunc);
         });
 
