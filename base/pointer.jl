@@ -286,6 +286,7 @@ unsafe_pointer_to_objref(x::Ptr) = ccall(:jl_value_ptr, Any, (Ptr{Cvoid},), x)
 
 """
     pointer_from_objref(x)
+    pointer_from_objref(x, gc_pointer::Bool)
 
 Get the memory address of a Julia object as a `Ptr`. The existence of the resulting `Ptr`
 will not protect the object from garbage collection, so you must ensure that the object
@@ -294,12 +295,21 @@ remains referenced for the whole time that the `Ptr` will be used.
 This function may not be called on immutable objects, since they do not have
 stable memory addresses.
 
+The result is a pointer to an object that the garbage collector knows (a `jl_value_t*`),
+which can be passed to [`unsafe_pointer_to_objref`](@ref), also by other code that it is
+given to. If `gc_pointer` is `false`, the result is only good for reading and writing the
+memory of `x`. The compiler may then keep `x` somewhere else than on the heap, where it is
+not an object that can be referred to in another way.
+
+!!! compat "Julia 1.15"
+    The `gc_pointer` argument requires Julia 1.15 or later.
+
 See also [`unsafe_pointer_to_objref`](@ref).
 """
-function pointer_from_objref(@nospecialize(x))
+function pointer_from_objref(@nospecialize(x), gc_pointer::Bool=true)
     @inline
     ismutable(x) || error("pointer_from_objref cannot be used on immutable objects")
-    ccall(:jl_value_ptr, Ptr{Cvoid}, (Any,), x)
+    ccall(:jl_pointer_from_objref, Ptr{Cvoid}, (Any, Bool), x, gc_pointer)
 end
 
 ## limited pointer arithmetic & comparison ##

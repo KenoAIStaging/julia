@@ -10,7 +10,7 @@ target datalayout = "e-p:64:64-p1:64:64-p2:32:32-p3:32:32-p4:64:64-p5:32:32-p6:3
 declare {}*** @julia.ptls_states()
 declare {}*** @julia.get_pgcstack()
 declare noalias {} addrspace(10)* @julia.gc_alloc_obj(i8*, i64, {} addrspace(10)*)
-declare {}* @julia.pointer_from_objref({} addrspace(11)*)
+declare {}* @julia.pointer_from_objref({} addrspace(11)*, i1)
 
 ; Test that non-0 addrspace allocas are properly emitted and handled
 
@@ -27,7 +27,7 @@ define void @non_zero_addrspace() {
   %ptls_i8 = bitcast {}*** %ptls to i8*
   %var1 = call {} addrspace(10)* @julia.gc_alloc_obj(i8* %ptls_i8, i64 4, {} addrspace(10)* @tag)
   %var2 = addrspacecast {} addrspace(10)* %var1 to {} addrspace(11)*
-  %var3 = call {}* @julia.pointer_from_objref({} addrspace(11)* %var2)
+  %var3 = call {}* @julia.pointer_from_objref({} addrspace(11)* %var2, i1 false)
   ret void
 }
 ; CHECK-LABEL: }{{$}}

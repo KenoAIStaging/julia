@@ -363,6 +363,7 @@
     XX(jl_pathname_for_symbol) \
     XX(jl_pchar_to_array) \
     XX(jl_pchar_to_string) \
+    XX(jl_pointer_from_objref) \
     XX(jl_pop_handler) \
     XX(jl_pop_handler_noexcept) \
     XX(jl_preload_sysimg) \

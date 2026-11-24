@@ -953,7 +953,8 @@ static jl_cgval_t emit_pointerset(jl_codectx_t &ctx, ArrayRef<jl_cgval_t> argv) 
         // unsafe_store to Ptr{Any} is allowed to implicitly drop GC roots.
         auto gep = ctx.builder.CreateInBoundsGEP(ctx.types().T_size, thePtr, im1);
         setName(ctx.emission_context, gep, "pointerset_ptr");
-        auto val = ctx.builder.CreatePtrToInt(emit_pointer_from_objref(ctx, boxed(ctx, x)), ctx.types().T_size);
+        // what is stored is a `jl_value_t*`, which `unsafe_load` gives back as a reference
+        auto val = ctx.builder.CreatePtrToInt(emit_pointer_from_objref(ctx, boxed(ctx, x), true), ctx.types().T_size);
         setName(ctx.emission_context, val, "pointerset_val");
         Instruction *store = ctx.builder.CreateAlignedStore(val, gep, Align(align_nb));
         jl_aliasinfo_t ai = ctx.alias().data;

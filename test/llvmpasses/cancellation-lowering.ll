@@ -15,7 +15,7 @@ declare ptr @julia.gc_alloc_memory(ptr, i64, ptr, i64, i1)
 declare ptr @ijl_box_int64(i64)
 declare ptr @ijl_apply_generic(ptr, ptr, i32)
 declare i32 @tail_target(ptr)
-declare ptr @julia.pointer_from_objref(ptr addrspace(11))
+declare ptr @julia.pointer_from_objref(ptr addrspace(11), i1)
 
 ; Test basic cancellation point lowering with reset_ctx cleared before return
 define i32 @test_cancellation_point() {
@@ -364,18 +364,18 @@ entry:
 ; An exempt call (no unsafe-point clear, e.g. julia.pointer_from_objref)
 ; that is a musttail still must not leave the stack reset context published
 ; past the return: the teardown goes in front of the call.
-define ptr @test_musttail_exempt(ptr addrspace(11) %obj) {
+define ptr @test_musttail_exempt(ptr addrspace(11) %obj, i1 %gc_pointer) {
 entry:
 ; CHECK-LABEL: @test_musttail_exempt
 ; CHECK: call i32 @{{.*}}setjmp
 ; CHECK-NEXT: store atomic volatile ptr %cancel_ucontext, ptr %reset_ctx_ptr release
 ; CHECK: cancel_pt_cont:
 ; CHECK: store atomic volatile ptr null, ptr %reset_ctx_ptr monotonic
-; CHECK-NEXT: %r = musttail call ptr @julia.pointer_from_objref(ptr addrspace(11) %obj)
+; CHECK-NEXT: %r = musttail call ptr @julia.pointer_from_objref(ptr addrspace(11) %obj, i1 %gc_pointer)
 ; CHECK-NEXT: ret ptr %r
   %pgcstack = call ptr @julia.get_pgcstack()
   %result = call i32 @julia.cancellation_point()
-  %r = musttail call ptr @julia.pointer_from_objref(ptr addrspace(11) %obj)
+  %r = musttail call ptr @julia.pointer_from_objref(ptr addrspace(11) %obj, i1 %gc_pointer)
   ret ptr %r
 }
 

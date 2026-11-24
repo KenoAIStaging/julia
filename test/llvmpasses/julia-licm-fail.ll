@@ -49,8 +49,8 @@ loop:
   %alloc = call noalias nonnull {} addrspace(10)* @julia.gc_alloc_obj({}** nonnull %current_task, i64 8, {} addrspace(10)* @tag)
 ; OPAQUE-NEXT: %cast = addrspacecast ptr addrspace(10) %alloc to ptr addrspace(11)
   %cast = addrspacecast {} addrspace(10)* %alloc to {} addrspace(11)*
-; OPAQUE-NEXT: %ptr = call nonnull ptr @julia.pointer_from_objref(ptr addrspace(11) %cast)
-  %ptr = call nonnull {}* @julia.pointer_from_objref({} addrspace(11)* %cast)
+; OPAQUE-NEXT: %ptr = call nonnull ptr @julia.pointer_from_objref(ptr addrspace(11) %cast, i1 false)
+  %ptr = call nonnull {}* @julia.pointer_from_objref({} addrspace(11)* %cast, i1 false)
   br i1 %ret, label %return, label %loop
 return:
   ret void
@@ -82,7 +82,7 @@ declare noalias nonnull {} addrspace(10)* @ijl_gc_big_alloc(i8*, i64) #1
 declare nonnull {} addrspace(10)* @escape({} addrspace(10)*)
 
 ; COM: addrescape function
-declare nonnull {}* @julia.pointer_from_objref({} addrspace(11)*)
+declare nonnull {}* @julia.pointer_from_objref({} addrspace(11)*, i1)
 
 attributes #0 = { "probe-stack"="inline-asm" }
 attributes #1 = { allocsize(1) }

@@ -72,6 +72,10 @@ New library features
   once and shares it between both streams, as in ``` `cmd >x 2>&1` ```. Before, the streams
   could overwrite each other's output, and a not-yet-open `PipeEndpoint` received only one of them.
 * `Base.enumerate(itr; from=1)` now accepts an optional starting point `from` for the enumeration.
+* `pointer_from_objref(x, false)` gets a pointer that is only used to read and write the memory
+  of `x`. Without the argument, the pointer is to an object that `unsafe_pointer_to_objref` can
+  be called on, also by other code that the pointer is passed to. Before, `x` could be an object
+  that the compiler had moved to the stack.
 
 * In a command literal, a redirection to `/dev/null` now means `devnull` on every system,
   including Windows, so that, for example, ``` `cmd 2>/dev/null` ``` is portable.

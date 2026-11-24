@@ -37,7 +37,7 @@ isassigned(x::RefValue) = isdefined(x, :x)
 
 function unsafe_convert(P::Union{Type{Ptr{T}},Type{Ptr{Cvoid}}}, b::RefValue{T})::P where T
     if allocatedinline(T)
-        p = pointer_from_objref(b)
+        p = pointer_from_objref(b, false)
     elseif isconcretetype(T) && ismutabletype(T)
         p = pointer_from_objref(b.x)
     else
@@ -45,7 +45,7 @@ function unsafe_convert(P::Union{Type{Ptr{T}},Type{Ptr{Cvoid}}}, b::RefValue{T})
         # If it is actually an immutable, then we can't take its pointer directly
         # Instead, explicitly load the pointer from the `RefValue`,
         # which also ensures this returns same pointer as the one rooted in the `RefValue` object.
-        p = atomic_pointerref(Ptr{Ptr{Cvoid}}(pointer_from_objref(b)), :monotonic)
+        p = atomic_pointerref(Ptr{Ptr{Cvoid}}(pointer_from_objref(b, false)), :monotonic)
         if p == C_NULL
             throw(UndefRefError())
         end
@@ -53,7 +53,7 @@ function unsafe_convert(P::Union{Type{Ptr{T}},Type{Ptr{Cvoid}}}, b::RefValue{T})
     return p
 end
 function unsafe_convert(::Type{Ptr{Any}}, b::RefValue{Any})::Ptr{Any}
-    return pointer_from_objref(b)
+    return pointer_from_objref(b, false)
 end
 
 getindex(b::RefValue) = b.x

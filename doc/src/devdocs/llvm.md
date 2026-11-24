@@ -377,7 +377,7 @@ explicit control of GC rooting. By our above invariants, this function is illega
 because it performs an address space cast from 10 to 0. However, it can be useful,
 in certain situations, so we provide a special intrinsic:
 ```llvm
-declared %jl_value_t *julia.pointer_from_objref(%jl_value_t addrspace(10)*)
+declare ptr @julia.pointer_from_objref(ptr addrspace(11), i1)
 ```
 which is lowered to the corresponding address space cast after GC root lowering.
 Do note however that by using this intrinsic, the caller assumes all responsibility
@@ -387,6 +387,15 @@ for the function. As a result, the external rooting must be arranged while the
 value is still tracked by the system. I.e. it is not valid to attempt to use the
 result of this operation to establish a global root - the optimizer may have
 already dropped the value.
+
+The second argument says whether the result has to be a pointer to an object that the
+GC knows (a `jl_value_t*`), because a reference to the object may be made from it again:
+with `julia.pointer_to_objref` described below, also in another function that it is
+passed to, or by loading it from memory that it was stored to. If the argument is
+`false`, the result is only used to access the memory of the object, and the object
+can then be removed, or moved to the stack, where it is not one that the GC knows.
+The same can be done if the argument is `true` and the address stays in instructions
+of the function that only access memory.
 
 ### Supporting [`unsafe_pointer_to_objref`](@ref)
 
@@ -411,10 +420,11 @@ and is lowered to the corresponding address space cast after GC root lowering. T
 keep it in place until then, the intrinsic is not speculatable and is declared to
 modify memory that only the runtime can access, so the optimizer may neither
 execute it speculatively nor move it across another call. The caller remains
-responsible for the object being alive when the call is made. A pointer that
-`julia.pointer_from_objref` returned is no proof of that: as described above, the
-optimizer may already have removed the object it was taken from, or moved it to the
-stack.
+responsible for the object being alive when the call is made.
+
+The address may be one that `julia.pointer_from_objref` returned, if that was asked for
+a pointer to an object that the GC knows. A reference that is made directly from such
+an address is replaced by the original reference.
 
 ### Keeping values alive in the absence of uses
 

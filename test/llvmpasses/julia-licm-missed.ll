@@ -95,7 +95,7 @@ declare noalias nonnull {} addrspace(10)* @ijl_gc_big_alloc(i8*, i64) #1
 declare nonnull {} addrspace(10)* @escape({} addrspace(10)*)
 
 ; COM: addrescape function
-declare nonnull {}* @julia.pointer_from_objref({} addrspace(11)*)
+declare nonnull {}* @julia.pointer_from_objref({} addrspace(11)*, i1)
 
 attributes #0 = { "probe-stack"="inline-asm" }
 attributes #1 = { allocsize(1) }

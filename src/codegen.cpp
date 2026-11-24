@@ -1595,10 +1595,14 @@ static const auto gc_preserve_end_func = new JuliaFunction<> {
     [](LLVMContext &C) { return FunctionType::get(getVoidTy(C), {Type::getTokenTy(C)}, false); },
     nullptr,
 };
+// The second argument says if the address has to be that of an object that the GC knows, because
+// it may be made into a reference to it again (`julia.pointer_to_objref`, or a `jl_value_t*` that
+// other code is given). Without that, it is only good for accessing the memory of the object, which
+// the allocation optimizer may then remove or move to the stack.
 static const auto pointer_from_objref_func = new JuliaFunction<>{
     "julia.pointer_from_objref",
     [](LLVMContext &C) { return FunctionType::get(JuliaType::get_pjlvalue_ty(C),
-            {PointerType::get(C, AddressSpace::Derived)}, false); },
+            {PointerType::get(C, AddressSpace::Derived), getInt1Ty(C)}, false); },
     [](LLVMContext &C) {
         AttrBuilder FnAttrs(C);
         FnAttrs.addMemoryAttr(MemoryEffects::none());

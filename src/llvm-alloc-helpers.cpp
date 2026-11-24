@@ -5,6 +5,8 @@
 #include "llvm-codegen-shared.h"
 #include "julia_assert.h"
 
+#include <llvm/ADT/SmallPtrSet.h>
+#include <llvm/ADT/Statistic.h>
 #include <llvm/Analysis/LoopInfo.h>
 #include <llvm/IR/IntrinsicInst.h>
 
@@ -12,6 +14,8 @@
 
 using namespace llvm;
 using namespace jl_alloc;
+
+STATISTIC(GCPointerEscapes, "Number of allocations seen to escape through their address being needed as a GC pointer");
 
 static bool hasObjref(Type *ty)
 {
@@ -170,6 +174,52 @@ JL_USED_FUNC void AllocUseInfo::dump()
     dump(dbgs());
 }
 
+// Whether the address of the object that this `julia.pointer_from_objref` call returns has to be
+// that of an object that the GC knows
+static bool needsGCPointer(CallInst *addr)
+{
+    // a call without the operand is from before it existed, and asks for no more than it got then
+    if (addr->arg_size() < 2)
+        return false;
+    auto gc_pointer = dyn_cast<ConstantInt>(addr->getArgOperand(1));
+    return !gc_pointer || !gc_pointer->isZero();
+}
+
+// Whether `addr`, the address of an object, is only used to read and write the memory of that
+// object in this function. It is unknown what is done with it anywhere else, where a reference to
+// the object may be made from it again.
+static bool onlyAccessesMemory(CallInst *addr)
+{
+    SmallVector<Instruction*, 8> worklist{addr};
+    SmallPtrSet<Instruction*, 8> seen;
+    while (!worklist.empty()) {
+        Instruction *cur = worklist.pop_back_val();
+        for (Use &use: cur->uses()) {
+            auto user = dyn_cast<Instruction>(use.getUser());
+            if (!user)
+                return false;
+            if (isa<LoadInst>(user) || isa<ICmpInst>(user))
+                continue;
+            if (isa<StoreInst>(user) && use.getOperandNo() == StoreInst::getPointerOperandIndex())
+                continue;
+            if (isa<AtomicCmpXchgInst>(user) && use.getOperandNo() == AtomicCmpXchgInst::getPointerOperandIndex())
+                continue;
+            if (isa<AtomicRMWInst>(user) && use.getOperandNo() == AtomicRMWInst::getPointerOperandIndex())
+                continue;
+            if (isa<GetElementPtrInst>(user) || isa<BitCastInst>(user) || isa<AddrSpaceCastInst>(user)) {
+                if (seen.insert(user).second)
+                    worklist.push_back(user);
+                continue;
+            }
+            // None of the intrinsics keep the address
+            if (isa<IntrinsicInst>(user))
+                continue;
+            return false;
+        }
+    }
+    return true;
+}
+
 #ifndef __clang_gcanalyzer__
 #define REMARK(remark) if (options.ORE) options.ORE->emit(remark)
 #else
@@ -248,6 +298,20 @@ void jl_alloc::runEscapeAnalysis(llvm::CallInst *I, EscapeAnalysisRequiredArgs r
             }
             if (required.pass.pointer_from_objref_func == callee) {
                 required.use_info.addrescaped = true;
+                if (needsGCPointer(call) && !onlyAccessesMemory(call)) {
+                    LLVM_DEBUG(dbgs() << "Object address is needed as a GC pointer, marking escape\n");
+                    REMARK([&]() {
+                        std::string str;
+                        llvm::raw_string_ostream rso(str);
+                        inst->print(rso);
+                        return OptimizationRemarkMissed(DEBUG_TYPE, "GCPointer",
+                                                        inst)
+                               << "Object address is needed as a GC pointer, marking escape (" << ore::NV("Call", StringRef(str)) << ")";
+                    });
+                    ++GCPointerEscapes;
+                    required.use_info.escaped = true;
+                    return false;
+                }
                 return true;
             }
             if (required.pass.gc_loaded_func == callee) {

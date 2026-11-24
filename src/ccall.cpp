@@ -17,6 +17,7 @@ STATISTIC(EmittedLLVMCalls, "Number of llvmcall intrinsics emitted");
 #define TRANSFORMED_CCALL_STAT(name) STATISTIC(_CCALL_STAT(name), "Number of " #name " ccalls intercepted")
 TRANSFORMED_CCALL_STAT(jl_array_ptr);
 TRANSFORMED_CCALL_STAT(jl_value_ptr);
+TRANSFORMED_CCALL_STAT(jl_pointer_from_objref);
 TRANSFORMED_CCALL_STAT(jl_cpu_pause);
 TRANSFORMED_CCALL_STAT(jl_cpu_wake);
 TRANSFORMED_CCALL_STAT(jl_gc_safepoint);
@@ -1711,7 +1712,8 @@ static jl_cgval_t emit_ccall(jl_codectx_t &ctx, jl_value_t **args, size_t nargs)
         if (isboxed) {
             retval = boxed(ctx, argv[0]);
             if (!retboxed)
-                retval = emit_pointer_from_objref(ctx, retval /*T_prjlvalue*/);
+                // a `jl_value_t*`
+                retval = emit_pointer_from_objref(ctx, retval /*T_prjlvalue*/, true);
         }
         else {
             if (tti == (jl_value_t*)jl_voidpointer_type)
@@ -1726,6 +1728,17 @@ static jl_cgval_t emit_ccall(jl_codectx_t &ctx, jl_value_t **args, size_t nargs)
                 retval = emit_pointer_to_objref(ctx, retval);
             }
         }
+        JL_GC_POP();
+        return mark_or_box_ccall_result(ctx, retval, retboxed, rt, unionall, static_rt);
+    }
+    else if (is_libjulia_func(jl_pointer_from_objref) && !isVa && !llvmcall && nccallargs == 2 &&
+             lrt == ctx.types().T_ptr && jl_svecref(at, 0) == (jl_value_t*)jl_any_type &&
+             jl_svecref(at, 1) == (jl_value_t*)jl_bool_type) {
+        ++CCALL_STAT(jl_pointer_from_objref);
+        Value *gc_pointer = emit_unbox(ctx, getInt8Ty(ctx.builder.getContext()),
+                                       update_julia_type(ctx, argv[1], (jl_value_t*)jl_bool_type));
+        gc_pointer = ctx.builder.CreateTrunc(gc_pointer, getInt1Ty(ctx.builder.getContext()));
+        Value *retval = emit_pointer_from_objref(ctx, boxed(ctx, argv[0]), gc_pointer);
         JL_GC_POP();
         return mark_or_box_ccall_result(ctx, retval, retboxed, rt, unionall, static_rt);
     }
@@ -1923,7 +1936,8 @@ static jl_cgval_t emit_ccall(jl_codectx_t &ctx, jl_value_t **args, size_t nargs)
         const int nt_offset = offsetof(jl_tls_states_t, next_task);
         Value *pnt = ctx.builder.CreateInBoundsGEP(ctx.types().T_pjlvalue, ptls_pv, ConstantInt::get(ctx.types().T_size, nt_offset / sizeof(void*)));
         setName(ctx.emission_context, pnt, "next_task_ptr");
-        ctx.builder.CreateStore(emit_pointer_from_objref(ctx, boxed(ctx, argv[0])), pnt);
+        // the runtime uses what is stored here as the task
+        ctx.builder.CreateStore(emit_pointer_from_objref(ctx, boxed(ctx, argv[0]), true), pnt);
         return ghostValue(ctx, jl_nothing_type);
     }
     else if (is_libjulia_func(jl_sigatomic_begin)) {

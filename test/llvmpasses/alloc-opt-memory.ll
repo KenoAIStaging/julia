@@ -51,7 +51,7 @@ top:
   %mem = call noalias nonnull align 16 ptr addrspace(10) @julia.gc_alloc_memory(ptr %task, i64 24, ptr addrspace(10) addrspacecast (ptr @tag to ptr addrspace(10)), i64 3, i1 false)
   %mem_derived = addrspacecast ptr addrspace(10) %mem to ptr addrspace(11)
   %ptr_field = getelementptr inbounds i8, ptr addrspace(11) %mem_derived, i64 8
-  %objref = call ptr @julia.pointer_from_objref(ptr addrspace(11) %mem_derived)
+  %objref = call ptr @julia.pointer_from_objref(ptr addrspace(11) %mem_derived, i1 false)
   %data = getelementptr inbounds i8, ptr %objref, i64 16
   store ptr %data, ptr addrspace(11) %ptr_field, align 8
   %elt = getelementptr inbounds i8, ptr %data, i64 8
@@ -74,7 +74,7 @@ top:
   %task = getelementptr inbounds i8, ptr %pgcstack, i64 -152
   %mem = call noalias nonnull align 16 ptr addrspace(10) @julia.gc_alloc_memory(ptr %task, i64 24, ptr addrspace(10) addrspacecast (ptr @tag to ptr addrspace(10)), i64 3, i1 false)
   %mem_derived = addrspacecast ptr addrspace(10) %mem to ptr addrspace(11)
-  %objref = call ptr @julia.pointer_from_objref(ptr addrspace(11) %mem_derived)
+  %objref = call ptr @julia.pointer_from_objref(ptr addrspace(11) %mem_derived, i1 false)
   %token = call token (...) @llvm.julia.gc_preserve_begin(ptr addrspace(10) %mem)
   call void @use(ptr %objref)
   call void @llvm.julia.gc_preserve_end(token %token)
@@ -95,7 +95,7 @@ top:
   %mem = call noalias nonnull align 16 ptr addrspace(10) @julia.gc_alloc_memory(ptr %task, i64 24, ptr addrspace(10) addrspacecast (ptr @tag to ptr addrspace(10)), i64 3, i1 false)
   %mem_derived = addrspacecast ptr addrspace(10) %mem to ptr addrspace(11)
   %ptr_field = getelementptr inbounds i8, ptr addrspace(11) %mem_derived, i64 8
-  %objref = call ptr @julia.pointer_from_objref(ptr addrspace(11) %mem_derived)
+  %objref = call ptr @julia.pointer_from_objref(ptr addrspace(11) %mem_derived, i1 false)
   %token = call token (...) @llvm.julia.gc_preserve_begin(ptr addrspace(10) %mem)
   call void @use(ptr %objref)
   call void @llvm.julia.gc_preserve_end(token %token)
@@ -133,7 +133,7 @@ top:
   %mem = call noalias nonnull align 16 ptr addrspace(10) @julia.gc_alloc_memory(ptr %task, i64 24, ptr addrspace(10) addrspacecast (ptr @tag to ptr addrspace(10)), i64 3, i1 false)
   %mem_derived = addrspacecast ptr addrspace(10) %mem to ptr addrspace(11)
   %ptr_field = getelementptr inbounds i8, ptr addrspace(11) %mem_derived, i64 8
-  %objref = call ptr @julia.pointer_from_objref(ptr addrspace(11) %mem_derived)
+  %objref = call ptr @julia.pointer_from_objref(ptr addrspace(11) %mem_derived, i1 false)
   %data = getelementptr inbounds i8, ptr %objref, i64 16
   store volatile ptr %data, ptr addrspace(11) %ptr_field, align 8
   %reload = load ptr, ptr addrspace(11) %ptr_field, align 8
@@ -245,7 +245,7 @@ top:
 }
 
 declare ptr @julia.get_pgcstack()
-declare ptr @julia.pointer_from_objref(ptr addrspace(11)) #1
+declare ptr @julia.pointer_from_objref(ptr addrspace(11), i1) #1
 declare void @use(ptr)
 declare void @llvm.memset.p11.i64(ptr addrspace(11), i8, i64, i1)
 declare token @llvm.julia.gc_preserve_begin(...)

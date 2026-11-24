@@ -90,7 +90,7 @@ define void @legal_int_types() {
   %ptls_i8 = bitcast ptr %ptls to ptr
   %var1 = call ptr addrspace(10) @julia.gc_alloc_obj(ptr %ptls_i8, i64 12, ptr addrspace(10) @tag)
   %var2 = addrspacecast ptr addrspace(10) %var1 to ptr addrspace(11)
-  %var3 = call ptr @julia.pointer_from_objref(ptr addrspace(11) %var2)
+  %var3 = call ptr @julia.pointer_from_objref(ptr addrspace(11) %var2, i1 false)
   ret void
 }
 ; CHECK-LABEL: }{{$}}
@@ -140,7 +140,7 @@ define void @lifetime_no_preserve_end(ptr noalias nocapture noundef nonnull sret
   %v = call noalias ptr addrspace(10) @julia.gc_alloc_obj(ptr %ptls_i8, i64 8, ptr addrspace(10) @tag)
   %token = call token (...) @llvm.julia.gc_preserve_begin(ptr addrspace(10) %v)
   %v_derived = addrspacecast ptr addrspace(10) %v to ptr addrspace(11)
-  %ptr = call nonnull ptr @julia.pointer_from_objref(ptr addrspace(11) %v_derived)
+  %ptr = call nonnull ptr @julia.pointer_from_objref(ptr addrspace(11) %v_derived, i1 false)
   %ptr_raw = bitcast ptr %ptr to ptr
   call void @external_function()
   %ret_raw = bitcast ptr %0 to ptr
@@ -163,13 +163,13 @@ define void @initializers() {
   %ptls_i8 = bitcast ptr %ptls to ptr
   %var1 = call ptr addrspace(10) @julia.gc_alloc_obj(ptr %ptls_i8, i64 1, ptr addrspace(10) @tag) #4
   %var2 = addrspacecast ptr addrspace(10) %var1 to ptr addrspace(11)
-  %var3 = call ptr @julia.pointer_from_objref(ptr addrspace(11) %var2)
+  %var3 = call ptr @julia.pointer_from_objref(ptr addrspace(11) %var2, i1 false)
   %var4 = call ptr addrspace(10) @julia.gc_alloc_obj(ptr %ptls_i8, i64 2, ptr addrspace(10) @tag) #7
   %var5 = addrspacecast ptr addrspace(10) %var4 to ptr addrspace(11)
-  %var6 = call ptr @julia.pointer_from_objref(ptr addrspace(11) %var5)
+  %var6 = call ptr @julia.pointer_from_objref(ptr addrspace(11) %var5, i1 false)
   %var7 = call ptr addrspace(10) @julia.gc_alloc_obj(ptr %ptls_i8, i64 3, ptr addrspace(10) @tag) #1
   %var8 = addrspacecast ptr addrspace(10) %var7 to ptr addrspace(11)
-  %var9 = call ptr @julia.pointer_from_objref(ptr addrspace(11) %var8)
+  %var9 = call ptr @julia.pointer_from_objref(ptr addrspace(11) %var8, i1 false)
   ret void
 }
 ; CHECK-LABEL: }{{$}}
@@ -314,7 +314,7 @@ define void @ref_with_addrescaped_no_stack(ptr addrspace(10) %val) {
   %v = call noalias nonnull align 8 dereferenceable(16) ptr addrspace(10) @julia.gc_alloc_obj(ptr %ptls, i64 16, ptr addrspace(10) @tag) #7
   %v_derived = addrspacecast ptr addrspace(10) %v to ptr addrspace(11)
   store ptr addrspace(10) %val, ptr addrspace(11) %v_derived, align 8, !tbaa !20
-  %raw = call ptr @julia.pointer_from_objref(ptr addrspace(11) %v_derived)
+  %raw = call ptr @julia.pointer_from_objref(ptr addrspace(11) %v_derived, i1 false)
   %tok = call token (...) @llvm.julia.gc_preserve_begin(ptr addrspace(10) %v)
   call void @external_function()
   call void @llvm.julia.gc_preserve_end(token %tok)
@@ -333,7 +333,7 @@ define void @align_inherit() {
   %ptls_i8 = bitcast ptr %ptls to ptr
   %var1 = call align 32 ptr addrspace(10) @julia.gc_alloc_obj(ptr %ptls_i8, i64 8, ptr addrspace(10) @tag)
   %var2 = addrspacecast ptr addrspace(10) %var1 to ptr addrspace(11)
-  %var3 = call ptr @julia.pointer_from_objref(ptr addrspace(11) %var2)
+  %var3 = call ptr @julia.pointer_from_objref(ptr addrspace(11) %var2, i1 false)
   ret void
 }
 ; CHECK-LABEL: }{{$}}
@@ -348,7 +348,7 @@ define void @legal_int_i64() {
   %ptls_i8 = bitcast ptr %ptls to ptr
   %var1 = call ptr addrspace(10) @julia.gc_alloc_obj(ptr %ptls_i8, i64 8, ptr addrspace(10) @tag)
   %var2 = addrspacecast ptr addrspace(10) %var1 to ptr addrspace(11)
-  %var3 = call ptr @julia.pointer_from_objref(ptr addrspace(11) %var2)
+  %var3 = call ptr @julia.pointer_from_objref(ptr addrspace(11) %var2, i1 false)
   ret void
 }
 ; CHECK-LABEL: }{{$}}
@@ -394,9 +394,91 @@ define ptr addrspace(10) @two_objref_fields_no_merge(ptr addrspace(10) %a, ptr a
 }
 ; CHECK-LABEL: }{{$}}
 
+; Test that a reference made from the address that was just taken of an object is the
+; original reference, so that the allocation is seen to be returned.
+; CHECK-LABEL: @objref_from_own_address
+; CHECK-NOT: @julia.pointer_to_objref
+; CHECK: %v = call{{.*}}@julia.gc_alloc_obj
+; CHECK-NOT: @julia.pointer_to_objref
+; CHECK: ret ptr addrspace(10) %v
+define ptr addrspace(10) @objref_from_own_address() {
+  %pgcstack = call ptr @julia.get_pgcstack()
+  %ptls = call ptr @julia.ptls_states()
+  %v = call noalias nonnull align 8 dereferenceable(8) ptr addrspace(10) @julia.gc_alloc_obj(ptr %ptls, i64 8, ptr addrspace(10) @tag) #7
+  %v_derived = addrspacecast ptr addrspace(10) %v to ptr addrspace(11)
+  store i64 1, ptr addrspace(11) %v_derived, align 8
+  %raw = call ptr @julia.pointer_from_objref(ptr addrspace(11) %v_derived, i1 true)
+  %ref = call ptr addrspace(10) @julia.pointer_to_objref(ptr %raw)
+  ret ptr addrspace(10) %ref
+}
+; CHECK-LABEL: }{{$}}
+
+; Test that an allocation stays on the heap when a GC pointer to it is needed and leaves
+; the function, where a reference may be made from it again.
+; CHECK-LABEL: @gc_pointer_leaves
+; CHECK: call{{.*}}@julia.gc_alloc_obj
+; CHECK: ret void
+define void @gc_pointer_leaves() {
+  %pgcstack = call ptr @julia.get_pgcstack()
+  %ptls = call ptr @julia.ptls_states()
+  %v = call noalias nonnull align 8 dereferenceable(8) ptr addrspace(10) @julia.gc_alloc_obj(ptr %ptls, i64 8, ptr addrspace(10) @tag) #7
+  %v_derived = addrspacecast ptr addrspace(10) %v to ptr addrspace(11)
+  store i64 1, ptr addrspace(11) %v_derived, align 8
+  %raw = call ptr @julia.pointer_from_objref(ptr addrspace(11) %v_derived, i1 true)
+  %tok = call token (...) @llvm.julia.gc_preserve_begin(ptr addrspace(10) %v)
+  call void @external_pointer_user(ptr %raw)
+  call void @llvm.julia.gc_preserve_end(token %tok)
+  ret void
+}
+; CHECK-LABEL: }{{$}}
+
+; Test that it is still moved to the stack when the pointer that leaves is only needed to
+; access its memory,
+; CHECK-LABEL: @data_pointer_leaves
+; CHECK-NOT: @julia.gc_alloc_obj
+; CHECK: call void @external_pointer_user(ptr %v)
+; CHECK: ret void
+define void @data_pointer_leaves() {
+  %pgcstack = call ptr @julia.get_pgcstack()
+  %ptls = call ptr @julia.ptls_states()
+  %v = call noalias nonnull align 8 dereferenceable(8) ptr addrspace(10) @julia.gc_alloc_obj(ptr %ptls, i64 8, ptr addrspace(10) @tag) #7
+  %v_derived = addrspacecast ptr addrspace(10) %v to ptr addrspace(11)
+  store i64 1, ptr addrspace(11) %v_derived, align 8
+  %raw = call ptr @julia.pointer_from_objref(ptr addrspace(11) %v_derived, i1 false)
+  %tok = call token (...) @llvm.julia.gc_preserve_begin(ptr addrspace(10) %v)
+  call void @external_pointer_user(ptr %raw)
+  call void @llvm.julia.gc_preserve_end(token %tok)
+  ret void
+}
+; CHECK-LABEL: }{{$}}
+
+; and when a GC pointer is only used to access its memory in this function.
+; CHECK-LABEL: @gc_pointer_stays
+; CHECK-NOT: @julia.gc_alloc_obj
+; CHECK: ret i64
+define i64 @gc_pointer_stays() {
+  %pgcstack = call ptr @julia.get_pgcstack()
+  %ptls = call ptr @julia.ptls_states()
+  %v = call noalias nonnull align 8 dereferenceable(16) ptr addrspace(10) @julia.gc_alloc_obj(ptr %ptls, i64 16, ptr addrspace(10) @tag) #7
+  %v_derived = addrspacecast ptr addrspace(10) %v to ptr addrspace(11)
+  store i64 1, ptr addrspace(11) %v_derived, align 8
+  %raw = call ptr @julia.pointer_from_objref(ptr addrspace(11) %v_derived, i1 true)
+  %tok = call token (...) @llvm.julia.gc_preserve_begin(ptr addrspace(10) %v)
+  %field = getelementptr inbounds i8, ptr %raw, i64 8
+  store i64 2, ptr %field, align 8
+  %val = load i64, ptr %field, align 8
+  call void @llvm.julia.gc_preserve_end(token %tok)
+  ret i64 %val
+}
+; CHECK-LABEL: }{{$}}
+
+declare ptr addrspace(10) @julia.pointer_to_objref(ptr)
+
+declare void @external_pointer_user(ptr)
+
 declare ptr @julia.ptls_states()
 
-declare ptr @julia.pointer_from_objref(ptr addrspace(11))
+declare ptr @julia.pointer_from_objref(ptr addrspace(11), i1)
 
 declare token @llvm.julia.gc_preserve_begin(...)
 

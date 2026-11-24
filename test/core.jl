@@ -1899,6 +1899,71 @@ let (r, w) = objref_and_weakref()
     x = objref_outlives_preserve(r, w, true)
     @test x isa Base.RefValue{Int} && x[] == 314159
 end
+# A reference made from the address of a local object refers to an object that can be used as one
+function objref_of_local(v::Int)
+    x = Ref(v)
+    GC.@preserve x begin
+        y = unsafe_pointer_to_objref(pointer_from_objref(x))::Base.RefValue{Int}
+        return y[]
+    end
+end
+@noinline function objref_of_local_returned(v::Int)
+    x = Ref(v)
+    return GC.@preserve x unsafe_pointer_to_objref(pointer_from_objref(x))
+end
+const objref_c_identity = @cfunction(identity, Ptr{Cvoid}, (Ptr{Cvoid},))
+@noinline function objref_of_local_through_c(v::Int)
+    x = Ref(v)
+    return GC.@preserve x unsafe_pointer_to_objref(ccall(objref_c_identity, Ptr{Cvoid}, (Ptr{Cvoid},),
+                                                         pointer_from_objref(x)))
+end
+@test objref_of_local(41) === 41
+let y = objref_of_local_returned(42), z = objref_of_local_through_c(43)
+    GC.gc()
+    @test y isa Base.RefValue{Int} && y[] == 42
+    @test z isa Base.RefValue{Int} && z[] == 43
+end
+# So does one that is made from the address in another function, or loaded back from memory
+objref_in_callback(p::Ptr{Cvoid}) = (unsafe_pointer_to_objref(p)::Base.RefValue{Int})[]
+const objref_c_callback = @cfunction(objref_in_callback, Int, (Ptr{Cvoid},))
+function objref_of_local_in_callback(v::Int)
+    x = Ref(v)
+    return GC.@preserve x ccall(objref_c_callback, Int, (Ptr{Cvoid},), pointer_from_objref(x))
+end
+function objref_of_local_stored(v::Int)
+    x = Ref(v)
+    slot = Vector{Ptr{Cvoid}}(undef, 1)
+    GC.@preserve x slot begin
+        unsafe_store!(Ptr{Any}(pointer(slot)), x)
+        return (unsafe_load(Ptr{Any}(pointer(slot)))::Base.RefValue{Int})[]
+    end
+end
+@test objref_of_local_in_callback(44) === 44
+@test objref_of_local_stored(45) === 45
+# A pointer that is only used to access the memory of a local object does not make it a heap object
+function dataptr_of_local_in_c()
+    bytes = Ref{Int64}(0)
+    ccall(:jl_gc_get_total_bytes, Cvoid, (Ptr{Int64},), bytes)
+    return bytes[]
+end
+function dataptr_of_local(v::Int)
+    x = Ref(v)
+    GC.@preserve x unsafe_store!(Ptr{Int}(pointer_from_objref(x)), v + 1)
+    return x[]
+end
+function dataptr_of_local_explicit(v::Int)
+    x = Ref(v)
+    GC.@preserve x ccall(:memset, Ptr{Cvoid}, (Ptr{Cvoid}, Cint, Csize_t), pointer_from_objref(x, false), 0, sizeof(Int))
+    return x[]
+end
+let
+    @test dataptr_of_local_in_c() isa Int64
+    @test dataptr_of_local(46) === 47
+    @test dataptr_of_local_explicit(48) === 0
+    @test @allocated(dataptr_of_local_in_c()) == 0
+    @test @allocated(dataptr_of_local(46)) == 0
+    @test @allocated(dataptr_of_local_explicit(48)) == 0
+end
 
 let
     local a, aa

@@ -78,7 +78,7 @@ define void @ccall_ptr(i8* %fptr) {
   %current_task = getelementptr inbounds {}*, {}** %gcstack, i64 -12
   %v = call noalias {} addrspace(10)* @julia.gc_alloc_obj({}** %current_task, i64 8, {} addrspace(10)* @tag)
   %va = addrspacecast {} addrspace(10)* %v to {} addrspace(11)*
-  %ptrj = call {}* @julia.pointer_from_objref({} addrspace(11)* %va)
+  %ptrj = call {}* @julia.pointer_from_objref({} addrspace(11)* %va, i1 false)
   %ptr = bitcast {}* %ptrj to i8*
   %f = bitcast i8* %fptr to void (i8*)*
   call void %f(i8* %ptr) [ "jl_roots"({} addrspace(10)* %v), "unknown_bundle"(i8* %ptr) ]
@@ -97,7 +97,7 @@ define void @ccall_unknown_bundle(i8* %fptr) {
   %current_task = getelementptr inbounds {}*, {}** %gcstack, i64 -12
   %v = call noalias {} addrspace(10)* @julia.gc_alloc_obj({}** %current_task, i64 8, {} addrspace(10)* @tag)
   %va = addrspacecast {} addrspace(10)* %v to {} addrspace(11)*
-  %ptrj = call {}* @julia.pointer_from_objref({} addrspace(11)* %va)
+  %ptrj = call {}* @julia.pointer_from_objref({} addrspace(11)* %va, i1 false)
   %ptr = bitcast {}* %ptrj to i8*
   %f = bitcast i8* %fptr to void (i8*)*
   call void %f(i8* %ptr) [ "jl_not_jl_roots"({} addrspace(10)* %v) ]
@@ -133,7 +133,7 @@ define void @lifetime_branches(i8* %fptr, i1 %b, i1 %b2) {
 L1:
   %v = call noalias {} addrspace(10)* @julia.gc_alloc_obj({}** %current_task, i64 8, {} addrspace(10)* @tag)
   %va = addrspacecast {} addrspace(10)* %v to {} addrspace(11)*
-  %ptrj = call {}* @julia.pointer_from_objref({} addrspace(11)* %va)
+  %ptrj = call {}* @julia.pointer_from_objref({} addrspace(11)* %va, i1 false)
   %ptr = bitcast {}* %ptrj to i8*
   %f = bitcast i8* %fptr to void (i8*)*
   call void %f(i8* %ptr) [ "jl_roots"({} addrspace(10)* %v) ]
@@ -244,7 +244,7 @@ L3:
 declare void @external_function()
 declare {}*** @julia.get_pgcstack()
 declare noalias nonnull {} addrspace(10)* @julia.gc_alloc_obj({}**, i64, {} addrspace(10)*)
-declare {}* @julia.pointer_from_objref({} addrspace(11)*)
+declare {}* @julia.pointer_from_objref({} addrspace(11)*, i1)
 declare void @llvm.memcpy.p11i8.p0i8.i64(i8 addrspace(11)* nocapture writeonly, i8* nocapture readonly, i64, i32, i1)
 declare token @llvm.julia.gc_preserve_begin(...)
 declare void @llvm.julia.gc_preserve_end(token)

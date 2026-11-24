@@ -52,6 +52,7 @@ STATISTIC(StackAllocs, "Total number of allocations moved to the stack");
 STATISTIC(RemovedTypeofs, "Total number of typeofs removed");
 STATISTIC(RemovedWriteBarriers, "Total number of write barriers removed");
 STATISTIC(RemovedGCPreserve, "Total number of GC preserve instructions removed");
+STATISTIC(FoldedAddrRoundTrips, "Total number of references made from the address of an object folded");
 
 namespace {
 
@@ -80,7 +81,8 @@ static void removeGCPreserve(CallInst *call, Instruction *val)
  * Uses that are not considered to escape the object (i.e. heap address) includes,
  *
  * * load
- * * `pointer_from_objref`
+ * * `pointer_from_objref`, unless it asks for a GC pointer and does more with the address than to
+ *   access memory
  * * `gc_loaded`
  * * Any real llvm intrinsics
  * * gc preserve intrinsics
@@ -138,6 +140,7 @@ private:
     void insertLifetime(Value *ptr, Instruction *orig);
 
     void checkInst(CallInst *I);
+    bool foldAddressRoundTrip(CallInst *conv);
 
     void replaceIntrinsicUseWith(IntrinsicInst *call, Intrinsic::ID ID,
                                  Instruction *orig_i, Instruction *new_i);
@@ -195,6 +198,7 @@ private:
 
     SetVector<std::pair<CallInst*,size_t>> worklist;
     SmallVector<CallInst*,6> removed;
+    bool folded = false;
     AllocUseInfo use_info;
     CheckInst::Stack check_stack;
     Lifetime::Stack lifetime_stack;
@@ -210,13 +214,39 @@ void Optimizer::pushInstruction(Instruction *I)
     }
 }
 
+// A reference that is made from the address of an object right where that address was taken from
+// a reference is the same reference. Use the original one, whose uses the passes can follow.
+bool Optimizer::foldAddressRoundTrip(CallInst *conv)
+{
+    auto addr = dyn_cast<CallInst>(conv->getArgOperand(0)->stripPointerCasts());
+    if (!addr || addr->getCalledOperand() != pass.pointer_from_objref_func)
+        return false;
+    Value *obj = addr->getArgOperand(0)->stripPointerCasts();
+    // the address may also be of the inside of an object, which there is no reference to
+    if (obj->getType() != conv->getType())
+        return false;
+    ++FoldedAddrRoundTrips;
+    conv->replaceAllUsesWith(obj);
+    conv->eraseFromParent();
+    if (addr->use_empty())
+        addr->eraseFromParent();
+    return true;
+}
+
 void Optimizer::initialize()
 {
+    SmallVector<CallInst*,4> convs;
     for (auto &bb: F) {
         for (auto &I: bb) {
             pushInstruction(&I);
+            if (auto call = dyn_cast<CallInst>(&I)) {
+                if (pass.pointer_to_objref_func && call->getCalledOperand() == pass.pointer_to_objref_func)
+                    convs.push_back(call);
+            }
         }
     }
+    for (CallInst *conv: convs)
+        folded |= foldAddressRoundTrip(conv);
 }
 
 void Optimizer::optimizeAll()
@@ -342,7 +372,7 @@ void Optimizer::optimizeAll()
 bool Optimizer::finalize()
 {
     if (removed.empty())
-        return false;
+        return folded;
     for (auto inst: removed)
         inst->eraseFromParent();
     return true;

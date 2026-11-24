@@ -449,6 +449,13 @@ JL_DLLEXPORT jl_value_t *jl_value_ptr(jl_value_t *a)
 {
     return a;
 }
+// `gc_pointer` is for the compiler, which may keep an object that no pointer for the GC is taken
+// of somewhere else than on the heap
+JL_DLLEXPORT jl_value_t *jl_pointer_from_objref(jl_value_t *a, int8_t gc_pointer)
+{
+    (void)gc_pointer;
+    return a;
+}
 
 // optimization of setfield which bypasses boxing of the idx (and checking field type validity)
 JL_DLLEXPORT void jl_set_nth_field(jl_value_t *v, size_t idx0, jl_value_t *rhs)

@@ -348,17 +348,24 @@ void jl_debugcache_t::initialize(Module *m) {
         dbuilder.getOrCreateTypeArray({}));
 }
 
-static Value *emit_pointer_from_objref(jl_codectx_t &ctx, Value *V)
+// The address of the object V. `gc_pointer` (an i1) says if that has to be the address of an object
+// that the GC knows, or is only used to access its memory (see `pointer_from_objref_func`).
+static Value *emit_pointer_from_objref(jl_codectx_t &ctx, Value *V, Value *gc_pointer)
 {
     unsigned AS = V->getType()->getPointerAddressSpace();
     if (AS != AddressSpace::Tracked && AS != AddressSpace::Derived)
         return V;
     V = decay_derived(ctx, V);
     Function *F = prepare_call(pointer_from_objref_func);
-    CallInst *Call = ctx.builder.CreateCall(F, V);
+    CallInst *Call = ctx.builder.CreateCall(F, {V, gc_pointer});
     Call->setAttributes(F->getAttributes());
     ++EmittedPointerFromObjref;
     return Call;
+}
+
+static Value *emit_pointer_from_objref(jl_codectx_t &ctx, Value *V, bool gc_pointer=false)
+{
+    return emit_pointer_from_objref(ctx, V, ConstantInt::getBool(ctx.builder.getContext(), gc_pointer));
 }
 
 // The reference to the object that the untracked pointer V points at (see `pointer_to_objref_func`)
